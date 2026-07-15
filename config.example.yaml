@@ -1,0 +1,46 @@
+# Copy to config.yaml (gitignored) and fill in for your setup.
+
+# STT profile: "cloud" (Deepgram primary, OpenAI Whisper API fallback) or "local" (faster-whisper on CPU)
+stt_profile: cloud
+
+deepgram:
+  # Pinned but swappable without code changes (docs/ARCHITECTURE.md §6.2.4)
+  model: nova-3
+  language: multi   # auto it/en
+
+openai_whisper:
+  model: whisper-1
+
+local_whisper:
+  # benchmark small vs medium int8 on the Bolt (task T5)
+  model: small
+  compute_type: int8
+
+# TTS profile: "elevenlabs" (cloud, Italian voice) or "piper" (local)
+tts_profile: elevenlabs
+
+elevenlabs:
+  voice_id: ""      # your Italian voice id
+  model: eleven_multilingual_v2
+
+llm:
+  model: claude-sonnet-4-6
+  max_history_turns: 20
+
+ojn:
+  # Self-hosted OpenJabNab on the Bolt (docs/ARCHITECTURE.md §6.1)
+  base_url: http://127.0.0.1:8080
+  # OJN_TOKEN comes from .env, not from here
+
+audio:
+  # ALSA device for the reSpeaker Flex XVF3800 (USB Audio Class)
+  capture_device: "hw:XVF3800"
+  sample_rate: 16000
+  vad_end_of_speech_ms: 700
+  half_duplex_guard_ms: 300
+
+mp3_server:
+  # Tiny HTTP server that serves TTS output to the rabbit (docs/ARCHITECTURE.md §5)
+  host: 0.0.0.0     # must be reachable from the legacy segment
+  port: 8090
+  audio_dir: www/audio

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rabbit-brain"
+version = "0.1.0"
+description = "AI brain for the original Nabaztag rabbit (nabaztag-ai project)"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Maurizio Caporali" }]
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.11",
+    "pre-commit>=3.6",
+]
+
+[tool.setuptools.packages.find]
+include = ["rabbit_brain*"]
+

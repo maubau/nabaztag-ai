@@ -1,0 +1,18 @@
+# Copy to intents.yaml (gitignored — real RFID tag UIDs are personal data and a
+# physical-access credential of sorts). Placeholder UIDs below.
+
+rfid_intents:
+  "00:00:00:00:00:00:00:01":
+    intent: atlas_news
+    description: "Physical AI Atlas card → fetch RSS/JSON, summarize via Claude, speak"
+  "00:00:00:00:00:00:00:02":
+    intent: weather_today
+    description: "Weather card → speak today's forecast"
+
+button_intents:
+  single_click:
+    intent: wake_listen
+    description: "Same as wake word: start listening"
+  double_click:
+    intent: stop_speaking
+    description: "Drop queued sentences (no true cancel on OJN — see BodyCapabilities)"

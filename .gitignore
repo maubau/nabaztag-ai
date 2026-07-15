@@ -1,0 +1,33 @@
+# Secrets & personal data — never committed (see docs/ARCHITECTURE.md §11.3)
+.env
+config.yaml
+intents.yaml
+ojn/network/hostapd.conf
+ojn/network/dnsmasq.conf
+
+# Generated audio & model weights
+www/audio/
+*.mp3
+models/
+*.bin
+*.onnx
+*.ct2
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+
+# Local working copy of the spec; the canonical version is docs/ARCHITECTURE.md
+/nabaztag-ai-architecture-v2.2.md
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

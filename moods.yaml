@@ -1,0 +1,40 @@
+# Mood → LED/ear mapping. No secrets; meant to be tweaked on camera.
+# Ears: 0..16 per ear (0 = fully forward, 16 = fully back — confirm in Phase 0).
+# LEDs: bottom, left, right, nose, top — per-LED RGB where the capability matrix allows.
+
+moods:
+  neutral:
+    ears: {left: 8, right: 8}
+    leds: {nose: "#202020"}
+    pulse: false
+  happy:
+    ears: {left: 3, right: 3}
+    leds: {bottom: "#00c000", nose: "#00ff00"}
+    pulse: true
+  curious:
+    ears: {left: 2, right: 10}
+    leds: {top: "#0080ff", nose: "#00ffff"}
+    pulse: false
+  thinking:
+    ears: {left: 12, right: 12}
+    leds: {nose: "#ff8000"}
+    pulse: true
+  sleepy:
+    ears: {left: 16, right: 16}
+    leds: {bottom: "#100010"}
+    pulse: true
+  alert:
+    ears: {left: 0, right: 0}
+    leds: {nose: "#ff0000", top: "#ff0000"}
+    pulse: false
+
+# DoA reflex (docs/ARCHITECTURE.md §6.2.8): on wake word, bias both ears toward
+# the speaker side before the listening pose.
+doa:
+  # angle sectors (degrees) → ear bias
+  sectors:
+    - {from: 315, to: 45, ears: {left: 4, right: 4}}     # front
+    - {from: 45, to: 135, ears: {left: 2, right: 8}}     # right
+    - {from: 135, to: 225, ears: {left: 12, right: 12}}  # behind
+    - {from: 225, to: 315, ears: {left: 8, right: 2}}    # left
+  listen_pose: {left: 0, right: 0}

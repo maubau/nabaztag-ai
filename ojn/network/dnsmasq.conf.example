@@ -1,0 +1,18 @@
+# DHCP + DNS for the legacy rabbit segment (docs/ARCHITECTURE.md §4.1).
+# Copy to dnsmasq.conf (gitignored); deploy.sh injects the rabbit's MAC from .env.
+
+interface=wlan1
+bind-interfaces
+
+# Legacy segment: 192.168.66.0/24 — its own subnet, no route to the home LAN.
+dhcp-range=192.168.66.50,192.168.66.150,12h
+
+# Static lease for the rabbit: a stable IP simplifies everything downstream.
+# __RABBIT_MAC__ is replaced by deploy.sh from .env (RABBIT_MAC).
+dhcp-host=__RABBIT_MAC__,192.168.66.10,nabaztag
+
+# --- DNS-override fallback (§4.1) ---
+# Only needed if the rabbit firmware ignores the "Violet Platform address" field.
+# Uncomment to point the Violet platform hostnames at the Bolt's OJN instance:
+#address=/ojn.local/192.168.66.1
+#address=/r.wizz.cc/192.168.66.1
