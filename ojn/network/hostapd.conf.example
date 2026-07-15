@@ -5,18 +5,19 @@
 # WPA2-only or WPA2/WPA3-mixed AP (confirmed in practice on a FRITZ!Box 4060).
 # Do NOT downgrade your main network — this is a dedicated, isolated segment.
 
-interface=wlan1              # the USB dongle; keep the main interface for LAN/uplink
+interface=__AP_IFACE__
 driver=nl80211
 ssid=nabaztag-legacy
-hw_mode=g                    # 2.4 GHz, 802.11g (rabbit is b/g only)
-channel=11                   # fixed; avoid auto-selection
-ieee80211n=0                 # disable 11n — do not let the AP negotiate beyond the rabbit
+country_code=IT
+hw_mode=g
+channel=11
+ieee80211n=0
 
-wpa=1                        # WPA (not WPA2). wpa=2 would lock the rabbit out
+# WPA1/TKIP only. Do not use this configuration on the home LAN.
+wpa=1
 wpa_key_mgmt=WPA-PSK
-wpa_pairwise=TKIP            # TKIP only — the rabbit does not do AES/CCMP
-wpa_passphrase=__LEGACY_AP_PASSPHRASE__   # replaced by deploy.sh from .env; never commit the real one
+wpa_pairwise=TKIP
+wpa_passphrase=__LEGACY_AP_PASSPHRASE__
 
-eapol_version=1              # KNOWN ISSUE: some Nabaztags fail the EAPOL handshake without this.
-                             # If association still fails, run `hostapd -dd` — an
-                             # "EAPOL-Key timeout" in the log confirms this is the culprit.
+# Some Nabaztags fail the EAPOL handshake with the default EAPOL version.
+eapol_version=1

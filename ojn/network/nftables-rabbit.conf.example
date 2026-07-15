@@ -3,8 +3,7 @@
 # The rabbit's Wi-Fi is 2006-grade crypto (WPA-TKIP) — treat the segment as
 # untrusted and contain it: rabbit ⇄ Bolt only, no home LAN, no internet.
 #
-# Assumes: wlan1 = legacy AP interface, Bolt legacy IP = 192.168.66.1.
-# Adjust OJN/MP3 ports to match your deployment before installing.
+# __AP_IFACE__ is rendered by deploy.sh. Bolt legacy IP = 192.168.66.1.
 
 table inet rabbit_isolation {
     chain forward {
@@ -13,22 +12,24 @@ table inet rabbit_isolation {
         # Nothing from the legacy segment may be forwarded anywhere:
         # no home LAN, no internet. (Traffic *to the Bolt itself* is INPUT,
         # not FORWARD, so this single rule is the whole containment story.)
-        iifname "wlan1" drop
-        oifname "wlan1" drop
+        iifname "__AP_IFACE__" drop
+        oifname "__AP_IFACE__" drop
     }
 
     chain input {
         type filter hook input priority 0; policy accept;
 
-        iifname "wlan1" jump rabbit_input
+        iifname "__AP_IFACE__" jump rabbit_input
     }
 
     chain rabbit_input {
+        # Replies to connections initiated by the Bolt (including Gate S0 ping)
+        ct state established,related accept
         # DHCP + DNS from dnsmasq
         udp dport { 67, 53 } accept
         tcp dport 53 accept
-        # OJN (Violet protocol + HTTP API) — adjust to your OJN ports
-        tcp dport { 80, 8080 } accept
+        # OJN HTTP wrapper/API + Nabaztag:tag XMPP transport
+        tcp dport { 80, 8080, 5222 } accept
         # MP3 HTTP server (config.example.yaml: mp3_server.port)
         tcp dport 8090 accept
         # Ping for Gate S0 verification

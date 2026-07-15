@@ -1,7 +1,7 @@
 # DHCP + DNS for the legacy rabbit segment (docs/ARCHITECTURE.md §4.1).
 # Copy to dnsmasq.conf (gitignored); deploy.sh injects the rabbit's MAC from .env.
 
-interface=wlan1
+interface=__AP_IFACE__
 bind-interfaces
 
 # Legacy segment: 192.168.66.0/24 — its own subnet, no route to the home LAN.

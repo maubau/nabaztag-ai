@@ -92,7 +92,7 @@ class BodyController:
             self._latest[(type(cmd), priority)] = entry.seq
         self._outstanding += 1
         self._idle.clear()
-        if isinstance(cmd, (PlayAudioCommand, SayCommand)):
+        if isinstance(cmd, PlayAudioCommand | SayCommand):
             heapq.heappush(self._audio_pending, entry)
             self._audio_ready.set()
         else:

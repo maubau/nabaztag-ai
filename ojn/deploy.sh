@@ -5,8 +5,8 @@
 #   ./ojn/deploy.sh ojn     # OpenJabNab server (S1/S2)
 #   ./ojn/deploy.sh verify  # Gate S0 checks
 #
-# Reads from .env (repo root): LEGACY_AP_PASSPHRASE, RABBIT_MAC.
-# Hardware steps (plugging the dongle, booting the rabbit) are Maurizio's;
+# Reads from .env (repo root): AP_IFACE, LEGACY_AP_PASSPHRASE, RABBIT_MAC.
+# Hardware steps (booting/configuring the rabbit) are Maurizio's;
 # everything scriptable lives here so the setup is reproducible from the repo.
 
 set -euo pipefail
@@ -27,43 +27,71 @@ load_env() {
     set -a; source "$REPO_ROOT/.env"; set +a
     : "${LEGACY_AP_PASSPHRASE:?set LEGACY_AP_PASSPHRASE in .env}"
     : "${RABBIT_MAC:?set RABBIT_MAC in .env (the Wi-Fi MAC of the rabbit)}"
+    [[ "$AP_IFACE" =~ ^[a-zA-Z0-9_.:-]+$ ]] || die "invalid AP_IFACE: $AP_IFACE"
+    [[ "$RABBIT_MAC" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] || \
+        die "RABBIT_MAC must look like 00:11:22:33:44:55"
+    [[ "$LEGACY_AP_PASSPHRASE" =~ ^[a-zA-Z0-9._-]{8,63}$ ]] || \
+        die "LEGACY_AP_PASSPHRASE must be 8-63 letters/digits/dot/underscore/hyphen"
 }
 
 render_configs() {
     log "Rendering hostapd/dnsmasq configs from examples (+ .env values)"
-    sed "s|__LEGACY_AP_PASSPHRASE__|$LEGACY_AP_PASSPHRASE|" \
+    sed -e "s|__LEGACY_AP_PASSPHRASE__|$LEGACY_AP_PASSPHRASE|" \
+        -e "s|__AP_IFACE__|$AP_IFACE|g" \
         "$NET_DIR/hostapd.conf.example" > "$NET_DIR/hostapd.conf"
-    sed -e "s|__RABBIT_MAC__|$RABBIT_MAC|" -e "s|^interface=.*|interface=$AP_IFACE|" \
+    sed -e "s|__RABBIT_MAC__|$RABBIT_MAC|" -e "s|__AP_IFACE__|$AP_IFACE|g" \
         "$NET_DIR/dnsmasq.conf.example" > "$NET_DIR/dnsmasq.conf"
-    sed -i "s|^interface=.*|interface=$AP_IFACE|" "$NET_DIR/hostapd.conf"
     chmod 600 "$NET_DIR/hostapd.conf"   # contains the passphrase; both files are gitignored
+}
+
+install_rendered() {
+    local source=$1 destination=$2 mode=${3:-644}
+    local rendered
+    rendered=$(mktemp)
+    sed "s|__AP_IFACE__|$AP_IFACE|g" "$source" > "$rendered"
+    sudo install -m "$mode" "$rendered" "$destination"
+    rm -f "$rendered"
 }
 
 setup_ap() {
     load_env
-    ip link show "$AP_IFACE" >/dev/null 2>&1 || die "interface $AP_IFACE not found (USB dongle plugged in? override with AP_IFACE=...)"
+    ip link show "$AP_IFACE" >/dev/null 2>&1 || \
+        die "interface $AP_IFACE not found (check 'ip -br link' and AP_IFACE in .env)"
     render_configs
 
     log "Installing packages"
     sudo apt-get update -qq
-    sudo apt-get install -y hostapd dnsmasq nftables
-
-    log "Configuring $AP_IFACE with static IP $BOLT_LEGACY_IP"
-    sudo ip addr replace "$BOLT_LEGACY_IP" dev "$AP_IFACE"
-    sudo ip link set "$AP_IFACE" up
+    sudo apt-get install -y hostapd dnsmasq-base nftables
 
     log "Installing configs"
     sudo install -m 600 "$NET_DIR/hostapd.conf" /etc/hostapd/nabaztag-legacy.conf
     sudo install -m 644 "$NET_DIR/dnsmasq.conf" /etc/dnsmasq.d/nabaztag-legacy.conf
-    sudo install -m 644 "$NET_DIR/nftables-rabbit.conf.example" /etc/nftables-rabbit.conf
+    install_rendered "$NET_DIR/nftables-rabbit.conf.example" /etc/nftables-rabbit.conf
+    install_rendered "$NET_DIR/nabaztag-ap-interface.service.example" \
+        /etc/systemd/system/nabaztag-ap-interface.service
+    sudo install -m 644 "$NET_DIR/nabaztag-firewall.service.example" \
+        /etc/systemd/system/nabaztag-firewall.service
+    sudo install -m 644 "$NET_DIR/nabaztag-dnsmasq.service.example" \
+        /etc/systemd/system/nabaztag-dnsmasq.service
 
-    log "Applying isolation firewall rules"
-    sudo nft -f /etc/nftables-rabbit.conf
+    # Ubuntu Server normally uses systemd-networkd. If NetworkManager is present,
+    # keep it from reclaiming the radio that hostapd owns.
+    if command -v nmcli >/dev/null 2>&1; then
+        install_rendered "$NET_DIR/NetworkManager-unmanaged.conf.example" \
+            /etc/NetworkManager/conf.d/90-nabaztag-ap-unmanaged.conf
+        sudo nmcli device set "$AP_IFACE" managed no || true
+    fi
+
+    log "Enabling persistent interface and isolation firewall"
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now nabaztag-ap-interface.service
+    sudo systemctl enable --now nabaztag-firewall.service
 
     log "Starting services"
     sudo systemctl unmask hostapd 2>/dev/null || true
-    sudo sh -c "echo 'DAEMON_CONF=/etc/hostapd/nabaztag-legacy.conf' > /etc/default/hostapd"
-    sudo systemctl restart dnsmasq
+    echo 'DAEMON_CONF=/etc/hostapd/nabaztag-legacy.conf' | \
+        sudo tee /etc/default/hostapd >/dev/null
+    sudo systemctl enable --now nabaztag-dnsmasq.service
     sudo systemctl enable --now hostapd || {
         echo "hostapd failed — debug with: sudo hostapd -dd /etc/hostapd/nabaztag-legacy.conf"
         echo "(an 'EAPOL-Key timeout' in the log means the eapol_version=1 issue — see §4.1)"
@@ -76,12 +104,21 @@ setup_ap() {
 verify_s0() {
     load_env
     log "Gate S0 verification"
-    echo "1) Rabbit associated + static lease:"
+    echo "1) Persistent services:"
+    systemctl is-active nabaztag-ap-interface nabaztag-firewall hostapd \
+        nabaztag-dnsmasq || true
+    echo "2) AP address and radio mode:"
+    ip -4 -br address show dev "$AP_IFACE"
+    iw dev "$AP_IFACE" info 2>/dev/null | sed -n '1,12p' || true
+    echo "3) Isolation rules (XMPP 5222 must be listed):"
+    sudo nft list table inet rabbit_isolation 2>/dev/null | \
+        grep -E 'iifname|oifname|dport' || echo "   firewall table missing"
+    echo "4) Rabbit associated + static lease:"
     grep -i "$RABBIT_MAC" /var/lib/misc/dnsmasq.leases 2>/dev/null || echo "   no lease yet — rabbit not associated?"
-    echo "2) Rabbit pingable from the Bolt:"
+    echo "5) Rabbit pingable from the Bolt:"
     ping -c 3 -W 2 "$RABBIT_IP" && echo "   OK" || echo "   FAIL"
-    echo "3) Isolation (run from a home-LAN host): ping $RABBIT_IP must FAIL."
-    echo "4) Main Wi-Fi untouched: verify your router still shows WPA2/WPA3 only."
+    echo "6) Isolation: connect a temporary client to the legacy SSID; home LAN/internet must fail."
+    echo "7) Main Wi-Fi untouched: verify your router still shows WPA2/WPA3 only."
 }
 
 setup_ojn() {

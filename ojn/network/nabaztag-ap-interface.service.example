@@ -1,0 +1,15 @@
+[Unit]
+Description=Nabaztag legacy AP interface
+Wants=network-pre.target
+After=network-pre.target
+Before=hostapd.service nabaztag-dnsmasq.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/ip addr replace 192.168.66.1/24 dev __AP_IFACE__
+ExecStart=/usr/sbin/ip link set __AP_IFACE__ up
+ExecStop=-/usr/sbin/ip addr del 192.168.66.1/24 dev __AP_IFACE__
+
+[Install]
+WantedBy=multi-user.target

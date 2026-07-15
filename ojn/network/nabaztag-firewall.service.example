@@ -1,0 +1,15 @@
+[Unit]
+Description=Nabaztag legacy network isolation firewall
+Requires=nabaztag-ap-interface.service
+After=nabaztag-ap-interface.service
+Before=hostapd.service nabaztag-dnsmasq.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/nft delete table inet rabbit_isolation
+ExecStart=/usr/sbin/nft -f /etc/nftables-rabbit.conf
+ExecStop=-/usr/sbin/nft delete table inet rabbit_isolation
+
+[Install]
+WantedBy=multi-user.target
