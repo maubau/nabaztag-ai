@@ -26,10 +26,12 @@ MaxNumberOfBunnies = 4
 MaxBurstNumberOfBunnies = 8
 
 [OpenJabNabServers]
-; These are handed to the rabbit — must be the Bolt's legacy-segment IP.
-PingServer = 192.168.66.1
-BroadServer = 192.168.66.1
-XmppServer = 192.168.66.1
+; These are handed to the rabbit. MUST be a hostname, not an IPv4 literal:
+; the MTL bootcode passes the string to its DNS resolver as-is (S1 field
+; finding). dnsmasq on the legacy segment resolves ojn.local -> 192.168.66.1.
+PingServer = ojn.local
+BroadServer = ojn.local
+XmppServer = ojn.local
 ListeningHttpPort = 8080
 ListeningXmppPort = 5222
 

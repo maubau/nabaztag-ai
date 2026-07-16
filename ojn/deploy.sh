@@ -65,6 +65,29 @@ render_ojn_dir() {
     rm -f "$rendered"
 }
 
+patch_wrapper() {
+    # PHP 8.3 fixes for the 2008-era admin UI (S1 field findings). Applied
+    # after every pinned checkout -f, so they are idempotent by construction.
+    log "Patching http-wrapper for PHP 8.x"
+    local admin="$OJN_DIR/http-wrapper/ojn_admin"
+    # session_start() lost its string argument in PHP 8
+    sed -i "s/session_start('openJabNab');/session_name('openJabNab'); session_start();/" \
+        "$admin/include/common-def.php"
+    # split() was removed in PHP 8 (the pattern here is a literal pipe)
+    sed -i 's#split("\\|"#explode("|"#g' "$admin/plugins/bunnies/cinema.plugin.php"
+
+    # The admin UI expects install.php to write include/common.php at runtime,
+    # which would need an Apache-writable tree. Generate it here instead, from
+    # the (patched) template — never hand Apache write access to the checkout.
+    if [ ! -f "$admin/include/common.php" ]; then
+        local host="${OJN_ADMIN_HOST:-$(hostname -I | awk '{print $1}')}"
+        local email="${OJN_ADMIN_EMAIL:-admin@localhost}"
+        log "Generating ojn_admin/include/common.php (host=$host)"
+        sed -e "s|<HOSTNAME>|$host|g" -e "s|<EMAIL>|$email|g" \
+            "$admin/include/common-def.php" > "$admin/include/common.php"
+    fi
+}
+
 setup_ap() {
     load_env
     ip link show "$AP_IFACE" >/dev/null 2>&1 || \
@@ -147,8 +170,10 @@ setup_ojn() {
     # Debian buster (last Qt4 Debian) container, pinned to OJN_COMMIT.
     # The PHP http-wrapper is served by host Apache from the host checkout.
     log "S1/S2: OJN daemon (Qt4 container) + http-wrapper (host Apache)"
+    load_env
     sudo apt-get update -qq
-    sudo apt-get install -y docker.io apache2 php libapache2-mod-php git
+    # php-xml: required by the admin UI on PHP 8.3 (S1 field finding)
+    sudo apt-get install -y docker.io apache2 php php-xml libapache2-mod-php git
 
     log "Host checkout of OpenJabNab @ ${OJN_COMMIT:0:7} (serves http-wrapper/)"
     if [ ! -e "$OJN_DIR" ]; then
@@ -159,9 +184,18 @@ setup_ojn() {
     [ -d "$OJN_DIR/.git" ] || die "$OJN_DIR exists but is not an OpenJabNab git checkout"
     [ -w "$OJN_DIR" ] || die "$OJN_DIR is not writable; fix its ownership first"
     git -C "$OJN_DIR" fetch --quiet origin || true
-    git -C "$OJN_DIR" -c advice.detachedHead=false checkout "$OJN_COMMIT"
+    # -f resets tracked files (untracked ones, like the generated common.php,
+    # survive); the PHP 8 patches below are re-applied on every run.
+    git -C "$OJN_DIR" -c advice.detachedHead=false checkout -f "$OJN_COMMIT"
+    patch_wrapper
     # The daemon (root in the container) writes chor/broadcast files here.
     chmod -R a+rX "$OJN_DIR/http-wrapper"
+
+    log "Ensuring ojn.local resolves on the legacy segment (MTL bootcode quirk)"
+    sed -e "s|__RABBIT_MAC__|$RABBIT_MAC|" -e "s|__AP_IFACE__|$AP_IFACE|g" \
+        "$NET_DIR/dnsmasq.conf.example" > "$NET_DIR/dnsmasq.conf"
+    sudo install -m 644 "$NET_DIR/dnsmasq.conf" /etc/dnsmasq.d/nabaztag-legacy.conf
+    sudo systemctl restart nabaztag-dnsmasq 2>/dev/null || true
 
     log "Building the daemon image (reproducible; no third-party OJN images)"
     sudo docker build --build-arg OJN_COMMIT="$OJN_COMMIT" \
@@ -172,11 +206,21 @@ setup_ojn() {
     if [ ! -f "$OJN_STATE_DIR/openjabnab.ini" ]; then
         sudo install -m 644 "$REPO_ROOT/ojn/docker/openjabnab.ini.example" \
             "$OJN_STATE_DIR/openjabnab.ini"
+    else
+        # Migration (S1 finding): the rabbit's bootcode needs a resolvable
+        # hostname, not an IPv4 literal, as Ping/Broad/Xmpp server.
+        if grep -qE '^(Ping|Broad|Xmpp)Server *= *192\.168\.66\.1' \
+                "$OJN_STATE_DIR/openjabnab.ini"; then
+            log "Migrating openjabnab.ini: 192.168.66.1 -> ojn.local"
+            sudo sed -i -E 's#^((Ping|Broad|Xmpp)Server *= *)192\.168\.66\.1#\1ojn.local#' \
+                "$OJN_STATE_DIR/openjabnab.ini"
+        fi
     fi
     render_ojn_dir "$REPO_ROOT/ojn/docker/nabaztag-ojn.service.example" \
         /etc/systemd/system/nabaztag-ojn.service
     sudo systemctl daemon-reload
-    sudo systemctl enable --now nabaztag-ojn.service
+    sudo systemctl enable nabaztag-ojn.service
+    sudo systemctl restart nabaztag-ojn.service
 
     log "Configuring Apache vhost for the http-wrapper"
     render_ojn_dir "$REPO_ROOT/ojn/apache/ojn-vhost.conf.example" \
@@ -186,16 +230,41 @@ setup_ojn() {
     sudo a2ensite ojn >/dev/null
     sudo systemctl reload apache2
 
-    log "S1 smoke checks:"
-    echo "  daemon:   sudo docker logs openjabnab | tail; curl -s http://127.0.0.1:8080/ojn_api/global/about"
-    echo "  wrapper:  curl -s http://127.0.0.1/ojn_api/global/about   (via Apache+PHP proxy)"
-    echo "  bootcode: curl -sI 'http://127.0.0.1/vl/bc.jsp?v=0&m=00:00:00:00:00:00' | head -3"
+    log "S1 smoke checks (port 8080 speaks OJN's internal binary framing, NOT"
+    log "HTTP — never curl it directly; always test through Apache on :80):"
+    echo "  daemon:   sudo docker logs openjabnab | tail"
+    echo "  API:      curl -s http://127.0.0.1/ojn_api/global/about"
+    echo "  bootcode: curl -sI http://127.0.0.1/vl/bc.jsp | head -3"
+    echo "  DNS:      dig +short ojn.local @192.168.66.1   (must answer 192.168.66.1)"
+    echo "  account:  ./ojn/deploy.sh account <login> <password>   (first run only)"
     echo "  then: register the rabbit from the admin UI (http://<bolt>/ojn_admin/) — S2"
 }
 
+bootstrap_account() {
+    # The built-in admin/admin exists only in memory while zero accounts are
+    # persisted, and is never saved. Use it once to create the first real
+    # account: OJN auto-promotes that account to admin and persists it.
+    local login=$1 password=$2
+    [ -n "$login" ] && [ -n "$password" ] || die "usage: $0 account <login> <password>"
+    local api="http://127.0.0.1/ojn_api"
+
+    local token
+    token=$(curl -sf "$api/accounts/auth?login=admin&pass=admin" \
+        | sed -n 's|.*<value>\(.*\)</value>.*|\1|p')
+    [ -n "$token" ] || die "default admin/admin login failed — an account already exists (good); use it instead"
+
+    curl -sf "$api/accounts/registerNewAccount?login=$login&username=$login&pass=$password&token=$token" \
+        | grep -q "<ok>" || die "registerNewAccount failed"
+    log "Account '$login' created and auto-promoted to admin (persisted)."
+    log "The in-memory admin/admin disappears at next daemon restart:"
+    sudo systemctl restart nabaztag-ojn.service
+    log "Done. AllowAnonymousRegistration stays false in openjabnab.ini."
+}
+
 case "${1:-}" in
-    ap)     setup_ap ;;
-    ojn)    setup_ojn ;;
-    verify) verify_s0 ;;
-    *)      echo "usage: $0 {ap|ojn|verify}"; exit 1 ;;
+    ap)      setup_ap ;;
+    ojn)     setup_ojn ;;
+    verify)  verify_s0 ;;
+    account) bootstrap_account "${2:-}" "${3:-}" ;;
+    *)       echo "usage: $0 {ap|ojn|verify|account <login> <pass>}"; exit 1 ;;
 esac

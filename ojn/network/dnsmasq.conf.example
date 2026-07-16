@@ -11,8 +11,11 @@ dhcp-range=192.168.66.50,192.168.66.150,12h
 # __RABBIT_MAC__ is replaced by deploy.sh from .env (RABBIT_MAC).
 dhcp-host=__RABBIT_MAC__,192.168.66.10,nabaztag
 
-# --- DNS-override fallback (§4.1) ---
-# Only needed if the rabbit firmware ignores the "Violet Platform address" field.
-# Uncomment to point the Violet platform hostnames at the Bolt's OJN instance:
-#address=/ojn.local/192.168.66.1
+# --- OJN platform hostname (REQUIRED, S1 field finding) ---
+# The MTL bootcode does not special-case an IPv4-literal XMPP server: it hands
+# whatever string it gets to the DNS resolver. The daemon therefore announces
+# "ojn.local" (openjabnab.ini) and dnsmasq resolves it to the Bolt:
+address=/ojn.local/192.168.66.1
+
+# Optional extra override if a stock bootcode ever asks for Violet's hostname:
 #address=/r.wizz.cc/192.168.66.1

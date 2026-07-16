@@ -9,7 +9,7 @@ hardware half, run by Maurizio).** File references are to the OJN repo.
 
 | Surface | Where | Notes |
 | :--- | :--- | :--- |
-| Daemon HTTP | `localhost:8080` (config `OpenJabNabServers/ListeningHttpPort`) | `server/main/openjabnab.cpp:41` — binds **localhost only**; the Apache/PHP wrapper (`http-wrapper/openjabnab.php`) fronts it for the rabbit |
+| Daemon "HTTP" port | `localhost:8080` (config `OpenJabNabServers/ListeningHttpPort`) | ⚠️ **Not plain HTTP** (S1 field finding): it speaks OJN's internal framing (`pack("LCa*")` length+type+payload — see `openjabnab.php`). Never `curl` 8080 directly; every HTTP test goes through Apache on :80 |
 | Rabbit XMPP | `:5222` on all interfaces (`ListeningXmppPort`) | V2 rabbits speak XMPP to the server; commands are pushed, not polled — good for latency |
 | Admin/plugin API | `GET /ojn_api/<call>` | Router: `server/lib/apimanager.cpp:32` (`httphandler.cpp:38` strips the prefix) |
 | Violet-compatible API (VAPI) | `GET /ojn/FR/api.jsp` and `/ojn/FR/api_stream.jsp` | `bunny.cpp:55 ProcessVioletApiCall`. Auth: `sn=<serial>&token=<vapi token>` |
@@ -31,7 +31,7 @@ hardware half, run by Maurizio).** File references are to the OJN repo.
 | :--- | :--- | :--- |
 | TTS (server-generated) | **works-native** (source) | VAPI `api.jsp?...&tts=<text>[&voice=..]` (`bunny.cpp:159`) or `/ojn_api/bunny/<id>/tts/say?text=..` (`plugin_tts.cpp:24`). Sends `MU <file>\nPL 3\nMW\n`. We won't use OJN TTS in v1 (ElevenLabs/Piper instead) but it's the S1/S2 smoke test |
 | **MP3 by URL, queued** | **works-native** (source) | VAPI `api_stream.jsp?...&urlList=url1|url2|url3` → `ST url\nMW\nST url\nMW\n` (`bunny.cpp:67-74`). **Sentence-level MP3 queueing (§6.2.6) is a single native call** — the `|`-separated list *is* the queue. Also `webradio` plugin. No cancel, no finished-callback anywhere → `can_cancel_audio = False`, duration-timer approach confirmed |
-| **Arbitrary ear positions 0–16** | **works-native** (source) | VAPI `api.jsp?...&posleft=0..16&posright=0..16` → `AmbientPacket::SetEarsPosition` (`bunny.cpp:138-153`). Range-checked 0–16. **No plugin needed** |
+| **Arbitrary ear positions 0–16** | **works-native — HARDWARE CONFIRMED (S2, July 2026)** | VAPI `api.jsp?...&posleft=0..16&posright=0..16` → `AmbientPacket::SetEarsPosition` (`bunny.cpp:138-153`). Range-checked 0–16. Verified on the real rabbit right after registration. **No plugin needed** |
 | Per-LED RGB | **works-native via chor** (source) | No standalone LED call, but VAPI `chor=` compiles a Violet `.chor` binary server-side and pushes `CH <path>` (`bunny.cpp:168-204`). A 1-action chor sets one LED. LEDs: `0=bottom, 1=left, 2=middle, 3=right, 4=top` (`choregraphy.h:13`) |
 | Timed choreography (ears+LEDs) | **works-native** (source) | Same `chor=` param. Text format (`choregraphy.cpp:73 Parse`): `tempo,{time,motor,ear,angle,0,dir | time,led,led#,r,g,b},...` — tempo in ms/tick (10..2550, stored /10), `time` in ticks relative to sequence start, motor: `ear` 0=left 1=right, `angle` in degrees (encoded /18 → 0..16 steps of 18°), `dir` 0=fwd 1=back |
 | Sleep / wake | **works-native** (source) | VAPI `api.jsp?...&action=13` (wake) / `action=14` (sleep) (`bunny.cpp:120-127`) |
@@ -48,14 +48,16 @@ exotic left over. `ojn/plugin_choreo/` stays uncreated (per §11.4 / Gate G0 rul
 The only gap is **event egress**, which is a different, much smaller problem with a stock-plugin
 fallback (`callurl`) that requires no C++ at all.
 
-Hardware half still to confirm on the real rabbit (Maurizio, with the OJN web UI + `curl`):
+Hardware half — status on the real rabbit:
 
-1. `tts/say` audible (S1/S2 gate).
-2. `api_stream.jsp` with a 2-sentence `urlList` from the brain's MP3 server: plays both, gap length?
-3. `posleft/posright` sweep 0→16: physical positions match, motion time?
-4. 1-action LED chor on each of the 5 LEDs: colors correct?
-5. `callurl/addrfid` → rabbit GETs the brain URL on tag read: reliable? latency?
-6. Round-trip latency of a VAPI ear command (feeds BodyController deadlines and the p50 budget).
+1. ~~`tts/say` audible~~ → replaced: OJN's TTS backends are dead 2010 endpoints; audio is
+   smoke-tested with `api_stream.jsp` instead (see S1/S2 findings below).
+2. **OPEN** — `api_stream.jsp` with a 2-sentence `urlList` from a local MP3 server: plays both, gap length?
+3. **DONE** — arbitrary `posleft/posright` confirmed on hardware (S2). Motion time still to measure.
+4. **OPEN** — 1-action LED chor on each of the 5 LEDs: colors correct?
+5. **OPEN** — `callurl/addrfid` → rabbit GETs the brain URL on tag read: reliable? latency?
+6. **OPEN** — precise round-trip latency of a VAPI ear command (feeds BodyController deadlines
+   and the p50 budget).
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 
@@ -77,6 +79,37 @@ Record answers here, then stamp the matrix rows hardware-confirmed.
 - OJN's own TTS backends (acapela/google, 2010-era endpoints) are presumed dead — the `tts/say`
   smoke test may fail for that reason alone; use `api_stream.jsp` with a local MP3 URL as the
   S1/S2 audio check instead.
+
+### S1/S2 field findings (PASSED, July 2026)
+
+Container daemon + Apache wrapper + bootcode + API + XMPP all working on the Bolt; rabbit
+registered to a persistent account; XMPP session ESTAB between 192.168.66.1:5222 and the
+rabbit; boot completes (ears initialize) and a VAPI `posleft/posright` command moves the real
+ears. Lessons baked into `deploy.sh ojn`:
+
+- **XMPP server must be a hostname.** The MTL bootcode does not special-case an IPv4 literal —
+  it hands the string to its DNS resolver. Fix: dnsmasq serves `address=/ojn.local/192.168.66.1`
+  and `openjabnab.ini` announces `PingServer/BroadServer/XmppServer = ojn.local` (deploy.sh
+  migrates older INIs automatically).
+- **Port 8080 is not HTTP** (see entry-points table above) — smoke tests go through Apache :80.
+- **PHP 8.3 fixes** (patched idempotently after every pinned checkout): `php-xml` package;
+  `session_start('openJabNab')` → `session_name(...)`; `session_start()`; `split()` → `explode()`
+  in the cinema admin plugin.
+- **`ojn_admin/include/common.php` is generated by deploy.sh** from `common-def.php`
+  (`OJN_ADMIN_HOST`/`OJN_ADMIN_EMAIL` overridable) — the checkout is never made
+  Apache-writable, and `install.php` is never needed.
+- **First-account bootstrap:** the built-in `admin/admin` lives only in memory (never saved,
+  `accountmanager.cpp:111`). `./ojn/deploy.sh account <login> <pass>` uses it once: OJN
+  auto-promotes the first registered account to admin (`accountmanager.cpp:253`) and persists
+  it; the daemon is then restarted so the default admin evaporates.
+  `AllowAnonymousRegistration` stays `false`.
+- **Stray `bunnies/.dat` file explained:** `BunnyManager::GetBunny` (`bunnymanager.cpp:81`)
+  auto-creates a Bunny for *any* unknown serial — including the empty one — before any token
+  check, and saving writes `<serial>.dat` (empty serial → `.dat`). Any VAPI probe without a
+  valid `sn` triggers it. Cleanup is safe with the daemon stopped:
+  `sudo systemctl stop nabaztag-ojn && sudo rm '/var/lib/openjabnab/bunnies/.dat' && sudo systemctl start nabaztag-ojn`.
+  Don't smoke-test VAPI endpoints with bogus serials; the segment is isolated, so outside
+  scanners can't reach it.
 
 ### Hardware findings so far
 
