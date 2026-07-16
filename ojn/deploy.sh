@@ -236,7 +236,7 @@ setup_ojn() {
     echo "  API:      curl -s http://127.0.0.1/ojn_api/global/about"
     echo "  bootcode: curl -sI http://127.0.0.1/vl/bc.jsp | head -3"
     echo "  DNS:      dig +short ojn.local @192.168.66.1   (must answer 192.168.66.1)"
-    echo "  account:  ./ojn/deploy.sh account <login> <password>   (first run only)"
+    echo "  account:  ./ojn/deploy.sh account <login>   (first run only; password prompted)"
     echo "  then: register the rabbit from the admin UI (http://<bolt>/ojn_admin/) — S2"
 }
 
@@ -244,17 +244,28 @@ bootstrap_account() {
     # The built-in admin/admin exists only in memory while zero accounts are
     # persisted, and is never saved. Use it once to create the first real
     # account: OJN auto-promotes that account to admin and persists it.
-    local login=$1 password=$2
-    [ -n "$login" ] && [ -n "$password" ] || die "usage: $0 account <login> <password>"
-    local api="http://127.0.0.1/ojn_api"
+    # The password is prompted (never an argv/history item) and sent to curl
+    # via stdin (pass@-), so it shows up neither in `ps` nor in the shell log.
+    local login=$1
+    [ -n "$login" ] || die "usage: $0 account <login>   (password is prompted)"
+    local password password2
+    read -rs -p "Password for '$login': " password; echo
+    read -rs -p "Repeat password: " password2; echo
+    [ -n "$password" ] || die "empty password"
+    [ "$password" = "$password2" ] || die "passwords do not match"
 
+    local api="http://127.0.0.1/ojn_api"
     local token
-    token=$(curl -sf "$api/accounts/auth?login=admin&pass=admin" \
-        | sed -n 's|.*<value>\(.*\)</value>.*|\1|p')
+    token=$(curl -sfG --data-urlencode "login=admin" --data-urlencode "pass=admin" \
+        "$api/accounts/auth" | sed -n 's|.*<value>\(.*\)</value>.*|\1|p')
     [ -n "$token" ] || die "default admin/admin login failed — an account already exists (good); use it instead"
 
-    curl -sf "$api/accounts/registerNewAccount?login=$login&username=$login&pass=$password&token=$token" \
-        | grep -q "<ok>" || die "registerNewAccount failed"
+    printf '%s' "$password" | curl -sfG \
+        --data-urlencode "login=$login" \
+        --data-urlencode "username=$login" \
+        --data-urlencode "pass@-" \
+        --data-urlencode "token=$token" \
+        "$api/accounts/registerNewAccount" | grep -q "<ok>" || die "registerNewAccount failed"
     log "Account '$login' created and auto-promoted to admin (persisted)."
     log "The in-memory admin/admin disappears at next daemon restart:"
     sudo systemctl restart nabaztag-ojn.service
@@ -265,6 +276,6 @@ case "${1:-}" in
     ap)      setup_ap ;;
     ojn)     setup_ojn ;;
     verify)  verify_s0 ;;
-    account) bootstrap_account "${2:-}" "${3:-}" ;;
-    *)       echo "usage: $0 {ap|ojn|verify|account <login> <pass>}"; exit 1 ;;
+    account) bootstrap_account "${2:-}" ;;
+    *)       echo "usage: $0 {ap|ojn|verify|account <login>}"; exit 1 ;;
 esac

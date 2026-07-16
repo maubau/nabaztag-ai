@@ -99,7 +99,9 @@ ears. Lessons baked into `deploy.sh ojn`:
   (`OJN_ADMIN_HOST`/`OJN_ADMIN_EMAIL` overridable) — the checkout is never made
   Apache-writable, and `install.php` is never needed.
 - **First-account bootstrap:** the built-in `admin/admin` lives only in memory (never saved,
-  `accountmanager.cpp:111`). `./ojn/deploy.sh account <login> <pass>` uses it once: OJN
+  `accountmanager.cpp:111`). `./ojn/deploy.sh account <login>` (password prompted with a
+  hidden read and sent via `curl --data-urlencode pass@-` — never in argv, `ps`, shell
+  history, or unencoded in the URL) uses it once: OJN
   auto-promotes the first registered account to admin (`accountmanager.cpp:253`) and persists
   it; the daemon is then restarted so the default admin evaporates.
   `AllowAnonymousRegistration` stays `false`.
