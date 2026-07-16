@@ -40,3 +40,7 @@ LogFile = /data/openjabnab.log
 LogFileLevel = Debug
 LogScreenLevel = Info
 DisplayCronLog = false
+; Raw request dump (dump.log). Patched in our image (ojn/docker/patches):
+; OFF by default, and pass/token/tk are redacted even when enabled.
+; Turn on only temporarily for protocol debugging.
+NetworkDump = false

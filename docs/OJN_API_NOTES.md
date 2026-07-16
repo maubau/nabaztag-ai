@@ -113,6 +113,13 @@ ears. Lessons baked into `deploy.sh ojn`:
   auto-promotes the first registered account to admin (`accountmanager.cpp:253`) and persists
   it; the daemon is then restarted so the default admin evaporates.
   `AllowAnonymousRegistration` stays `false`.
+- **Security: upstream NetworkDump leaks credentials.** `NetworkDump::Log("Api Call",
+  GetRawURI())` (`httphandler.cpp:40`) appends every raw API URI — including `pass=`, `token=`
+  and `tk=` — to `dump.log` in cleartext, with no off switch upstream. Our image replaces
+  `netdump.cpp` (`ojn/docker/patches/`): the dump is **off by default** (opt-in with
+  `[Log] NetworkDump = true`) and pass/token/tk are **redacted** even when enabled. `dump.log`
+  lives in the container's ephemeral layer (not `/data`), so it dies with the container.
+  Credentials that hit the pre-patch log were rotated (July 2026).
 - **Stray `bunnies/.dat` file explained:** `BunnyManager::GetBunny` (`bunnymanager.cpp:81`)
   auto-creates a Bunny for *any* unknown serial — including the empty one — before any token
   check, and saving writes `<serial>.dat` (empty serial → `.dat`). Any VAPI probe without a

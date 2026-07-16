@@ -28,6 +28,10 @@ ARG OJN_COMMIT=640257f3cef63fb428d80b8c171f3b15d17ab0ed
 RUN git clone "$OJN_REPO" /ojn \
     && git -C /ojn -c advice.detachedHead=false checkout "$OJN_COMMIT"
 
+# Security patch: upstream NetworkDump logs raw URIs (pass/token/tk) to
+# dump.log unconditionally. Our netdump.cpp makes it opt-in + redacted.
+COPY patches/netdump.cpp /ojn/server/lib/netdump.cpp
+
 WORKDIR /ojn/server
 # 2008-era code vs gcc 8: warnings must not be errors
 RUN find . -name '*.pro' -exec sed -i 's/ -Werror//g' {} + \
