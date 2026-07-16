@@ -133,11 +133,18 @@ setup_ojn() {
     log "Deploying OpenJabNab to $OJN_DIR"
     sudo apt-get update -qq
     sudo apt-get install -y git build-essential qtbase5-dev apache2 php libapache2-mod-php
-    if [ ! -d "$OJN_DIR" ]; then
-        sudo git clone https://github.com/OpenJabNab/OpenJabNab.git "$OJN_DIR"
-    else
+    if [ ! -e "$OJN_DIR" ]; then
+        # /opt requires privilege, but qmake/make must be able to write into the
+        # checkout as the invoking user. Do not create a root-owned git tree.
+        sudo install -d -m 755 -o "$(id -u)" -g "$(id -g)" "$OJN_DIR"
+        git clone https://github.com/OpenJabNab/OpenJabNab.git "$OJN_DIR"
+    elif [ -d "$OJN_DIR/.git" ]; then
+        [ -w "$OJN_DIR" ] || \
+            die "$OJN_DIR is not writable; fix its ownership before building"
         log "OJN already cloned; pulling"
-        sudo git -C "$OJN_DIR" pull --ff-only
+        git -C "$OJN_DIR" pull --ff-only
+    else
+        die "$OJN_DIR exists but is not an OpenJabNab git checkout"
     fi
     log "Building the OJN daemon (server/)"
     ( cd "$OJN_DIR/server" && qmake && make -j"$(nproc)" ) || \
