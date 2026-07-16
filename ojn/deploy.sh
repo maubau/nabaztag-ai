@@ -17,6 +17,9 @@ AP_IFACE="${AP_IFACE:-wlan1}"
 BOLT_LEGACY_IP="192.168.66.1/24"
 RABBIT_IP="192.168.66.10"
 OJN_DIR="${OJN_DIR:-/opt/openjabnab}"
+OJN_STATE_DIR="${OJN_STATE_DIR:-/var/lib/openjabnab}"
+# OJN master as source-verified in docs/OJN_API_NOTES.md (July 2026)
+OJN_COMMIT="${OJN_COMMIT:-640257f3cef63fb428d80b8c171f3b15d17ab0ed}"
 
 log() { printf '\n==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -50,6 +53,15 @@ install_rendered() {
     rendered=$(mktemp)
     sed "s|__AP_IFACE__|$AP_IFACE|g" "$source" > "$rendered"
     sudo install -m "$mode" "$rendered" "$destination"
+    rm -f "$rendered"
+}
+
+render_ojn_dir() {
+    local source=$1 destination=$2
+    local rendered
+    rendered=$(mktemp)
+    sed "s|__OJN_DIR__|$OJN_DIR|g" "$source" > "$rendered"
+    sudo install -m 644 "$rendered" "$destination"
     rm -f "$rendered"
 }
 
@@ -130,27 +142,55 @@ verify_s0() {
 }
 
 setup_ojn() {
-    log "Deploying OpenJabNab to $OJN_DIR"
+    # OJN master is Qt4-era code and does not build against Qt5+ (Gate S1
+    # finding, docs/OJN_API_NOTES.md): the daemon runs in a locally-built
+    # Debian buster (last Qt4 Debian) container, pinned to OJN_COMMIT.
+    # The PHP http-wrapper is served by host Apache from the host checkout.
+    log "S1/S2: OJN daemon (Qt4 container) + http-wrapper (host Apache)"
     sudo apt-get update -qq
-    sudo apt-get install -y git build-essential qtbase5-dev apache2 php libapache2-mod-php
+    sudo apt-get install -y docker.io apache2 php libapache2-mod-php git
+
+    log "Host checkout of OpenJabNab @ ${OJN_COMMIT:0:7} (serves http-wrapper/)"
     if [ ! -e "$OJN_DIR" ]; then
-        # /opt requires privilege, but qmake/make must be able to write into the
-        # checkout as the invoking user. Do not create a root-owned git tree.
+        # /opt requires privilege for the mkdir only; the checkout stays user-owned.
         sudo install -d -m 755 -o "$(id -u)" -g "$(id -g)" "$OJN_DIR"
         git clone https://github.com/OpenJabNab/OpenJabNab.git "$OJN_DIR"
-    elif [ -d "$OJN_DIR/.git" ]; then
-        [ -w "$OJN_DIR" ] || \
-            die "$OJN_DIR is not writable; fix its ownership before building"
-        log "OJN already cloned; pulling"
-        git -C "$OJN_DIR" pull --ff-only
-    else
-        die "$OJN_DIR exists but is not an OpenJabNab git checkout"
     fi
-    log "Building the OJN daemon (server/)"
-    ( cd "$OJN_DIR/server" && qmake && make -j"$(nproc)" ) || \
-        die "OJN build failed — check Qt version; see docs/OJN_API_NOTES.md for build notes"
-    log "OJN built. Manual steps remain: Apache vhost for the PHP wrapper, daemon start,"
-    log "rabbit registration, and pointing the rabbit's 'Violet Platform address' at this Bolt (S1/S2)."
+    [ -d "$OJN_DIR/.git" ] || die "$OJN_DIR exists but is not an OpenJabNab git checkout"
+    [ -w "$OJN_DIR" ] || die "$OJN_DIR is not writable; fix its ownership first"
+    git -C "$OJN_DIR" fetch --quiet origin || true
+    git -C "$OJN_DIR" -c advice.detachedHead=false checkout "$OJN_COMMIT"
+    # The daemon (root in the container) writes chor/broadcast files here.
+    chmod -R a+rX "$OJN_DIR/http-wrapper"
+
+    log "Building the daemon image (reproducible; no third-party OJN images)"
+    sudo docker build --build-arg OJN_COMMIT="$OJN_COMMIT" \
+        -t openjabnab:qt4 "$REPO_ROOT/ojn/docker"
+
+    log "Installing daemon state dir ($OJN_STATE_DIR) and systemd unit"
+    sudo install -d -m 755 "$OJN_STATE_DIR"
+    if [ ! -f "$OJN_STATE_DIR/openjabnab.ini" ]; then
+        sudo install -m 644 "$REPO_ROOT/ojn/docker/openjabnab.ini.example" \
+            "$OJN_STATE_DIR/openjabnab.ini"
+    fi
+    render_ojn_dir "$REPO_ROOT/ojn/docker/nabaztag-ojn.service.example" \
+        /etc/systemd/system/nabaztag-ojn.service
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now nabaztag-ojn.service
+
+    log "Configuring Apache vhost for the http-wrapper"
+    render_ojn_dir "$REPO_ROOT/ojn/apache/ojn-vhost.conf.example" \
+        /etc/apache2/sites-available/ojn.conf
+    sudo a2enmod rewrite >/dev/null
+    sudo a2dissite 000-default >/dev/null 2>&1 || true
+    sudo a2ensite ojn >/dev/null
+    sudo systemctl reload apache2
+
+    log "S1 smoke checks:"
+    echo "  daemon:   sudo docker logs openjabnab | tail; curl -s http://127.0.0.1:8080/ojn_api/global/about"
+    echo "  wrapper:  curl -s http://127.0.0.1/ojn_api/global/about   (via Apache+PHP proxy)"
+    echo "  bootcode: curl -sI 'http://127.0.0.1/vl/bc.jsp?v=0&m=00:00:00:00:00:00' | head -3"
+    echo "  then: register the rabbit from the admin UI (http://<bolt>/ojn_admin/) — S2"
 }
 
 case "${1:-}" in

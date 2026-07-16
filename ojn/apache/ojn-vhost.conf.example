@@ -1,0 +1,17 @@
+# OJN http-wrapper vhost — the rabbit's HTTP entry point (port 80).
+# The wrapper's own .htaccess does the real routing: /vl/bc.jsp is rewritten to
+# the static bootcode, everything else is proxied to the daemon on 127.0.0.1:8080
+# by openjabnab.php — hence AllowOverride All + mod_rewrite are required.
+<VirtualHost *:80>
+    ServerName nabaztag-ojn
+    DocumentRoot __OJN_DIR__/http-wrapper
+
+    <Directory __OJN_DIR__/http-wrapper>
+        Options FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    ErrorLog ${APACHE_LOG_DIR}/ojn-error.log
+    CustomLog ${APACHE_LOG_DIR}/ojn-access.log combined
+</VirtualHost>

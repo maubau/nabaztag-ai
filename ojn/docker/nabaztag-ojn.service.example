@@ -1,0 +1,19 @@
+[Unit]
+Description=OpenJabNab daemon (Qt4, containerized, host network)
+After=docker.service nabaztag-ap-interface.service
+Requires=docker.service
+
+[Service]
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/docker rm -f openjabnab
+# Host network: HTTP API binds 127.0.0.1:8080 (reached by the Apache wrapper),
+# XMPP binds 0.0.0.0:5222 (reached by the rabbit at 192.168.66.1).
+ExecStart=/usr/bin/docker run --rm --name openjabnab --network host \
+    -v /var/lib/openjabnab:/data \
+    -v __OJN_DIR__/http-wrapper:/data/http-wrapper \
+    openjabnab:qt4
+ExecStop=/usr/bin/docker stop openjabnab
+
+[Install]
+WantedBy=multi-user.target

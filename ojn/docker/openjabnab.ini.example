@@ -1,0 +1,40 @@
+; OpenJabNab daemon config for the nabaztag-ai deployment (docs/OJN_API_NOTES.md).
+; Installed to /var/lib/openjabnab/openjabnab.ini by deploy.sh (edit there, not here);
+; the container entrypoint symlinks it next to the binary.
+
+[Config]
+httpListener = true
+httpApi = true
+httpVioletApi = true
+xmppListener = true
+; Shared with host Apache via the /data/http-wrapper bind mount
+; (nabaztag-ojn.service): the daemon writes chor/broadcast files where the
+; wrapper vhost serves them.
+RealHttpRoot = /data/http-wrapper/ojn_local/
+HttpRoot = ojn_local
+HttpPluginsFolder = plugins
+StandAloneAuthBypass = false
+AllowAnonymousRegistration = false
+AllowUserManageBunny = false
+AllowUserManageZtamp = false
+SessionTimeout = 300
+; 2010-era web TTS backends (acapela|google) — likely dead; we do not rely on
+; OJN TTS (brain does its own). Smoke-test audio with api_stream.jsp instead.
+TTS = google
+; single rabbit by design (ARCHITECTURE.md non-goals)
+MaxNumberOfBunnies = 4
+MaxBurstNumberOfBunnies = 8
+
+[OpenJabNabServers]
+; These are handed to the rabbit — must be the Bolt's legacy-segment IP.
+PingServer = 192.168.66.1
+BroadServer = 192.168.66.1
+XmppServer = 192.168.66.1
+ListeningHttpPort = 8080
+ListeningXmppPort = 5222
+
+[Log]
+LogFile = /data/openjabnab.log
+LogFileLevel = Debug
+LogScreenLevel = Info
+DisplayCronLog = false

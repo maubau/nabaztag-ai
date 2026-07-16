@@ -59,6 +59,25 @@ Hardware half still to confirm on the real rabbit (Maurizio, with the OJN web UI
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 
+### Build & deployment findings (Gate S1)
+
+- **OJN master is Qt4-era code and does not build against Qt5+** (Ubuntu 24.04): removing
+  `-Werror` is not enough — `QHttp` (removed in Qt5), `QString::toAscii()` and other API/ABI
+  breaks remain. Porting is out of scope.
+- **Deployment shape:** the daemon is built and run in a locally-built **Debian buster
+  container** (last Debian shipping Qt4), pinned to OJN commit `640257f3` — `ojn/docker/`
+  (Dockerfile + entrypoint + tuned `openjabnab.ini`). No third-party OJN images from Docker Hub.
+  Container runs with **host networking** (HTTP API binds 127.0.0.1:8080; XMPP binds :5222 for
+  the rabbit); state lives in `/var/lib/openjabnab` (bind-mounted at `/data`; the daemon keeps
+  ini/bunnies/ztamps/accounts next to its binary, the entrypoint symlinks them into `/data`).
+- The **PHP http-wrapper stays on host Apache** (vhost in `ojn/apache/`, DocumentRoot =
+  `<OJN_DIR>/http-wrapper`, `AllowOverride All` + `mod_rewrite`); `openjabnab.php` reaches the
+  daemon at 127.0.0.1:8080, and the daemon's `RealHttpRoot` points at the same `http-wrapper/
+  ojn_local/` via bind mount so chor/broadcast files land where Apache serves them.
+- OJN's own TTS backends (acapela/google, 2010-era endpoints) are presumed dead — the `tts/say`
+  smoke test may fail for that reason alone; use `api_stream.jsp` with a local MP3 URL as the
+  S1/S2 audio check instead.
+
 ### Hardware findings so far
 
 - **Gate S0: PASSED (July 2026).** Intel AC 3168 radio (`wlp3s0`) runs the WPA1/TKIP AP fine
