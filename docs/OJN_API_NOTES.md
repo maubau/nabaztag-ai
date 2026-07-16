@@ -30,7 +30,7 @@ hardware half, run by Maurizio).** File references are to the OJN repo.
 | Capability | Verdict | How |
 | :--- | :--- | :--- |
 | TTS (server-generated) | **works-native** (source) | VAPI `api.jsp?...&tts=<text>[&voice=..]` (`bunny.cpp:159`) or `/ojn_api/bunny/<id>/tts/say?text=..` (`plugin_tts.cpp:24`). Sends `MU <file>\nPL 3\nMW\n`. We won't use OJN TTS in v1 (ElevenLabs/Piper instead) but it's the S1/S2 smoke test |
-| **MP3 by URL, queued** | **works-native** (source) | VAPI `api_stream.jsp?...&urlList=url1|url2|url3` → `ST url\nMW\nST url\nMW\n` (`bunny.cpp:67-74`). **Sentence-level MP3 queueing (§6.2.6) is a single native call** — the `|`-separated list *is* the queue. Also `webradio` plugin. No cancel, no finished-callback anywhere → `can_cancel_audio = False`, duration-timer approach confirmed |
+| **MP3 by URL, queued** | **works-native — HARDWARE CONFIRMED (July 2026)** | VAPI `api_stream.jsp?...&urlList=url1|url2|url3` → `ST url\nMW\nST url\nMW\n` (`bunny.cpp:67-74`). **Sentence-level MP3 queueing (§6.2.6) is a single native call** — the `|`-separated list *is* the queue. Verified on the real rabbit: two local MP3s requested and played in order (access log 15:02:14 → 15:02:19). No cancel, no finished-callback anywhere → `can_cancel_audio = False`, duration-timer approach confirmed. **No plugin needed for the audio queue** |
 | **Arbitrary ear positions 0–16** | **works-native — HARDWARE CONFIRMED (S2, July 2026)** | VAPI `api.jsp?...&posleft=0..16&posright=0..16` → `AmbientPacket::SetEarsPosition` (`bunny.cpp:138-153`). Range-checked 0–16. Verified on the real rabbit right after registration. **No plugin needed** |
 | Per-LED RGB | **works-native via chor** (source) | No standalone LED call, but VAPI `chor=` compiles a Violet `.chor` binary server-side and pushes `CH <path>` (`bunny.cpp:168-204`). A 1-action chor sets one LED. LEDs: `0=bottom, 1=left, 2=middle, 3=right, 4=top` (`choregraphy.h:13`) |
 | Timed choreography (ears+LEDs) | **works-native** (source) | Same `chor=` param. Text format (`choregraphy.cpp:73 Parse`): `tempo,{time,motor,ear,angle,0,dir | time,led,led#,r,g,b},...` — tempo in ms/tick (10..2550, stored /10), `time` in ticks relative to sequence start, motor: `ear` 0=left 1=right, `angle` in degrees (encoded /18 → 0..16 steps of 18°), `dir` 0=fwd 1=back |
@@ -52,7 +52,9 @@ Hardware half — status on the real rabbit:
 
 1. ~~`tts/say` audible~~ → replaced: OJN's TTS backends are dead 2010 endpoints; audio is
    smoke-tested with `api_stream.jsp` instead (see S1/S2 findings below).
-2. **OPEN** — `api_stream.jsp` with a 2-sentence `urlList` from a local MP3 server: plays both, gap length?
+2. **DONE** — `api_stream.jsp` with a 2-MP3 `urlList` from a local server: rabbit fetches and
+   plays both in order (access log 15:02:14 → 15:02:19). Inter-sentence gap still worth timing
+   precisely once TTS produces real sentence pairs (feeds R5 tuning).
 3. **DONE** — arbitrary `posleft/posright` confirmed on hardware (S2). Motion time still to measure.
 4. **OPEN** — 1-action LED chor on each of the 5 LEDs: colors correct?
 5. **OPEN** — `callurl/addrfid` → rabbit GETs the brain URL on tag read: reliable? latency?
