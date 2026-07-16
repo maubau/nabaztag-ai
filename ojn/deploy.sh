@@ -64,7 +64,10 @@ setup_ap() {
     sudo apt-get install -y hostapd dnsmasq-base nftables
 
     log "Installing configs"
-    sudo install -m 600 "$NET_DIR/hostapd.conf" /etc/hostapd/nabaztag-legacy.conf
+    sudo install -d -m 755 /etc/dnsmasq.d
+    # Ubuntu's hostapd unit has a ConditionFileNotEmpty check on this canonical
+    # path, even when DAEMON_CONF is overridden in /etc/default/hostapd.
+    sudo install -m 600 "$NET_DIR/hostapd.conf" /etc/hostapd/hostapd.conf
     sudo install -m 644 "$NET_DIR/dnsmasq.conf" /etc/dnsmasq.d/nabaztag-legacy.conf
     install_rendered "$NET_DIR/nftables-rabbit.conf.example" /etc/nftables-rabbit.conf
     install_rendered "$NET_DIR/nabaztag-ap-interface.service.example" \
@@ -89,11 +92,11 @@ setup_ap() {
 
     log "Starting services"
     sudo systemctl unmask hostapd 2>/dev/null || true
-    echo 'DAEMON_CONF=/etc/hostapd/nabaztag-legacy.conf' | \
+    echo 'DAEMON_CONF=/etc/hostapd/hostapd.conf' | \
         sudo tee /etc/default/hostapd >/dev/null
     sudo systemctl enable --now nabaztag-dnsmasq.service
     sudo systemctl enable --now hostapd || {
-        echo "hostapd failed — debug with: sudo hostapd -dd /etc/hostapd/nabaztag-legacy.conf"
+        echo "hostapd failed — debug with: sudo hostapd -dd /etc/hostapd/hostapd.conf"
         echo "(an 'EAPOL-Key timeout' in the log means the eapol_version=1 issue — see §4.1)"
         exit 1
     }
@@ -115,8 +118,13 @@ verify_s0() {
         grep -E 'iifname|oifname|dport' || echo "   firewall table missing"
     echo "4) Rabbit associated + static lease:"
     grep -i "$RABBIT_MAC" /var/lib/misc/dnsmasq.leases 2>/dev/null || echo "   no lease yet — rabbit not associated?"
-    echo "5) Rabbit pingable from the Bolt:"
-    ping -c 3 -W 2 "$RABBIT_IP" && echo "   OK" || echo "   FAIL"
+    echo "5) Rabbit alive on the segment (the firmware does NOT answer ping/arping,"
+    echo "   so liveness = neighbor entry and/or its HTTP bootcode requests):"
+    ip neigh show "$RABBIT_IP" | grep -q . && ip neigh show "$RABBIT_IP" \
+        || echo "   no neighbor entry yet"
+    echo "   watch its traffic with:"
+    echo "     sudo tcpdump -ni $AP_IFACE host $RABBIT_IP and tcp port 80 -c 3"
+    echo "   (a GET /vl/bc.jsp?... is the rabbit fetching its Violet bootcode = alive)"
     echo "6) Isolation: connect a temporary client to the legacy SSID; home LAN/internet must fail."
     echo "7) Main Wi-Fi untouched: verify your router still shows WPA2/WPA3 only."
 }

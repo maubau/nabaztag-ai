@@ -59,6 +59,20 @@ Hardware half still to confirm on the real rabbit (Maurizio, with the OJN web UI
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 
+### Hardware findings so far
+
+- **Gate S0: PASSED (July 2026).** Intel AC 3168 radio (`wlp3s0`) runs the WPA1/TKIP AP fine
+  (channel 11); the rabbit associates and holds its static lease (192.168.66.10, MAC in `.env`).
+- **The V2 firmware answers neither ICMP ping nor arping.** Liveness must be judged from the
+  DHCP lease + the rabbit's own traffic; `deploy.sh verify` was updated accordingly.
+- **First rabbit request observed: `GET /vl/bc.jsp?v=0.0.0.10&m=<mac>...`** — the Violet
+  bootcode fetch, plain HTTP port 80 (firmware reports `v=0.0.0.10`). OJN's `http-wrapper`
+  handles exactly this: its `.htaccess` rewrites `^vl/bc.jsp$` to the static
+  `ojn_local/bootcode/bootcode.default`, and proxies every other rabbit path to the daemon on
+  127.0.0.1:8080 via `openjabnab.php`. **S1/S2 therefore needs Apache with `mod_rewrite` +
+  `AllowOverride` on a vhost rooted at `http-wrapper/`, port 80** — the rabbit is already
+  knocking on the right door.
+
 ## 4. Consequences for `OjnAdapter`
 
 - Primary surface = **VAPI** (`api.jsp` / `api_stream.jsp`) + a handful of `/ojn_api/bunny/...`

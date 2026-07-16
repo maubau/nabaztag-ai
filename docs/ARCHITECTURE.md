@@ -88,7 +88,9 @@ Plus, on the Bolt:
 
 **Fallback if the Bolt can't host an AP:** a spare old router flashed/configured as a WPA-TKIP-only AP on an isolated VLAN or the FRITZ\!Box guest network, with the Bolt reachable from it via controlled routing. Functionally equivalent, less reproducible for others.
 
-✅ **Gate S0:** rabbit associates, gets its static lease, and is pingable from the Bolt; the rabbit cannot reach the home LAN or the internet; the main Wi-Fi remains WPA2/WPA3.
+✅ **Gate S0:** rabbit associates, gets its static lease, and demonstrably talks to the Bolt; the rabbit cannot reach the home LAN or the internet; the main Wi-Fi remains WPA2/WPA3.
+
+> **Field note (S0 run, July 2026):** the stock V2 firmware does **not** answer ICMP ping or arping, so "pingable" is the wrong liveness test. Evidence of life is the DHCP lease plus the rabbit's own HTTP traffic — on boot it GETs `/vl/bc.jsp?v=<fw>&m=<mac>...` (Violet bootcode request, port 80) from its platform address. `ojn/deploy.sh verify` checks the neighbor table and points at the tcpdump one-liner instead.
 
 ## 5\. Architecture
 
@@ -271,7 +273,7 @@ nabaztag-ai/
 
 ## 8\. Phases & Acceptance Criteria
 
-**S0 — Network foundation (manual, BLOCKING).** Per §4.1: legacy WPA/TKIP 2.4 GHz AP on the Bolt (`hostapd` \+ `dnsmasq`), isolated subnet, static lease for the rabbit. ✅ **Gate S0:** rabbit associated and pingable from the Bolt; rabbit isolated from home LAN/internet; main Wi-Fi untouched. *Nothing downstream can start until this passes.*
+**S0 — Network foundation (manual, BLOCKING).** Per §4.1: legacy WPA/TKIP 2.4 GHz AP on the Bolt (`hostapd` \+ `dnsmasq`), isolated subnet, static lease for the rabbit. ✅ **Gate S0:** rabbit associated, static lease held, and its HTTP bootcode requests observed on the Bolt (the firmware does not answer ping — see §4.1 field note); rabbit isolated from home LAN/internet; main Wi-Fi untouched. *Nothing downstream can start until this passes.* **Status: PASSED (July 2026)** — AC 3168 AP on `wlp3s0`, channel 11, WPA1/TKIP; `GET /vl/bc.jsp?...` seen from the rabbit's static IP.
 
 **S1/S2 — OJN bring-up (manual):** OJN deployed on the Bolt; rabbit's "Violet Platform address" pointed at the Bolt's OJN instance (DNS override via the same dnsmasq only as fallback, §4.1); rabbit registered. ✅ `tts/say` from the OJN web UI makes the rabbit speak; button \+ RFID events visible in OJN logs.
 
