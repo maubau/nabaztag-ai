@@ -30,6 +30,9 @@ _VAPI_ERRORS = {
 
 PLAYBACK_GUARD_S = 0.3  # §6.2.7 half-duplex guard
 DEFAULT_PLAYBACK_S = 10.0  # conservative fallback when the caller has no duration
+# Pause the rabbit takes between queued urlList MP3s, measured on hardware
+# (approximate, 1 s log resolution — see OJN_API_NOTES.md hardware findings)
+INTER_URL_GAP_S = 1.7
 
 
 class OjnError(RuntimeError):
@@ -153,6 +156,10 @@ class OjnAdapter:
     async def play_audio(
         self, urls: tuple[str, ...], duration_s: float | None
     ) -> TimedPlaybackHandle:
+        # duration_s is the summed MP3 duration; the rabbit adds a pause
+        # between queued files, so wall time includes the inter-URL gaps.
+        if duration_s is not None:
+            duration_s += INTER_URL_GAP_S * (len(urls) - 1)
         handle = TimedPlaybackHandle(duration_s)
         await self._vapi("/ojn/FR/api_stream.jsp", urlList="|".join(urls))
         handle.mark_started()

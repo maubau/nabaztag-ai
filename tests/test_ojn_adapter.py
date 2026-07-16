@@ -2,7 +2,12 @@ import asyncio
 
 import pytest
 from rabbit_brain.body.mock_ojn import MOCK_SERIAL
-from rabbit_brain.body.ojn_adapter import OjnAdapter, OjnError, led_spec_to_chor
+from rabbit_brain.body.ojn_adapter import (
+    INTER_URL_GAP_S,
+    OjnAdapter,
+    OjnError,
+    led_spec_to_chor,
+)
 from rabbit_brain.body.types import EarsCommand, LedSpec
 
 
@@ -56,8 +61,9 @@ async def test_play_audio_sends_urllist_and_times_out_playback(adapter, mock_ojn
     assert mock_ojn.calls_of("stream")[0].params["urlList"] == "|".join(urls)
     await asyncio.wait_for(handle.wait_started(), 1)
     assert not handle.finished
-    await asyncio.wait_for(handle.wait_finished(), 2)  # 0.05s + 0.3s guard
-    assert handle.estimated_duration_s == 0.05
+    # wall-time estimate = MP3 duration + one inter-URL gap (measured ~1.7s)
+    assert handle.estimated_duration_s == pytest.approx(0.05 + INTER_URL_GAP_S)
+    await asyncio.wait_for(handle.wait_finished(), 4)  # + 0.3s guard
 
 
 async def test_playback_handle_cannot_cancel(adapter):

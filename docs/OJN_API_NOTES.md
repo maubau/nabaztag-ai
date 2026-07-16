@@ -53,8 +53,12 @@ Hardware half — status on the real rabbit:
 1. ~~`tts/say` audible~~ → replaced: OJN's TTS backends are dead 2010 endpoints; audio is
    smoke-tested with `api_stream.jsp` instead (see S1/S2 findings below).
 2. **DONE** — `api_stream.jsp` with a 2-MP3 `urlList` from a local server: rabbit fetches and
-   plays both in order (access log 15:02:14 → 15:02:19). Inter-sentence gap still worth timing
-   precisely once TTS produces real sentence pairs (feeds R5 tuning).
+   plays both in order (access log 15:02:14 → 15:02:19). **Inter-sentence gap ≈ 1.7 s**
+   (first MP3 is 3.344 s, second request ~5 s later; approximate — Apache logs have 1 s
+   resolution). Consequences: (a) when estimating playback duration for an N-URL queue, add
+   ~1.7 s per boundary (`TimedPlaybackHandle` callers / TTS layer); (b) R5 ("choppy" gaps) is
+   real — worth re-measuring precisely with real TTS sentence pairs and considering fewer,
+   longer MP3s per reply.
 3. **DONE** — arbitrary `posleft/posright` confirmed on hardware (S2). Motion time still to measure.
 4. **OPEN** — 1-action LED chor on each of the 5 LEDs: colors correct?
 5. **OPEN** — `callurl/addrfid` → rabbit GETs the brain URL on tag read: reliable? latency?
