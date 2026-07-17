@@ -1,7 +1,10 @@
 """Drive a (mock or real) rabbit through the BodyController.
 
 python -m rabbit_brain.body.demo --mock-ojn
-python -m rabbit_brain.body.demo --ojn http://bolt:8080 --serial <sn> --vapi-token <tk>
+python -m rabbit_brain.body.demo --ojn http://127.0.0.1 --serial <sn> --vapi-token <tk>
+
+(--ojn points at the Apache wrapper on port 80; never :8080, which speaks
+OJN's internal binary framing, not HTTP.)
 """
 
 from __future__ import annotations
@@ -59,7 +62,9 @@ async def demo(adapter: OjnAdapter, mock: MockOjnServer | None) -> None:
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mock-ojn", action="store_true", help="run against the in-process mock")
-    parser.add_argument("--ojn", default="http://127.0.0.1:8080", help="OJN base URL")
+    parser.add_argument(
+        "--ojn", default="http://127.0.0.1", help="OJN base URL (Apache wrapper, port 80)"
+    )
     parser.add_argument("--serial", default=MOCK_SERIAL, help="rabbit serial (sn)")
     parser.add_argument("--vapi-token", default=MOCK_VAPI_TOKEN, help="VAPI token")
     args = parser.parse_args()

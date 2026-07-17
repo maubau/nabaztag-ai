@@ -4,9 +4,13 @@ All commands enter at AGENT_EXPRESSION priority, so a live voice conversation
 (USER_SPEECH_SYNC) still takes precedence over Claude Desktop poking the body.
 
 Configuration (env, or NABAZTAG_MOCK_OJN=1 for the hardware-free mock):
-    OJN_BASE_URL     e.g. http://bolt:8080
-    RABBIT_SERIAL    the rabbit's serial (sn)
-    OJN_VAPI_TOKEN   VAPI token (see docs/OJN_API_NOTES.md §1)
+    OJN_BASE_URL          http://127.0.0.1 when running on the Bolt — the Apache
+                          wrapper on port 80. NEVER port 8080: that is OJN's
+                          internal binary framing, not HTTP (OJN_API_NOTES §1)
+    RABBIT_SERIAL         the rabbit's serial (sn — the MAC without colons)
+    OJN_VAPI_TOKEN        VAPI token (see docs/OJN_API_NOTES.md §1)
+    NABAZTAG_EVENTS_PORT  webhook listener port (default 8091; must match the
+                          URL set via events/setWebhook)
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from rabbit_brain.body import (
     Priority,
     SayCommand,
 )
+from rabbit_brain.body.events_server import EventListener
 from rabbit_brain.body.mock_ojn import MOCK_SERIAL, MOCK_VAPI_TOKEN, MockOjnServer
 from rabbit_brain.body.ojn_adapter import OjnAdapter
 
@@ -59,6 +64,14 @@ async def rabbit_lifespan(_server: FastMCP) -> AsyncIterator[RabbitContext]:
         token = os.environ["OJN_VAPI_TOKEN"]
 
     async with OjnAdapter(base_url, serial, token) as adapter:
+        # Receives ojn-plugin-events webhooks and feeds adapter.events()
+        listener = EventListener(
+            adapter.push_event,
+            port=int(os.environ.get("NABAZTAG_EVENTS_PORT", "8091")),
+            serial=serial,
+        )
+        await listener.start()
+
         ctx = RabbitContext(controller=BodyController(adapter))
         run_task = asyncio.create_task(ctx.controller.run())
 
@@ -75,6 +88,7 @@ async def rabbit_lifespan(_server: FastMCP) -> AsyncIterator[RabbitContext]:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            await listener.stop()
             if mock is not None:
                 await mock.stop()
 
