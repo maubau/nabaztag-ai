@@ -4,11 +4,15 @@ MCP server (stdio) exposing the rabbit to Claude Desktop / Claude Code, **throug
 `BodyController`** — never the adapter directly — at `AGENT_EXPRESSION` priority, so a live
 voice conversation always wins over a Desktop command.
 
-Tools: `speak(text)`, `move_ears(left, right)`, `set_leds({led: [r,g,b]}, pulse)`,
-`play_choreography(name)`, `last_rfid()`, `body_state()`.
+Tools: `speak(text)`, `dance_demo(text)`, `move_ears(left, right)`,
+`set_leds({led: [r,g,b]}, pulse)`, `play_choreography(name)`, `last_rfid()`, `body_state()`.
 
 The lifespan also starts the **EventListener** (default `127.0.0.1:8091`) that receives
-`ojn-plugin-events` webhooks, so `last_rfid()` reflects real tag reads.
+`ojn-plugin-events` webhooks, so `last_rfid()` reflects real tag reads — and, with
+`TTS_PROFILE` set, the **Mp3Server** (default `:8090`) so `speak` does real TTS
+(ElevenLabs or Piper → local MP3 → OJN urlList playback; OJN's own tts/say backends are
+dead). `dance_demo` speaks a line while running a LED/ear choreography sized to the audio
+duration.
 
 ## Install & try (no hardware)
 
@@ -26,6 +30,12 @@ OJN_BASE_URL=http://127.0.0.1     # the Apache wrapper, port 80.
 RABBIT_SERIAL=<sn>                # the rabbit's MAC without colons
 OJN_VAPI_TOKEN=<token>            # from /ojn_api/bunny/<sn>/getVAPIToken
 NABAZTAG_EVENTS_PORT=8091         # optional; must match events/setWebhook
+
+# real speech (recommended):
+TTS_PROFILE=elevenlabs            # or: piper (needs PIPER_MODEL + ffmpeg)
+ELEVENLABS_API_KEY=...
+ELEVENLABS_VOICE_ID=...
+NABAZTAG_MP3_BASE_URL=http://192.168.66.1:8090   # as seen by the RABBIT
 ```
 
 The MCP server must run **on the Bolt**: the events webhook targets `127.0.0.1:8091` from the

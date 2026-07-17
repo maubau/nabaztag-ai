@@ -1,0 +1,64 @@
+"""ElevenLabs TTS provider (cloud profile, docs/ARCHITECTURE.md §6.2.6)."""
+
+from __future__ import annotations
+
+import os
+import uuid
+from pathlib import Path
+
+import aiohttp
+from mutagen.mp3 import MP3
+
+from .base import TTSResult
+
+API_BASE = "https://api.elevenlabs.io/v1"
+DEFAULT_MODEL = "eleven_multilingual_v2"
+
+
+class ElevenLabsTTS:
+    def __init__(
+        self,
+        audio_dir: Path,
+        voice_id: str,
+        api_key: str | None = None,
+        model: str = DEFAULT_MODEL,
+        session: aiohttp.ClientSession | None = None,
+    ):
+        self._audio_dir = Path(audio_dir)
+        self._audio_dir.mkdir(parents=True, exist_ok=True)
+        self._voice_id = voice_id
+        self._api_key = api_key or os.environ["ELEVENLABS_API_KEY"]
+        self._model = model
+        self._session = session
+        self._own_session = session is None
+
+    async def __aenter__(self) -> ElevenLabsTTS:
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        if self._own_session and self._session is not None:
+            await self._session.close()
+            self._session = None
+
+    async def synth(self, text: str) -> TTSResult:
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+            self._own_session = True
+        url = f"{API_BASE}/text-to-speech/{self._voice_id}"
+        async with self._session.post(
+            url,
+            params={"output_format": "mp3_44100_128"},
+            headers={"xi-api-key": self._api_key},
+            json={"text": text, "model_id": self._model},
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"ElevenLabs HTTP {resp.status}: {await resp.text()}")
+            data = await resp.read()
+        path = self._audio_dir / f"{uuid.uuid4().hex}.mp3"
+        path.write_bytes(data)
+        return TTSResult(path=path, duration_s=MP3(path).info.length)
