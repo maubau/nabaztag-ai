@@ -188,8 +188,9 @@ setup_ojn() {
     # survive); the PHP 8 patches below are re-applied on every run.
     git -C "$OJN_DIR" -c advice.detachedHead=false checkout -f "$OJN_COMMIT"
     patch_wrapper
-    # The daemon (root in the container) writes chor/broadcast files here.
-    chmod -R a+rX "$OJN_DIR/http-wrapper"
+    # The daemon (root in the container) writes chor/broadcast files here, so
+    # after the first run the tree contains root-owned files: chmod needs sudo.
+    sudo chmod -R a+rX "$OJN_DIR/http-wrapper"
 
     log "Ensuring ojn.local resolves on the legacy segment (MTL bootcode quirk)"
     sed -e "s|__RABBIT_MAC__|$RABBIT_MAC|" -e "s|__AP_IFACE__|$AP_IFACE|g" \
