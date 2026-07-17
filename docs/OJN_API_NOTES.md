@@ -126,6 +126,12 @@ ears. Lessons baked into `deploy.sh ojn`:
   `[Log] NetworkDump = true`) and pass/token/tk are **redacted** even when enabled. `dump.log`
   lives in the container's ephemeral layer (not `/data`), so it dies with the container.
   Credentials that hit the pre-patch log were rotated (July 2026).
+- **Security: Apache access log also carried credentials.** The vhost initially used the stock
+  `combined` format, which logs `%r` — the full request line including OJN's `pass`/`token`/`tk`
+  query parameters. The vhost now defines a dedicated `ojn_noquery` LogFormat using
+  `%m %U %H` (`%U` excludes the query string) for `ojn-access.log`. After deploying the updated
+  vhost: rotate the account password again and truncate the old access log
+  (`sudo truncate -s0 /var/log/apache2/ojn-access.log`, or logrotate + delete).
 - **Stray `bunnies/.dat` file explained:** `BunnyManager::GetBunny` (`bunnymanager.cpp:81`)
   auto-creates a Bunny for *any* unknown serial — including the empty one — before any token
   check, and saving writes `<serial>.dat` (empty serial → `.dat`). Any VAPI probe without a
