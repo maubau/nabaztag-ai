@@ -198,8 +198,10 @@ setup_ojn() {
     sudo systemctl restart nabaztag-dnsmasq 2>/dev/null || true
 
     log "Building the daemon image (reproducible; no third-party OJN images)"
-    sudo docker build --build-arg OJN_COMMIT="$OJN_COMMIT" \
-        -t openjabnab:qt4 "$REPO_ROOT/ojn/docker"
+    # context = ojn/ so the GPL plugin_events sources are inside it
+    sudo docker build -f "$REPO_ROOT/ojn/docker/Dockerfile" \
+        --build-arg OJN_COMMIT="$OJN_COMMIT" \
+        -t openjabnab:qt4 "$REPO_ROOT/ojn"
 
     log "Installing daemon state dir ($OJN_STATE_DIR) and systemd unit"
     sudo install -d -m 755 "$OJN_STATE_DIR"
@@ -238,6 +240,7 @@ setup_ojn() {
     echo "  DNS:      dig +short ojn.local @192.168.66.1   (must answer 192.168.66.1)"
     echo "  account:  ./ojn/deploy.sh account <login>   (first run only; password prompted)"
     echo "  then: register the rabbit from the admin UI (http://<bolt>/ojn_admin/) — S2"
+    echo "  events:   enable the webhook plugin per bunny — see ojn/plugin_events/README.md"
 }
 
 bootstrap_account() {

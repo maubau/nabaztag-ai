@@ -6,7 +6,8 @@
 # container, pinned to an exact OJN commit for reproducibility. Built locally
 # from this file — no third-party OJN images involved.
 #
-# Build:  docker build --build-arg OJN_COMMIT=<sha> -t openjabnab:qt4 .
+# Build context is ojn/ (the parent dir), so the GPL plugin_events sources can
+# be copied in:  docker build -f ojn/docker/Dockerfile -t openjabnab:qt4 ojn/
 # Run:    host network (rabbit → Bolt on 5222/XMPP; Apache → 127.0.0.1:8080),
 #         state in /data — see nabaztag-ojn.service.example.
 
@@ -30,15 +31,21 @@ RUN git clone "$OJN_REPO" /ojn \
 
 # Security patch: upstream NetworkDump logs raw URIs (pass/token/tk) to
 # dump.log unconditionally. Our netdump.cpp makes it opt-in + redacted.
-COPY patches/netdump.cpp /ojn/server/lib/netdump.cpp
+COPY docker/patches/netdump.cpp /ojn/server/lib/netdump.cpp
+
+# ojn-plugin-events (GPL, ojn/plugin_events/): server-side webhook egress for
+# click/RFID — Gate G0 verdict: the stock callurl path is dead (the bootcode
+# ignores CU), so events must leave from the server.
+COPY plugin_events /ojn/server/plugins/events
+RUN sed -i 's/^SUBDIRS = /SUBDIRS = events /' /ojn/server/plugins/plugins.pro
 
 WORKDIR /ojn/server
 # 2008-era code vs gcc 8: warnings must not be errors
 RUN find . -name '*.pro' -exec sed -i 's/ -Werror//g' {} + \
     && qmake-qt4 && make -j"$(nproc)"
 
-COPY openjabnab.ini.example /ojn/server/openjabnab.ini.default
-COPY entrypoint.sh /entrypoint.sh
+COPY docker/openjabnab.ini.example /ojn/server/openjabnab.ini.default
+COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # HTTP API (localhost-only inside the netns → host net required) + rabbit XMPP

@@ -36,7 +36,7 @@ hardware half, run by Maurizio).** File references are to the OJN repo.
 | Timed choreography (ears+LEDs) | **works-native — HARDWARE CONFIRMED (July 2026)** | Same `chor=` param. Text format (`choregraphy.cpp:73 Parse`): `tempo,{time,motor,ear,angle,0,dir | time,led,led#,r,g,b},...` — tempo in ms/tick (10..2550, stored /10), `time` in ticks relative to sequence start, motor: `ear` 0=left 1=right, `angle` in degrees (encoded /18 → 0..16 steps of 18°), `dir` 0=fwd 1=back. Verified end-to-end: VAPI answers CHORSENT, the rabbit fetches the generated `.chor` over HTTP (200 OK via the shared http-wrapper mount) and plays the timed sequence |
 | Sleep / wake | **works-native** (source) | VAPI `api.jsp?...&action=13` (wake) / `action=14` (sleep) (`bunny.cpp:120-127`) |
 | Raw frames | **works-native** (source) | `/ojn_api/bunny/<id>/packet/sendPacket?data=<hex>` (raw bytes) and `packet/sendMessage?msg=<text>` (wrapped in a MessagePacket) (`plugin_packet.cpp`). Known message verbs from plugin sources: `MU <path/url>` play MP3, `ST <url>` stream, `PL <n>` playlist/jingle choice, `MW` wait-end-of-playback, `CH <chor path>` run choreography, `CU <url>` make the rabbit call a URL |
-| **RFID / button events egress** | **needs-plugin (small) — with two native fallbacks** | No webhook and no event-polling endpoint exist. `getlast/getlasts` (`bunny.cpp:961-989`) only expose connection metadata (LastIP etc.), admin-only. Events are dispatched to C++ plugins (`OnClick`, `OnRFID` — `plugininterface.h:47-49`). Options: **(a)** tiny `ojn-plugin-events` posting webhooks — clean, ~50 lines, but it is a plugin; **(b)** `callurl` plugin (stock): map RFID tag → URL via `/ojn_api/bunny/<id>/callurl/addrfid?tag=<hex>&url=..` — on tag read the **rabbit itself** fetches the URL (`CU` verb, `plugin_callurl.cpp:28`), so pointing it at the brain's HTTP server turns a GET-from-rabbit-IP into the event, zero C++; **(c)** single/double-click → `setSingleClickPlugin` to a plugin we control. **Decision: try (b) on hardware first; build (a) only if (b) proves unreliable.** Note this is NOT the choreography plugin — see verdict below |
+| **RFID / button events egress** | **needs-plugin — CONFIRMED on hardware; `ojn-plugin-events` built (July 2026)** | No webhook and no event-polling endpoint exist. `getlast/getlasts` (`bunny.cpp:961-989`) only expose connection metadata, admin-only. Events are dispatched to C++ plugins (`OnClick`, `OnRFID` — `plugininterface.h:47-49`). **The stock `callurl` fallback FAILED on hardware:** the click reaches OJN and callurl sends the `CU <url>` packet (confirmed and decoded in the XMPP traffic), but the OJN bootcode never performs the HTTP request — zero DNS/TCP toward the target, even with an IPv4 literal on port 80. Since RFID/callurl shares the same final `CU` leg, the fallback is disqualified. **Resolution: `ojn/plugin_events/`** (GPL, ~100 lines) fires a server-side GET to a per-bunny webhook on `OnClick`/`OnRFID`; brain side is `rabbit_brain.body.events_server.EventListener` (default 127.0.0.1:8091). Note this is NOT the choreography plugin — see verdict below |
 | Ears/LED state readback | **not-possible** (source) | VAPI `ears` param answers a hardcoded `POSITIONEAR 0,0` TODO (`bunny.cpp:164-167`). BodyController must own state-tracking (it already does by design) |
 
 ## 3. Gate G0 verdict (software half)
@@ -45,8 +45,10 @@ hardware half, run by Maurizio).** File references are to the OJN repo.
 timed choreographies, queued MP3-by-URL, and sleep/wake; `packet/sendMessage` covers anything
 exotic left over. `ojn/plugin_choreo/` stays uncreated (per §11.4 / Gate G0 rules).
 
-The only gap is **event egress**, which is a different, much smaller problem with a stock-plugin
-fallback (`callurl`) that requires no C++ at all.
+The only gap is **event egress**: the stock `callurl` fallback was disqualified on hardware
+(the bootcode ignores `CU` — see the matrix row), so the small webhook plugin
+`ojn/plugin_events/` (GPL, cleanly separated per ARCHITECTURE §11.1) fills it. The T1
+choreography plugin remains unnecessary.
 
 Hardware half — status on the real rabbit:
 
@@ -63,7 +65,11 @@ Hardware half — status on the real rabbit:
 4. **DONE** — per-LED RGB + timed choreography confirmed: 5-LED color sequence (red, green,
    blue, yellow, cyan) then off; CHORSENT answered and `.chor` downloaded by the rabbit with
    HTTP 200 (validates the shared RealHttpRoot bind mount end-to-end).
-5. **OPEN** — `callurl/addrfid` → rabbit GETs the brain URL on tag read: reliable? latency?
+5. **RESOLVED (callurl FAILED)** — the bootcode ignores the `CU` verb: callurl's packet is
+   sent and decoded on the XMPP wire, but the rabbit performs no DNS/TCP/HTTP toward the
+   target. Event egress = `ojn/plugin_events/` webhook plugin (server-side, click + RFID).
+   **Remaining to verify on hardware:** plugin webhook fires end-to-end for click and RFID,
+   and its event latency (risk R3 expects 1–2 s from the rabbit's ping interval).
 6. **OPEN** — precise round-trip latency of a VAPI ear command (feeds BodyController deadlines
    and the p50 budget).
 

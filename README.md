@@ -54,6 +54,11 @@ All body output funnels through the `BodyController` (single owner of the body, 
 
 ## License
 
-Apache-2.0 (root, covers `brain/`, `mcp/`, `demos/`, docs, configs). If Gate G0 ever requires the OpenJabNab choreography plugin, it will live in `ojn/plugin_choreo/` under **OpenJabNab's GPL** (derivative work), cleanly separated — the brain talks to it only over HTTP.
+Apache-2.0 (root, covers `brain/`, `mcp/`, `demos/`, docs, configs) — with one exception:
+[ojn/plugin_events/](ojn/plugin_events/) is an OpenJabNab plugin (webhook egress for
+button/RFID events) and, as a derivative work of OpenJabNab, is licensed under **OpenJabNab's
+GPL v2** (its LICENSE is OJN's COPYING, copied verbatim). It is cleanly separated: no code is
+shared with `brain/` or `mcp/` — the brain talks to OJN only over HTTP. The choreography
+plugin foreseen in the architecture turned out to be unnecessary (Gate G0).
 
 *Nabaztag is a trademark of its respective owner; this is an independent community project, not affiliated with Violet/Aldebaran.*

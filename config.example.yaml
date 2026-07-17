@@ -44,3 +44,9 @@ mp3_server:
   host: 0.0.0.0     # must be reachable from the legacy segment
   port: 8090
   audio_dir: www/audio
+
+events_listener:
+  # Receives ojn-plugin-events webhooks (click/RFID). The OJN daemon runs with
+  # host networking on the same box, so localhost is enough.
+  host: 127.0.0.1
+  port: 8091
