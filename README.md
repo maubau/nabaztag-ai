@@ -1,5 +1,7 @@
 # nabaztag-ai 🐰
 
+[![CI](https://github.com/maubau/nabaztag-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/maubau/nabaztag-ai/actions/workflows/ci.yml)
+
 > AI brain for the original Nabaztag rabbit — LLM tool-use embodiment, voice pipeline, MCP server. Physical AI, 2006 edition.
 
 *(demo GIF — coming with Phase 1)*
