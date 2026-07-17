@@ -16,6 +16,8 @@
     # Do NOT use the stock "combined" format here: it logs %r (the full request
     # line), and OJN carries pass/token/tk in query strings. %U excludes the
     # query string, so credentials never reach the access log.
-    LogFormat "%h %l %u %t \"%m %U %H\" %>s %O \"%{User-Agent}i\"" ojn_noquery
+    # %b (not %O) for the response size: %O would require mod_logio, which
+    # deploy.sh does not enable.
+    LogFormat "%h %l %u %t \"%m %U %H\" %>s %b \"%{User-Agent}i\"" ojn_noquery
     CustomLog ${APACHE_LOG_DIR}/ojn-access.log ojn_noquery
 </VirtualHost>
