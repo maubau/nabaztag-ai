@@ -35,6 +35,15 @@ python -m rabbit_brain.body.demo --mock-ojn   # drive a simulated rabbit
 
 With real hardware, start from **Gate S0** (the rabbit's legacy Wi-Fi segment — see [docs/ARCHITECTURE.md §4.1](docs/ARCHITECTURE.md) and [ojn/](ojn/)).
 
+On the Bolt, the audio-in pipeline (reSpeaker capture, openWakeWord, silero-vad, DoA) needs the extras and the XVF3800 udev rule:
+
+```bash
+pip install -e "brain[audio]"        # + "brain[stt-local]" for stt_profile: local
+sudo install -m 644 brain/udev/70-respeaker-flex.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger
+python -m rabbit_brain.audio.demo --config config.yaml --mock-ojn   # mic smoke test
+```
+
 ## Architecture
 
 ```

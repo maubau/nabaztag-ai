@@ -1,0 +1,12 @@
+# reSpeaker Flex (XMOS XVF3800) — USB control interface access for the brain.
+#
+# Scoped to exactly this device (2886:001e); deliberately NOT MODE="0666"
+# (that would let every local user poke the vendor control interface).
+# The non-root service user must be in the plugdev group; TAG+="uaccess"
+# additionally grants access to locally logged-in sessions.
+#
+# Install on the Bolt:
+#   sudo install -m 644 brain/udev/70-respeaker-flex.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+#   sudo usermod -aG plugdev <service-user>   # then re-login
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2886", ATTRS{idProduct}=="001e", GROUP="plugdev", MODE="0660", TAG+="uaccess"

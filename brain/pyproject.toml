@@ -16,6 +16,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Audio-in pipeline on the Bolt (capture, wake word, VAD, DoA). Kept out of
+# the base deps so CI and the Mac dev env never pull ALSA/onnx wheels.
+audio = [
+    "numpy>=1.26",
+    "sounddevice>=0.4.6",
+    "openwakeword>=0.6",
+    "pysilero-vad>=2.0",
+    "pyusb>=1.2",
+]
+# stt_profile: local (faster-whisper on the Bolt CPU)
+stt-local = [
+    "faster-whisper>=1.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

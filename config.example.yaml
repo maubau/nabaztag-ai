@@ -45,10 +45,32 @@ audio:
   vad_end_of_speech_ms: 700
   half_duplex_guard_ms: 300
 
+wake:
+  # openWakeWord model names or .onnx paths (openwakeword.utils.download_models)
+  models: [hey_jarvis]
+  threshold: 0.5
+
 doa:
-  # Direction-of-arrival via the XVF3800 USB control interface — still to be
-  # verified with the official Flex tool before enabling.
-  enabled: false
+  # Direction-of-arrival via the XVF3800 USB control interface.
+  # Hardware-verified on the Bolt (July 2026) with the official Flex host tool:
+  # USB 2886:001e, SPEECH_DETECTED toggles, DOA_VALUE stable over 0-359°.
+  enabled: true
+  # "command": shell out to the official host-control tool (external dependency
+  #   — the respeaker/reSpeaker_Flex repo declares no license, so its code is
+  #   never vendored into this Apache-2.0 tree). The angle is parsed as the
+  #   last number in stdout.
+  # "usb": our own PyUSB client (rabbit_brain.audio.doa.XvfUsbDoa) — fill in
+  #   doa.usb resid/cmd ids from the tool's command map and verify against the
+  #   official tool before switching.
+  # Either way DoA is fail-open: a USB error never stops wake/VAD/STT.
+  backend: command
+  command: "xvf_host GET_DOA_VALUE"          # adapt to the tool's actual CLI
+  # speech_command: "xvf_host GET_SPEECH_DETECTED"   # optional
+  # usb:
+  #   resid: 0        # resource id from the firmware command map — VERIFY
+  #   cmd_doa: 0      # DOA_VALUE command id — VERIFY
+  #   cmd_speech: 0   # SPEECH_DETECTED command id — VERIFY (optional)
+  #   value_format: f # f = float32, i = int32
 
 mp3_server:
   # Tiny HTTP server that serves TTS output to the rabbit (docs/ARCHITECTURE.md §5)
