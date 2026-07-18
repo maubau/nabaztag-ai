@@ -33,19 +33,21 @@ ojn:
   # OJN_TOKEN comes from .env, not from here
 
 audio:
-  # ALSA capture device. Use the STABLE card name (plughw:CARD=...), never the
-  # numeric index (plughw:2,0) — card numbers can change across reboots.
-  # Interim mic: PC-LM1E USB webcam (mono 16-bit/16kHz verified on the Bolt).
-  # When the reSpeaker XVF3800 arrives: plughw:CARD=<its name>,DEV=0.
-  capture_device: "plughw:CARD=PCLM1E,DEV=0"
+  # reSpeaker Flex XVF3800 (hardware-verified on the Bolt, July 2026): ALSA
+  # card "C16K6Ch", 16 kHz / 6 channels; channel 0 is by far the loudest and
+  # clearest, so capture all 6 and select it. Always use the STABLE card name
+  # (hw:CARD=...), never the numeric index — card numbers change across reboots.
+  # (Interim fallback, mono webcam: plughw:CARD=PCLM1E,DEV=0 with channels: 1.)
+  capture_device: "hw:CARD=C16K6Ch,DEV=0"
   sample_rate: 16000
-  channels: 1
+  channels: 6
+  selected_channel: 0
   vad_end_of_speech_ms: 700
   half_duplex_guard_ms: 300
 
 doa:
-  # Direction-of-arrival needs the reSpeaker's XVF3800 control interface.
-  # Keep disabled until the reSpeaker replaces the interim webcam mic.
+  # Direction-of-arrival via the XVF3800 USB control interface — still to be
+  # verified with the official Flex tool before enabling.
   enabled: false
 
 mp3_server:
