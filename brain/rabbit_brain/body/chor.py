@@ -7,6 +7,10 @@ angle in degrees (encoded server-side as /18 → 0..16 steps).
 
 from __future__ import annotations
 
+# The chor string travels as a GET query parameter and is compiled server-side:
+# cap the dance so a long TTS reply cannot produce an absurd URL/sequence.
+MAX_DANCE_S = 60.0
+
 DANCE_COLORS = [
     (255, 0, 0),
     (0, 255, 0),
@@ -24,6 +28,7 @@ def build_dance_chor(duration_s: float, tempo_ms: int = 100) -> str:
     ticks the ears alternate front/back — enough body language for the
     dance_demo without hammering OJN with individual commands.
     """
+    duration_s = min(duration_s, MAX_DANCE_S)
     ticks = max(10, int(duration_s * 1000 / tempo_ms))
     parts = [str(tempo_ms)]
     step = 0

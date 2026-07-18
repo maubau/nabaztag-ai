@@ -95,12 +95,16 @@ async def test_speaker_long_text_splits_into_sentence_queue(tmp_path):
         )
         total = await speaker.speak(long_text, Priority.AGENT_EXPRESSION)
         assert len(tts.synths) > 1
-        cmd, priority = controller.submitted[0]
-        assert len(cmd.urls) == len(tts.synths)
         assert total == 1.5 * len(tts.synths)
-        assert priority == Priority.AGENT_EXPRESSION
-        # single urlList submission: one PlayAudioCommand, not one per sentence
-        assert len(controller.submitted) == 1
+        # time-to-first-audio: the first sentence goes out alone, immediately;
+        # the rest follows as one urlList batch synthesized while it plays
+        assert len(controller.submitted) == 2
+        first_cmd, first_priority = controller.submitted[0]
+        rest_cmd, _ = controller.submitted[1]
+        assert len(first_cmd.urls) == 1
+        assert first_cmd.duration_s == 1.5
+        assert len(rest_cmd.urls) == len(tts.synths) - 1
+        assert first_priority == Priority.AGENT_EXPRESSION
     finally:
         await server.stop()
 
@@ -117,6 +121,26 @@ async def test_speaker_through_real_controller_hits_ojn_stream(controller, mock_
         assert "utt1.mp3" in mock_ojn.calls_of("stream")[0].params["urlList"]
     finally:
         await server.stop()
+
+
+def test_build_dance_chor_capped():
+    from rabbit_brain.body.chor import MAX_DANCE_S
+
+    assert build_dance_chor(10_000.0) == build_dance_chor(MAX_DANCE_S)
+
+
+async def test_mp3_server_purges_old_files(tmp_path):
+    import os
+    import time
+
+    server = Mp3Server(tmp_path, host="127.0.0.1", port=0, retention_s=60)
+    old, fresh = tmp_path / "old.mp3", tmp_path / "fresh.mp3"
+    old.write_bytes(b"x")
+    fresh.write_bytes(b"x")
+    os.utime(old, (time.time() - 3600, time.time() - 3600))
+    assert server.purge_now() == 1
+    assert not old.exists()
+    assert fresh.exists()
 
 
 def test_recording_controller_matches_bodycontroller_surface():

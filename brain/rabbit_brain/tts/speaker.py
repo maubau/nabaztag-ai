@@ -34,10 +34,26 @@ class Speaker:
 
     async def speak(self, text: str, priority: Priority = Priority.USER_SPEECH_SYNC) -> float:
         """Synthesize and queue `text`; returns the summed MP3 duration in seconds
-        (excluding inter-file gaps, which the adapter adds to its estimate)."""
+        (excluding inter-file gaps, which the adapter adds to its estimate).
+
+        Time-to-first-audio: the first sentence is submitted as soon as it is
+        synthesized; the remaining sentences are synthesized while it plays and
+        queued as a second urlList (the controller's audio lane sequences them).
+        """
         chunks = [text] if len(text) <= SINGLE_FILE_MAX_CHARS else split_sentences(text)
-        results = [await self._provider.synth(chunk) for chunk in chunks]
-        urls = tuple(self._mp3.url_for(r.path) for r in results)
-        total = sum(r.duration_s for r in results)
-        await self._controller.submit(PlayAudioCommand(urls, total), priority)
+        if not chunks:
+            return 0.0
+        first = await self._provider.synth(chunks[0])
+        await self._controller.submit(
+            PlayAudioCommand((self._mp3.url_for(first.path),), first.duration_s), priority
+        )
+        total = first.duration_s
+        if len(chunks) > 1:
+            rest = [await self._provider.synth(chunk) for chunk in chunks[1:]]
+            rest_total = sum(r.duration_s for r in rest)
+            await self._controller.submit(
+                PlayAudioCommand(tuple(self._mp3.url_for(r.path) for r in rest), rest_total),
+                priority,
+            )
+            total += rest_total
         return total

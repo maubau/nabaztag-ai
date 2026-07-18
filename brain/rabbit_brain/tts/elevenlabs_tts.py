@@ -13,6 +13,9 @@ from .base import TTSResult
 
 API_BASE = "https://api.elevenlabs.io/v1"
 DEFAULT_MODEL = "eleven_multilingual_v2"
+# A hung TTS call must not freeze the voice loop: fail fast and let the caller
+# decide (the p50 budget is ~4s end-to-end).
+DEFAULT_TIMEOUT_S = 20.0
 
 
 class ElevenLabsTTS:
@@ -22,8 +25,10 @@ class ElevenLabsTTS:
         voice_id: str,
         api_key: str | None = None,
         model: str = DEFAULT_MODEL,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
         session: aiohttp.ClientSession | None = None,
     ):
+        self._timeout = aiohttp.ClientTimeout(total=timeout_s)
         self._audio_dir = Path(audio_dir)
         self._audio_dir.mkdir(parents=True, exist_ok=True)
         self._voice_id = voice_id
@@ -55,6 +60,7 @@ class ElevenLabsTTS:
             params={"output_format": "mp3_44100_128"},
             headers={"xi-api-key": self._api_key},
             json={"text": text, "model_id": self._model},
+            timeout=self._timeout,
         ) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"ElevenLabs HTTP {resp.status}: {await resp.text()}")
