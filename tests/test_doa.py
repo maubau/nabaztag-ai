@@ -70,9 +70,12 @@ async def test_fail_open_swallows_everything():
 @pytest.mark.parametrize(
     ("payload", "angle", "speech"),
     [
-        (bytes([0, 16, 0, 0]), 16, False),  # measured on hardware: 16°
+        # 5-byte payloads captured on the real XVF3800 (July 2026)
+        (bytes([0, 181, 0, 1, 0]), 181, True),
+        (bytes([0, 21, 1, 1, 0]), 277, True),
+        (bytes([0, 103, 1, 1, 0]), 359, True),
+        (bytes([0, 16, 0, 0, 0]), 16, False),
         (bytes([0, 75, 1, 1]), 331, True),  # 331° = 75 + 256, speech active
-        (bytes([0, 102, 1, 0]), 358, False),  # 358°
         (bytes([0, 0, 0, 1]), 0, True),
     ],
 )
@@ -99,6 +102,36 @@ def test_make_doa_disabled_and_backends():
     assert isinstance(provider._inner, CommandDoa)
     with pytest.raises(ValueError):
         make_doa({"doa": {"enabled": True, "backend": "ouija"}})
+
+
+class FakeUsbDevice:
+    """Records the control-transfer setup packet and answers like the XVF3800."""
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+        self.calls: list[tuple] = []
+
+    def ctrl_transfer(self, bmRequestType, bRequest, wValue, wIndex, length, timeout):
+        self.calls.append((bmRequestType, bRequest, wValue, wIndex, length, timeout))
+        # hardware behavior: a transfer shorter than status + DOA_VALUE.length
+        # (5 bytes) is answered with an error status, not the value
+        if length < len(self._payload):
+            return bytes([0x42] * length)
+        return self._payload
+
+
+async def test_flex_usb_doa_requests_five_byte_transfer():
+    dev = FakeUsbDevice(bytes([0, 181, 0, 1, 0]))  # 181°, speech — hardware sample
+    doa = FlexUsbDoa()
+    doa._dev = dev  # bypass usb.core.find: no hardware in CI
+    assert await doa.read() == DoaReading(angle_deg=181, speech_detected=True)
+    (call,) = dev.calls
+    bm_request_type, b_request, w_value, w_index, length, _timeout = call
+    assert length == 5  # status + DOA_VALUE.length; 4 would fail on hardware
+    assert bm_request_type == 0xC0  # vendor, device-to-host
+    assert b_request == 0
+    assert w_value == FLEX_DOA_CMD | 0x80  # command id with the read bit
+    assert w_index == FLEX_DOA_RESID
 
 
 async def test_flex_usb_doa_fail_open_without_device():

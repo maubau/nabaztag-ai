@@ -65,9 +65,10 @@ wake:
 
 doa:
   # Direction-of-arrival via the XVF3800 USB control interface.
-  # Hardware-verified on the Bolt (July 2026): USB 2886:001e, DOA_VALUE at
-  # resid=20/cmd=18 returns [status, angle_low, angle_high, speech_detected]
-  # in ONE transfer (angle 0-359° little-endian, speech flag byte).
+  # Hardware-confirmed on the Bolt (July 2026): USB 2886:001e, DOA_VALUE at
+  # resid=20/cmd=18, one 5-byte transfer (status + DOA_VALUE.length) returns
+  # [status, angle_low, angle_high, speech_detected, extra] — angle 0-359°
+  # little-endian, speech flag byte. Works without sudo via the udev rule.
   # DoA is fail-open in every backend: a USB error never stops wake/VAD/STT.
   enabled: true
   # "flex" (default): our own PyUSB decoder for the verified layout above

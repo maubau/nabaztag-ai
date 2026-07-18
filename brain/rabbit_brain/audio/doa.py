@@ -5,9 +5,10 @@ DoA is strictly additive and fail-open: any USB/tool error is logged
 
 Three backends, selected in config.yaml (`doa.backend`):
 
-- "flex" (default): PyUSB client for the reSpeaker Flex XVF3800 as verified
-  on the Bolt (July 2026): DOA_VALUE at resid=20, cmd=18; ONE control read
-  returns [status, angle_low, angle_high, speech_detected] — angle 0-359° as
+- "flex" (default): PyUSB client for the reSpeaker Flex XVF3800,
+  hardware-confirmed on the Bolt (July 2026): DOA_VALUE at resid=20, cmd=18;
+  ONE 5-byte control read (status + DOA_VALUE.length) returns
+  [status, angle_low, angle_high, speech_detected, extra] — angle 0-359° as
   a 16-bit little-endian pair plus the speech flag, in a single transfer.
   License-clean: written from the documented XMOS device-control transport
   (vendor control transfer, bRequest 0, wValue = command id | read bit,
@@ -168,8 +169,14 @@ class FlexUsbDoa(_XvfUsbBase):
         self._resid = resid
         self._cmd = cmd
 
+    # Transfer length = 1 status byte + DOA_VALUE.length (4): asking for fewer
+    # bytes makes the device answer with an error status (hardware-verified:
+    # a 4-byte request fails, a 5-byte one returns
+    # [status, angle_low, angle_high, speech, extra]).
+    _TRANSFER_LEN = 5
+
     def _read_sync(self) -> DoaReading:
-        return decode_flex_doa(self._control_read(self._resid, self._cmd, 4))
+        return decode_flex_doa(self._control_read(self._resid, self._cmd, self._TRANSFER_LEN))
 
     async def read(self) -> DoaReading:
         return await asyncio.to_thread(self._read_sync)
