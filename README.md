@@ -38,11 +38,14 @@ With real hardware, start from **Gate S0** (the rabbit's legacy Wi-Fi segment â€
 On the Bolt, the audio-in pipeline (reSpeaker capture, openWakeWord, silero-vad, DoA) needs the extras and the XVF3800 udev rule:
 
 ```bash
-pip install -e "brain[audio]"        # + "brain[stt-local]" for stt_profile: local
+sudo apt install libportaudio2       # sounddevice's runtime library
+brain/scripts/install-audio.sh       # add --stt-local for stt_profile: local
 sudo install -m 644 brain/udev/70-respeaker-flex.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
 python -m rabbit_brain.audio.demo --config config.yaml --mock-ojn   # mic smoke test
 ```
+
+(The script exists because openWakeWord's Linux dependency on tflite-runtime has no Python 3.12 wheel; we only use its ONNX backend, so it is installed `--no-deps` on top of the `brain[audio]` extra. CI runs the same script on Ubuntu 24.04/3.12.)
 
 ## Architecture
 

@@ -18,10 +18,19 @@ dependencies = [
 [project.optional-dependencies]
 # Audio-in pipeline on the Bolt (capture, wake word, VAD, DoA). Kept out of
 # the base deps so CI and the Mac dev env never pull ALSA/onnx wheels.
+# NOTE: openwakeword is deliberately NOT listed — on Linux it hard-depends on
+# tflite-runtime, which has no CPython 3.12 wheel, while we only use its ONNX
+# backend. Install with brain/scripts/install-audio.sh, which adds
+# openwakeword --no-deps on top of this extra (its declared runtime deps
+# minus tflite-runtime are carried here so nothing is silently missing).
 audio = [
     "numpy>=1.26",
     "sounddevice>=0.4.6",
-    "openwakeword>=0.6",
+    "onnxruntime>=1.10,<2",
+    "tqdm>=4.0,<5",
+    "scipy>=1.3,<2",
+    "scikit-learn>=1,<2",
+    "requests>=2.0,<3",
     "pysilero-vad>=2.0",
     "pyusb>=1.2",
 ]

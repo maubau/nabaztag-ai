@@ -31,3 +31,19 @@ jobs:
           ruff format --check .
       - name: Unit tests (mock-OJN, no hardware)
         run: pytest -v
+
+  audio-install-smoke:
+    # Mirrors the Bolt (Ubuntu 24.04 / Python 3.12) and exercises optional-dep
+    # resolution, which the mock unit tests never touch: openwakeword's Linux
+    # tflite-runtime dep has no cp312 wheel, so the install must go through
+    # brain/scripts/install-audio.sh (ONNX-only path).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: PortAudio shared library (sounddevice runtime dep)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libportaudio2
+      - name: Install audio extra + import smoke
+        run: brain/scripts/install-audio.sh

@@ -40,7 +40,10 @@ class OpenWakeWordDetector:
 
     def _ensure_model(self):
         if self._model is None:
-            from openwakeword.model import Model  # optional dep: 'rabbit-brain[audio]'
+            # optional dep — install via brain/scripts/install-audio.sh (openwakeword
+            # goes in --no-deps: its Linux tflite-runtime dep has no cp312 wheel and
+            # we only use the ONNX backend)
+            from openwakeword.model import Model
 
             self._model = Model(
                 wakeword_models=list(self._model_names),
