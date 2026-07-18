@@ -55,7 +55,9 @@ async def run(args: argparse.Namespace, config: dict, moods: dict) -> None:
         )
     else:
         capture = AlsaCapture(
-            device=audio_cfg.get("capture_device", "hw:CARD=C16K6Ch,DEV=0"),
+            device=audio_cfg.get(
+                "capture_device_index", audio_cfg.get("capture_device", "hw:CARD=C16K6Ch,DEV=0")
+            ),
             sample_rate=audio_cfg.get("sample_rate", 16_000),
             channels=audio_cfg.get("channels", 6),
             selected_channel=audio_cfg.get("selected_channel", 0),

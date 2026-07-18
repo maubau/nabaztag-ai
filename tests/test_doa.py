@@ -3,7 +3,17 @@ from pathlib import Path
 
 import pytest
 import yaml
-from rabbit_brain.audio.doa import CommandDoa, DoaReading, FailOpenDoa, angle_to_ears, make_doa
+from rabbit_brain.audio.doa import (
+    FLEX_DOA_CMD,
+    FLEX_DOA_RESID,
+    CommandDoa,
+    DoaReading,
+    FailOpenDoa,
+    FlexUsbDoa,
+    angle_to_ears,
+    decode_flex_doa,
+    make_doa,
+)
 
 MOODS_DOA = yaml.safe_load((Path(__file__).parent.parent / "moods.yaml").read_text())["doa"]
 
@@ -57,10 +67,41 @@ async def test_fail_open_swallows_everything():
     assert reading is not None and reading.angle_deg == 90
 
 
+@pytest.mark.parametrize(
+    ("payload", "angle", "speech"),
+    [
+        (bytes([0, 16, 0, 0]), 16, False),  # measured on hardware: 16°
+        (bytes([0, 75, 1, 1]), 331, True),  # 331° = 75 + 256, speech active
+        (bytes([0, 102, 1, 0]), 358, False),  # 358°
+        (bytes([0, 0, 0, 1]), 0, True),
+    ],
+)
+def test_decode_flex_doa(payload, angle, speech):
+    # angle is a 16-bit LE pair + separate speech byte — decoding bytes 1-4 as
+    # one int32 would corrupt the angle whenever the speech byte is set
+    assert decode_flex_doa(payload) == DoaReading(angle_deg=angle, speech_detected=speech)
+
+
+def test_decode_flex_doa_short_payload():
+    with pytest.raises(RuntimeError, match="too short"):
+        decode_flex_doa(bytes([0, 16]))
+
+
 def test_make_doa_disabled_and_backends():
     assert make_doa({"doa": {"enabled": False}}) is None
     assert make_doa({}) is None
+    # default backend is the hardware-verified Flex decoder
+    default = make_doa({"doa": {"enabled": True}})
+    assert isinstance(default, FailOpenDoa)
+    assert isinstance(default._inner, FlexUsbDoa)
+    assert (default._inner._resid, default._inner._cmd) == (FLEX_DOA_RESID, FLEX_DOA_CMD)
     provider = make_doa({"doa": {"enabled": True, "backend": "command", "command": "echo 1"}})
-    assert isinstance(provider, FailOpenDoa)
+    assert isinstance(provider._inner, CommandDoa)
     with pytest.raises(ValueError):
         make_doa({"doa": {"enabled": True, "backend": "ouija"}})
+
+
+async def test_flex_usb_doa_fail_open_without_device():
+    # no XVF3800 on this machine (or no pyusb): the wrapped provider must
+    # degrade to None, never raise — wake/VAD/STT keep running
+    assert await FailOpenDoa(FlexUsbDoa()).read() is None

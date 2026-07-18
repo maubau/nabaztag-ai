@@ -1,5 +1,13 @@
-from .capture import AlsaCapture, MicCapture, WavCapture, extract_channel
-from .doa import CommandDoa, DoaReading, FailOpenDoa, XvfUsbDoa, angle_to_ears
+from .capture import AlsaCapture, MicCapture, WavCapture, extract_channel, resolve_input_device
+from .doa import (
+    CommandDoa,
+    DoaReading,
+    FailOpenDoa,
+    FlexUsbDoa,
+    XvfUsbDoa,
+    angle_to_ears,
+    decode_flex_doa,
+)
 from .pipeline import VoicePipeline
 from .vad import UtteranceRecorder
 from .wake import OpenWakeWordDetector
@@ -9,6 +17,7 @@ __all__ = [
     "CommandDoa",
     "DoaReading",
     "FailOpenDoa",
+    "FlexUsbDoa",
     "MicCapture",
     "OpenWakeWordDetector",
     "UtteranceRecorder",
@@ -16,5 +25,7 @@ __all__ = [
     "WavCapture",
     "XvfUsbDoa",
     "angle_to_ears",
+    "decode_flex_doa",
     "extract_channel",
+    "resolve_input_device",
 ]

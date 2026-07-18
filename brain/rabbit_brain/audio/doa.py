@@ -3,19 +3,21 @@
 DoA is strictly additive and fail-open: any USB/tool error is logged
 (throttled) and read() returns None — wake/VAD/STT never depend on it.
 
-Two backends, selected in config.yaml (`doa.backend`):
+Three backends, selected in config.yaml (`doa.backend`):
 
-- "command" (default): run an external command (the official XMOS/Seeed host
-  tool, e.g. `xvf_host GET_DOA_VALUE`) and parse the angle from its stdout.
-  The tool stays an EXTERNAL dependency: the respeaker/reSpeaker_Flex repo
-  declares no license, so none of its code is copied into this Apache-2.0
-  tree (see docs/OJN_API_NOTES.md licensing note).
-- "usb": our own PyUSB client speaking the documented XMOS device-control
-  USB transport (vendor control transfers: bRequest 0, wValue = command id,
-  wIndex = resource id; on reads the first payload byte is a status code,
-  the rest is the little-endian value). The numeric resource/command ids are
-  firmware-build specific and therefore config, not constants — verify them
-  on the Bolt against the official tool before switching backends.
+- "flex" (default): PyUSB client for the reSpeaker Flex XVF3800 as verified
+  on the Bolt (July 2026): DOA_VALUE at resid=20, cmd=18; ONE control read
+  returns [status, angle_low, angle_high, speech_detected] — angle 0-359° as
+  a 16-bit little-endian pair plus the speech flag, in a single transfer.
+  License-clean: written from the documented XMOS device-control transport
+  (vendor control transfer, bRequest 0, wValue = command id | read bit,
+  wIndex = resource id), no vendor code — the respeaker/reSpeaker_Flex repo
+  declares no license, so none of its code is copied into this Apache-2.0 tree.
+- "command": run an external ONE-SHOT command and parse the angle from its
+  stdout. Not for continuously-running tools (e.g. respeaker_get_doa.py
+  never exits and would always hit the timeout).
+- "usb": generic XMOS device-control read (status byte + one little-endian
+  32-bit value) for other firmware builds; resid/cmd ids from config.
 
 Ear-reflex mapping (angle → EarsCommand) reads the `doa:` section of
 moods.yaml; the pipeline submits the result through the BodyController at
@@ -36,6 +38,10 @@ log = logging.getLogger(__name__)
 
 XVF3800_VID = 0x2886
 XVF3800_PID = 0x001E
+
+# reSpeaker Flex firmware command map, hardware-verified on the Bolt (July 2026)
+FLEX_DOA_RESID = 20
+FLEX_DOA_CMD = 18
 
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
@@ -86,34 +92,20 @@ class CommandDoa:
         return DoaReading(angle_deg=angle, speech_detected=speech)
 
 
-class XvfUsbDoa:
-    """License-clean PyUSB client for the XMOS device-control USB transport.
+class _XvfUsbBase:
+    """Shared PyUSB plumbing for the XMOS device-control USB transport.
 
-    Written from the documented protocol, not from vendor code. resid/cmd
-    numeric ids depend on the firmware's command map: take them from the
-    official tool's YAML and put them in config.yaml (`doa.usb`).
+    Written from the documented protocol, not from vendor code: a read is a
+    vendor control transfer with bRequest 0, wValue = command id with the
+    read bit set, wIndex = resource id; the first payload byte is a status
+    code (0 = success).
     """
 
     _READ_BIT = 0x80  # set on the command id for read transfers
     _REQ_TYPE_READ = 0xC0  # vendor | device-to-host
     _STATUS_OK = 0
 
-    def __init__(
-        self,
-        resid: int,
-        cmd_doa: int,
-        cmd_speech: int | None = None,
-        payload_len: int = 5,  # 1 status byte + one 32-bit value
-        value_format: str = "f",  # struct format of the value: "f" or "i"
-        vid: int = XVF3800_VID,
-        pid: int = XVF3800_PID,
-        usb_timeout_ms: int = 500,
-    ):
-        self._resid = resid
-        self._cmd_doa = cmd_doa
-        self._cmd_speech = cmd_speech
-        self._payload_len = payload_len
-        self._value_format = value_format
+    def __init__(self, vid: int = XVF3800_VID, pid: int = XVF3800_PID, usb_timeout_ms: int = 500):
         self._vid = vid
         self._pid = pid
         self._timeout_ms = usb_timeout_ms
@@ -131,26 +123,91 @@ class XvfUsbDoa:
                 )
         return self._dev
 
-    def _control_read(self, cmd: int) -> float:
+    def _control_read(self, resid: int, cmd: int, length: int) -> bytes:
         dev = self._ensure_device()
-        data = dev.ctrl_transfer(
-            self._REQ_TYPE_READ,
-            0,  # bRequest
-            cmd | self._READ_BIT,  # wValue: command id with read bit
-            self._resid,  # wIndex: resource id
-            self._payload_len,
-            self._timeout_ms,
+        data = bytes(
+            dev.ctrl_transfer(
+                self._REQ_TYPE_READ,
+                0,  # bRequest
+                cmd | self._READ_BIT,  # wValue: command id with read bit
+                resid,  # wIndex: resource id
+                length,
+                self._timeout_ms,
+            )
         )
         if len(data) < 1 or data[0] != self._STATUS_OK:
             raise RuntimeError(f"XVF3800 control read failed, status {data[:1]!r}")
-        (value,) = struct.unpack("<" + self._value_format, bytes(data[1:5]))
+        return data
+
+
+def decode_flex_doa(data: bytes) -> DoaReading:
+    """Decode the Flex DOA_VALUE payload: [status, angle_low, angle_high, speech].
+
+    The angle is a 16-bit little-endian degree value (0-359); byte 3 is the
+    SPEECH_DETECTED flag. NOT a packed float/int32 — decoding bytes 1-4 as one
+    number corrupts the angle whenever the speech byte is set.
+    """
+    if len(data) < 4:
+        raise RuntimeError(f"Flex DOA payload too short: {data!r}")
+    angle = (data[1] + 256 * data[2]) % 360
+    return DoaReading(angle_deg=angle, speech_detected=bool(data[3]))
+
+
+class FlexUsbDoa(_XvfUsbBase):
+    """reSpeaker Flex XVF3800 DoA — angle and speech flag in one USB read."""
+
+    def __init__(
+        self,
+        resid: int = FLEX_DOA_RESID,
+        cmd: int = FLEX_DOA_CMD,
+        vid: int = XVF3800_VID,
+        pid: int = XVF3800_PID,
+        usb_timeout_ms: int = 500,
+    ):
+        super().__init__(vid, pid, usb_timeout_ms)
+        self._resid = resid
+        self._cmd = cmd
+
+    def _read_sync(self) -> DoaReading:
+        return decode_flex_doa(self._control_read(self._resid, self._cmd, 4))
+
+    async def read(self) -> DoaReading:
+        return await asyncio.to_thread(self._read_sync)
+
+
+class XvfUsbDoa(_XvfUsbBase):
+    """Generic XMOS device-control value read (status + one 32-bit value).
+
+    For firmware builds with a different command map than the Flex; resid/cmd
+    ids and the value format come from config.yaml (`doa.usb`).
+    """
+
+    def __init__(
+        self,
+        resid: int,
+        cmd_doa: int,
+        cmd_speech: int | None = None,
+        value_format: str = "f",  # struct format of the value: "f" or "i"
+        vid: int = XVF3800_VID,
+        pid: int = XVF3800_PID,
+        usb_timeout_ms: int = 500,
+    ):
+        super().__init__(vid, pid, usb_timeout_ms)
+        self._resid = resid
+        self._cmd_doa = cmd_doa
+        self._cmd_speech = cmd_speech
+        self._value_format = value_format
+
+    def _read_value(self, cmd: int) -> float:
+        data = self._control_read(self._resid, cmd, 5)  # status + 32-bit value
+        (value,) = struct.unpack("<" + self._value_format, data[1:5])
         return float(value)
 
     async def read(self) -> DoaReading:
-        angle = int(round(await asyncio.to_thread(self._control_read, self._cmd_doa))) % 360
+        angle = int(round(await asyncio.to_thread(self._read_value, self._cmd_doa))) % 360
         speech = None
         if self._cmd_speech is not None:
-            speech = (await asyncio.to_thread(self._control_read, self._cmd_speech)) != 0
+            speech = (await asyncio.to_thread(self._read_value, self._cmd_speech)) != 0
         return DoaReading(angle_deg=angle, speech_detected=speech)
 
 
@@ -178,9 +235,15 @@ def make_doa(config: dict[str, Any]) -> FailOpenDoa | None:
     cfg = config.get("doa", {})
     if not cfg.get("enabled", False):
         return None
-    backend = cfg.get("backend", "command")
-    if backend == "command":
-        inner: DoaProvider = CommandDoa(
+    backend = cfg.get("backend", "flex")
+    if backend == "flex":
+        flex_cfg = cfg.get("flex", {})
+        inner: DoaProvider = FlexUsbDoa(
+            resid=flex_cfg.get("resid", FLEX_DOA_RESID),
+            cmd=flex_cfg.get("cmd", FLEX_DOA_CMD),
+        )
+    elif backend == "command":
+        inner = CommandDoa(
             command=cfg["command"],
             speech_command=cfg.get("speech_command"),
             timeout_s=cfg.get("timeout_s", 2.0),
@@ -194,7 +257,7 @@ def make_doa(config: dict[str, Any]) -> FailOpenDoa | None:
             value_format=usb_cfg.get("value_format", "f"),
         )
     else:
-        raise ValueError(f"unknown doa.backend {backend!r} (expected 'command' or 'usb')")
+        raise ValueError(f"unknown doa.backend {backend!r} (expected 'flex', 'command' or 'usb')")
     return FailOpenDoa(inner)
 
 

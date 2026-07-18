@@ -28,8 +28,10 @@ llm:
   max_history_turns: 20
 
 ojn:
-  # Self-hosted OpenJabNab on the Bolt (docs/ARCHITECTURE.md §6.1)
-  base_url: http://127.0.0.1:8080
+  # Self-hosted OpenJabNab on the Bolt: the Apache wrapper on port 80.
+  # NEVER :8080 — that port speaks OJN's internal binary framing, not HTTP
+  # (docs/OJN_API_NOTES.md §1).
+  base_url: http://127.0.0.1
   # OJN_TOKEN comes from .env, not from here
 
 audio:
@@ -38,7 +40,12 @@ audio:
   # clearest, so capture all 6 and select it. Always use the STABLE card name
   # (hw:CARD=...), never the numeric index — card numbers change across reboots.
   # (Interim fallback, mono webcam: plughw:CARD=PCLM1E,DEV=0 with channels: 1.)
+  # Note: sounddevice/PortAudio does not take arbitrary ALSA PCM strings the
+  # way arecord does — the brain extracts the card token (C16K6Ch) and
+  # resolves the PortAudio device index dynamically at start. If that ever
+  # mismatches, pin the index explicitly with capture_device_index.
   capture_device: "hw:CARD=C16K6Ch,DEV=0"
+  # capture_device_index: 3   # optional: explicit PortAudio index override
   sample_rate: 16000
   channels: 6
   selected_channel: 0
@@ -46,30 +53,40 @@ audio:
   half_duplex_guard_ms: 300
 
 wake:
-  # openWakeWord model names or .onnx paths (openwakeword.utils.download_models)
+  # openWakeWord model names or paths. The stock hey_jarvis model is for the
+  # initial smoke test ONLY — the target wake phrase is "Nabaztag", which
+  # needs a custom model trained with openWakeWord's synthetic-data pipeline
+  # (Apache-2.0; https://github.com/dscripka/openWakeWord — the trained
+  # artifact is ours, record training provenance alongside the file).
+  # Model weights are gitignored; keep them in models/wake/.
   models: [hey_jarvis]
+  # models: [models/wake/nabaztag.onnx]
   threshold: 0.5
 
 doa:
   # Direction-of-arrival via the XVF3800 USB control interface.
-  # Hardware-verified on the Bolt (July 2026) with the official Flex host tool:
-  # USB 2886:001e, SPEECH_DETECTED toggles, DOA_VALUE stable over 0-359°.
+  # Hardware-verified on the Bolt (July 2026): USB 2886:001e, DOA_VALUE at
+  # resid=20/cmd=18 returns [status, angle_low, angle_high, speech_detected]
+  # in ONE transfer (angle 0-359° little-endian, speech flag byte).
+  # DoA is fail-open in every backend: a USB error never stops wake/VAD/STT.
   enabled: true
-  # "command": shell out to the official host-control tool (external dependency
-  #   — the respeaker/reSpeaker_Flex repo declares no license, so its code is
-  #   never vendored into this Apache-2.0 tree). The angle is parsed as the
-  #   last number in stdout.
-  # "usb": our own PyUSB client (rabbit_brain.audio.doa.XvfUsbDoa) — fill in
-  #   doa.usb resid/cmd ids from the tool's command map and verify against the
-  #   official tool before switching.
-  # Either way DoA is fail-open: a USB error never stops wake/VAD/STT.
-  backend: command
-  command: "xvf_host GET_DOA_VALUE"          # adapt to the tool's actual CLI
-  # speech_command: "xvf_host GET_SPEECH_DETECTED"   # optional
+  # "flex" (default): our own PyUSB decoder for the verified layout above
+  #   (rabbit_brain.audio.doa.FlexUsbDoa — license-clean, no vendor code:
+  #   the respeaker/reSpeaker_Flex repo declares no license, so nothing from
+  #   it is vendored into this Apache-2.0 tree).
+  # "command": one-shot external tool, angle = last number in stdout. NOT for
+  #   continuously-running scripts (respeaker_get_doa.py never exits → timeout).
+  # "usb": generic XMOS device-control read (status + one 32-bit value) for
+  #   other firmware builds; set doa.usb resid/cmd ids from its command map.
+  backend: flex
+  # flex:
+  #   resid: 20       # DOA_VALUE resource id (verified)
+  #   cmd: 18         # DOA_VALUE command id (verified)
+  # command: "..."    # one-shot CLI, if backend: command
   # usb:
-  #   resid: 0        # resource id from the firmware command map — VERIFY
-  #   cmd_doa: 0      # DOA_VALUE command id — VERIFY
-  #   cmd_speech: 0   # SPEECH_DETECTED command id — VERIFY (optional)
+  #   resid: 0
+  #   cmd_doa: 0
+  #   cmd_speech: 0   # optional
   #   value_format: f # f = float32, i = int32
 
 mp3_server:

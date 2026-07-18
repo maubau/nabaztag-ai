@@ -2,7 +2,7 @@ import array
 import wave
 
 import pytest
-from rabbit_brain.audio.capture import WavCapture, extract_channel
+from rabbit_brain.audio.capture import WavCapture, extract_channel, resolve_input_device
 
 
 def make_multichannel_wav(path, channels=6, sample_rate=16_000, frames=2048):
@@ -59,6 +59,27 @@ async def test_wav_capture_channel_zero_matches_respeaker_config(tmp_path):
     mono = array.array("h")
     mono.frombytes(block)
     assert list(mono) == [n % 500 for n in range(512)]
+
+
+# A realistic PortAudio device listing on the Bolt: the ALSA PCM string is not
+# a valid PortAudio name — resolution goes through the card token instead.
+PORTAUDIO_DEVICES = [
+    {"name": "HDA Intel: ALC888 (hw:0,0)", "max_input_channels": 2},
+    {"name": "reSpeaker XVF3800: USB Audio (hw:1,0)", "max_input_channels": 0},  # output side
+    {"name": "C16K6Ch: USB Audio (hw:2,0)", "max_input_channels": 6},
+    {"name": "PC-LM1E: USB Audio (hw:3,0)", "max_input_channels": 1},
+]
+
+
+def test_resolve_input_device_by_card_token():
+    assert resolve_input_device(PORTAUDIO_DEVICES, "hw:CARD=C16K6Ch,DEV=0") == 2
+    assert resolve_input_device(PORTAUDIO_DEVICES, "plughw:CARD=PCLM1E,DEV=0") is None  # no match
+    assert resolve_input_device(PORTAUDIO_DEVICES, "pc-lm1e") == 3  # plain substring works too
+
+
+def test_resolve_input_device_skips_output_only():
+    devices = [{"name": "C16K6Ch: USB Audio", "max_input_channels": 0}]
+    assert resolve_input_device(devices, "hw:CARD=C16K6Ch,DEV=0") is None
 
 
 def test_wav_capture_rejects_non_16bit(tmp_path):

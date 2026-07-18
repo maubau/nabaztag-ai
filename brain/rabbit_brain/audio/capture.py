@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import wave
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -24,6 +25,25 @@ log = logging.getLogger(__name__)
 
 DEFAULT_BLOCK_SAMPLES = 512  # 32 ms at 16 kHz — the silero-vad chunk size
 _BYTES_PER_SAMPLE = 2  # s16le everywhere
+
+_CARD_RE = re.compile(r"CARD=([^,]+)")
+
+
+def resolve_input_device(devices: list[dict], wanted: str) -> int | None:
+    """Find the PortAudio input-device index matching an ALSA-style name.
+
+    PortAudio does not accept arbitrary ALSA PCM strings the way arecord
+    does — sounddevice matches devices by index or by substring of the
+    PortAudio device NAME. So from "hw:CARD=C16K6Ch,DEV=0" we extract the
+    card token ("C16K6Ch") and look for an input-capable device whose name
+    contains it. Returns None if nothing matches.
+    """
+    match = _CARD_RE.search(wanted)
+    token = (match.group(1) if match else wanted).lower()
+    for index, dev in enumerate(devices):
+        if dev.get("max_input_channels", 0) > 0 and token in dev.get("name", "").lower():
+            return index
+    return None
 
 
 def extract_channel(pcm: bytes, channels: int, selected: int) -> bytes:
@@ -62,7 +82,7 @@ class AlsaCapture:
 
     def __init__(
         self,
-        device: str = "hw:CARD=C16K6Ch,DEV=0",
+        device: str | int = "hw:CARD=C16K6Ch,DEV=0",
         sample_rate: int = 16_000,
         channels: int = 6,
         selected_channel: int = 0,
@@ -80,6 +100,20 @@ class AlsaCapture:
     @property
     def sample_rate(self) -> int:
         return self._sample_rate
+
+    def _resolve_device(self, sd) -> str | int:
+        """An explicit index passes through; an ALSA-style string is resolved
+        against the PortAudio device list (see resolve_input_device). If no
+        match is found the original string is handed to PortAudio as-is —
+        it may still match as a name substring."""
+        if isinstance(self._device, int):
+            return self._device
+        index = resolve_input_device(list(sd.query_devices()), self._device)
+        if index is not None:
+            log.info("capture device %r resolved to PortAudio index %d", self._device, index)
+            return index
+        log.warning("no PortAudio device matches %r, passing it through", self._device)
+        return self._device
 
     async def frames(self) -> AsyncIterator[bytes]:
         import sounddevice as sd  # optional dep: pip install 'rabbit-brain[audio]'
@@ -101,7 +135,7 @@ class AlsaCapture:
             loop.call_soon_threadsafe(_push, bytes(indata))
 
         stream = sd.RawInputStream(
-            device=self._device,
+            device=self._resolve_device(sd),
             samplerate=self._sample_rate,
             channels=self._channels,
             dtype="int16",
