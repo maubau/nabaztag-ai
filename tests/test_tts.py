@@ -123,22 +123,59 @@ async def test_speaker_through_real_controller_hits_ojn_stream(controller, mock_
         await server.stop()
 
 
+def _chor_is_valid(chor: str) -> tuple[int, int]:
+    """Choregraphy::Parse validity → (tempo_ms, last_tick)."""
+    fields = chor.split(",")
+    assert (len(fields) - 1) % 6 == 0
+    tempo = int(fields[0])
+    assert 10 <= tempo <= 2550
+    last_tick = max(int(fields[i]) for i in range(1, len(fields), 6))
+    return tempo, last_tick
+
+
 def test_build_wake_ack_chor_short_and_valid():
     from rabbit_brain.body.chor import build_wake_ack_chor
 
     for side in ("left", "right", None):
         chor = build_wake_ack_chor(side, listen_pose=(0, 0))
-        fields = chor.split(",")
-        assert (len(fields) - 1) % 6 == 0  # Choregraphy::Parse validity
-        tempo = int(fields[0])
-        last_tick = max(int(fields[i]) for i in range(1, len(fields), 6))
-        assert 300 <= last_tick * tempo <= 500  # UX: one short non-blocking ack
+        tempo, last_tick = _chor_is_valid(chor)
+        assert 300 <= last_tick * tempo <= 600  # UX: one short non-blocking ack
+        # all 5 LEDs flash white at t0
+        for led in range(5):
+            assert f"0,led,{led},255,255,255" in chor
         # ends in the listening pose (0° = position 0) for both ears
         for ear in ("0", "1"):
             assert f",motor,{ear},0,0,1" in chor
-    # sided ack twitches only that ear at t0 (motor 0=left, 1=right)
-    assert "0,motor,0,45,0,0" in build_wake_ack_chor("left", listen_pose=(0, 0))
-    assert "0,motor,0,45" not in build_wake_ack_chor("right", listen_pose=(0, 0))
+    # sided ack twitches only that ear at t0 by 72° (4 exact /18 steps)
+    assert "0,motor,0,72,0,0" in build_wake_ack_chor("left", listen_pose=(0, 0))
+    assert "0,motor,0,72" not in build_wake_ack_chor("right", listen_pose=(0, 0))
+    assert "0,motor,1,72,0,0" in build_wake_ack_chor("right", listen_pose=(0, 0))
+    # a non-zero listening pose shifts the twitch target but stays 4 steps out
+    assert "0,motor,0,108,0,0" in build_wake_ack_chor("left", listen_pose=(2, 2))  # 36+72
+
+
+def test_listening_scanner_and_indicators_valid():
+    from rabbit_brain.body.chor import (
+        build_leds_off_chor,
+        build_listening_scanner_chor,
+        build_processing_chor,
+    )
+
+    scanner = build_listening_scanner_chor()
+    _chor_is_valid(scanner)
+    # the lit dot visits every one of the 5 LEDs
+    for led in range(5):
+        assert f"led,{led},0,150,255" in scanner
+
+    processing = build_processing_chor()
+    _chor_is_valid(processing)
+    for led in range(5):
+        assert f"0,led,{led},255,140,0" in processing  # all LEDs on, orange
+
+    off = build_leds_off_chor()
+    _chor_is_valid(off)
+    for led in range(5):
+        assert f"0,led,{led},0,0,0" in off  # every LED off
 
 
 def test_build_dance_chor_capped():

@@ -6,8 +6,12 @@ from rabbit_brain.audio.capture import WavCapture
 from rabbit_brain.audio.doa import DoaReading
 from rabbit_brain.audio.pipeline import VoicePipeline
 from rabbit_brain.audio.vad import VAD_CHUNK_SAMPLES
-from rabbit_brain.body.chor import build_wake_ack_chor
-from rabbit_brain.body.types import ChorCommand, Priority
+from rabbit_brain.body.chor import (
+    build_leds_off_chor,
+    build_listening_scanner_chor,
+    build_wake_ack_chor,
+)
+from rabbit_brain.body.types import ChorCommand, EarsCommand, Priority
 from rabbit_brain.stt import STTResult
 from test_audio_capture import make_multichannel_wav
 
@@ -110,6 +114,11 @@ async def drain_acks(pipeline: VoicePipeline) -> None:
     await asyncio.gather(*pipeline._ack_tasks)
 
 
+def chors(controller) -> list[str]:
+    """The chor strings submitted to a FakeController, in order."""
+    return [cmd.chor for cmd, _ in controller.submitted if isinstance(cmd, ChorCommand)]
+
+
 async def test_wake_doa_vad_stt_flow():
     blocks = [SILENCE] * 3 + [SILENCE] + [SPEECH] * 6 + [SILENCE] * 10
     controller = FakeController()
@@ -128,13 +137,15 @@ async def test_wake_doa_vad_stt_flow():
 
     assert transcripts == ["ciao coniglio"]
     assert controller.interrupts == 1
-    # ONE non-coalescable choreography (twitch the right ear for 90°, end in
-    # the listening pose) — two same-priority EarsCommand would be coalesced
-    # by the real BodyController, silently dropping the DoA bias
-    (submitted,) = controller.submitted
-    cmd, priority = submitted
-    assert cmd == ChorCommand(build_wake_ack_chor("right", listen_pose=(0, 0)))
-    assert priority == Priority.DOA_REFLEX
+    submitted_chors = chors(controller)
+    # wake ack (right ear for 90°) as a single non-coalescable choreography —
+    # two same-priority EarsCommand would be coalesced, dropping the DoA bias
+    assert build_wake_ack_chor("right", listen_pose=(0, 0)) in submitted_chors
+    # LISTENING scanner ran, then LEDs off; everything is chor, no EarsCommand
+    assert build_listening_scanner_chor() in submitted_chors
+    assert build_leds_off_chor() in submitted_chors
+    assert not any(isinstance(cmd, EarsCommand) for cmd, _ in controller.submitted)
+    assert all(p == Priority.DOA_REFLEX for _, p in controller.submitted)
     # the STT stream carries the utterance (pre-roll + speech + closing silence)
     assert stt.pcm.count(SPEECH) == 6
 
@@ -151,16 +162,13 @@ async def test_doa_fail_open_still_acks():
     await pipeline.run()
     await drain_acks(pipeline)
     assert transcripts == ["ciao coniglio"]
-    (submitted,) = controller.submitted
-    assert submitted == (
-        ChorCommand(build_wake_ack_chor(None, listen_pose=(0, 0))),
-        Priority.DOA_REFLEX,
-    )
+    assert build_wake_ack_chor(None, listen_pose=(0, 0)) in chors(controller)
 
 
 async def test_recording_never_waits_for_doa():
     # a hung DoA read (USB stall) must not delay VAD/STT: the ack is
-    # fire-and-forget and listening starts immediately
+    # fire-and-forget. The LISTENING scanner is independent of DoA and still
+    # runs; only the wake-ack chor is missing because its DoA read hangs.
     class HungDoa:
         async def read(self):
             await asyncio.Event().wait()  # never returns
@@ -172,16 +180,18 @@ async def test_recording_never_waits_for_doa():
         FakeCapture(blocks), FakeWake(trigger_at=0), controller, transcripts, doa=HungDoa()
     )
     await asyncio.wait_for(pipeline.run(), 2)
-    assert transcripts == ["ciao coniglio"]
-    assert controller.submitted == []  # ack still hung — and nothing blocked
-    for task in pipeline._ack_tasks:
-        task.cancel()
+    assert transcripts == ["ciao coniglio"]  # nothing blocked on DoA
+    submitted_chors = chors(controller)
+    assert build_listening_scanner_chor() in submitted_chors  # listening ran
+    assert build_wake_ack_chor(None) not in submitted_chors  # ack still hung
+    await pipeline.aclose()  # collect the hung ack task
 
 
-async def test_wake_ack_executes_on_real_controller(controller, mock_ojn):
-    """Integration: real BodyController + mock OJN — the regression the fake
-    controller missed. The ack must reach OJN as exactly one chor call, with
-    no posleft/posright ear calls (coalescable, and under jingle suspicion)."""
+async def test_wake_ack_and_listening_cycle_on_real_controller(controller, mock_ojn):
+    """Integration through the REAL BodyController + mock OJN — the regression
+    class the FakeController missed. Verifies the whole indicator cycle reaches
+    the wire as choreography: wake ack → LISTENING scanner → stop (LEDs off),
+    with NO posleft/posright ear calls (coalescable + jingle-inducing)."""
     blocks = [SILENCE] + [SPEECH] * 4 + [SILENCE] * 10
     transcripts = []
     pipeline = make_pipeline(
@@ -194,10 +204,36 @@ async def test_wake_ack_executes_on_real_controller(controller, mock_ojn):
     await pipeline.run()
     await drain_acks(pipeline)
     await asyncio.wait_for(controller.wait_idle(), 2)
+
     assert transcripts == ["ciao coniglio"]
-    (chor_call,) = mock_ojn.calls_of("chor")
-    assert chor_call.params["chor"] == build_wake_ack_chor("left", listen_pose=(0, 0))
-    assert mock_ojn.calls_of("ears") == []
+    wire = [c.params["chor"] for c in mock_ojn.calls_of("chor")]
+    assert build_wake_ack_chor("left", listen_pose=(0, 0)) in wire  # DoA 270° → left ear
+    assert build_listening_scanner_chor() in wire
+    # the scanner is stopped by an all-off chor AFTER it started
+    assert build_leds_off_chor() in wire
+    assert wire.index(build_leds_off_chor()) > wire.index(build_listening_scanner_chor())
+    assert mock_ojn.calls_of("ears") == []  # choreography-only, no posleft/posright
+
+
+async def test_pipeline_close_collects_pending_tasks():
+    # aclose() must cancel/collect every background task (acks + indicators),
+    # e.g. an indicator still looping or an ack whose DoA read hangs
+    class HungDoa:
+        async def read(self):
+            await asyncio.Event().wait()
+
+    controller = FakeController()
+    pipeline = make_pipeline(FakeCapture([]), FakeWake(), controller, [], doa=HungDoa())
+    ack = asyncio.create_task(pipeline._wake_ack())
+    pipeline._ack_tasks.add(ack)
+    ack.add_done_callback(pipeline._ack_tasks.discard)
+    indicator = pipeline._spawn_indicator(build_listening_scanner_chor(), 0.01)
+    await asyncio.sleep(0)  # let them start
+    await pipeline.aclose()
+    assert ack.cancelled() and indicator.cancelled()  # both collected, none leaked
+    await asyncio.sleep(0)  # let the done-callbacks discard the tasks
+    assert pipeline._ack_tasks == set()
+    assert pipeline._indicator_tasks == set()
 
 
 def test_side_of_angle():

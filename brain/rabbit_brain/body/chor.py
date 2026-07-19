@@ -21,38 +21,103 @@ DANCE_COLORS = [
 ]
 
 
+# Ear angles are quantized server-side by /18 (0..16 steps of 18°). Use an
+# exact multiple so the twitch lands where intended: 72° = 4 steps. A smaller
+# angle (e.g. 45° → ~36° after rounding) reads as barely-there on hardware
+# (UX finding, July 2026).
+WAKE_TWITCH_DEG = 72
+_EAR_STEP_DEG = 18
+_EAR_MAX_DEG = 16 * _EAR_STEP_DEG  # 288°
+
+# LISTENING indicator: a lit dot sweeping the 5 LEDs front↔back, meant to loop
+# for the whole VAD recording. Cyan reads clearly and is distinct from the
+# wake flash (white) and PROCESSING (orange).
+LISTENING_SCANNER_TEMPO_MS = 120
+_SCANNER_POSITIONS = (0, 1, 2, 3, 4, 3, 2, 1)  # bottom→top→bottom (period 8)
+LISTENING_SCANNER_CYCLE_S = len(_SCANNER_POSITIONS) * LISTENING_SCANNER_TEMPO_MS / 1000
+
+# PROCESSING indicator: all LEDs pulsing orange (on 500 ms / off 500 ms),
+# meant to loop while the transcript is handled (agent loop, §6.2.5).
+PROCESSING_PULSE_TEMPO_MS = 100
+PROCESSING_PULSE_CYCLE_S = 1.0
+
+
 def build_wake_ack_chor(
     side: str | None,
     listen_pose: tuple[int, int] = (0, 0),
-    duration_ms: int = 400,
+    duration_ms: int = 500,
     tempo_ms: int = 50,
 ) -> str:
-    """Wake acknowledgement: one short (300-500 ms) non-blocking choreography.
+    """Wake acknowledgement: one short (~500 ms) non-blocking choreography.
 
-    LED flash on the nose + a quick twitch of the ear on the DoA side
-    (`side`: "left" | "right" | None = both), ending in the listening pose.
-    One ChorCommand instead of two same-priority EarsCommand: EarsCommand is
-    coalescable, so the real BodyController would drop the DoA bias and keep
-    only the final pose (UX finding, July 2026). Motor-only choreography also
-    avoids posleft/posright while the jingle side effect is under
-    investigation (docs/OJN_API_NOTES.md).
+    All 5 LEDs flash white + a firm 72° twitch (with a dwell) of the ear on
+    the DoA side (`side`: "left" | "right" | None = both), returning to the
+    listening pose. One ChorCommand, never two same-priority EarsCommand: the
+    BodyController coalesces those and silently drops the DoA bias (UX finding).
+    Choreography-only is also mandatory, not just convenient: the posleft/
+    posright path triggers a long firmware jingle — chor= does not (probe #7,
+    hardware-confirmed July 2026).
     """
     ticks = max(2, duration_ms // tempo_ms)
-    mid = ticks // 2
+    dwell = ticks // 2
     # motor ear index: 0=left, 1=right (docs/OJN_API_NOTES.md §2)
     ears = ("0", "1") if side is None else (("0",) if side == "left" else ("1",))
     parts = [str(tempo_ms)]
-    # t0: nose flash + twitch out (45° off the listening pose, capped at 180°)
-    parts += ["0", "led", "2", "0", "128", "255"]
+    # t0: white flash on all 5 LEDs + twitch the DoA-side ear(s) out by 72°
+    for led in range(5):
+        parts += ["0", "led", str(led), "255", "255", "255"]
     for ear in ears:
-        pose_deg = listen_pose[int(ear)] * 18
-        twitch_deg = min(180, pose_deg + 45)
+        pose_deg = listen_pose[int(ear)] * _EAR_STEP_DEG
+        twitch_deg = min(_EAR_MAX_DEG, pose_deg + WAKE_TWITCH_DEG)
         parts += ["0", "motor", ear, str(twitch_deg), "0", "0"]
-    # mid: back toward the listening pose
+    # after the dwell: ears back to the listening pose
     for ear in ("0", "1"):
-        parts += [str(mid), "motor", ear, str(listen_pose[int(ear)] * 18), "0", "1"]
-    # end: LED off, listening pose held
-    parts += [str(ticks), "led", "2", "0", "0", "0"]
+        parts += [str(dwell), "motor", ear, str(listen_pose[int(ear)] * _EAR_STEP_DEG), "0", "1"]
+    # end: LEDs off (the LISTENING scanner takes the LEDs from here)
+    for led in range(5):
+        parts += [str(ticks), "led", str(led), "0", "0", "0"]
+    return ",".join(parts)
+
+
+def build_listening_scanner_chor(
+    color: tuple[int, int, int] = (0, 150, 255),
+    tempo_ms: int = LISTENING_SCANNER_TEMPO_MS,
+) -> str:
+    """One sweep of a lit dot across the 5 LEDs (front↔back). Loops by
+    resubmission for the whole listening window; LISTENING_SCANNER_CYCLE_S is
+    its wall duration."""
+    r, g, b = color
+    parts = [str(tempo_ms)]
+    prev: int | None = None
+    for t, pos in enumerate(_SCANNER_POSITIONS):
+        if prev is not None:
+            parts += [str(t), "led", str(prev), "0", "0", "0"]
+        parts += [str(t), "led", str(pos), str(r), str(g), str(b)]
+        prev = pos
+    parts += [str(len(_SCANNER_POSITIONS)), "led", str(prev), "0", "0", "0"]
+    return ",".join(parts)
+
+
+def build_processing_chor(
+    color: tuple[int, int, int] = (255, 140, 0),
+    tempo_ms: int = PROCESSING_PULSE_TEMPO_MS,
+) -> str:
+    """All-LED pulse (on then off). Loops by resubmission every
+    PROCESSING_PULSE_CYCLE_S while the agent processes the utterance."""
+    r, g, b = color
+    parts = [str(tempo_ms)]
+    for led in range(5):
+        parts += ["0", "led", str(led), str(r), str(g), str(b)]
+    for led in range(5):
+        parts += ["5", "led", str(led), "0", "0", "0"]
+    return ",".join(parts)
+
+
+def build_leds_off_chor(tempo_ms: int = 10) -> str:
+    """Turn all 5 LEDs off — the terminator for a looping indicator."""
+    parts = [str(tempo_ms)]
+    for led in range(5):
+        parts += ["0", "led", str(led), "0", "0", "0"]
     return ",".join(parts)
 
 

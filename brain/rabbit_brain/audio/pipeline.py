@@ -4,15 +4,21 @@ Wiring (docs/ARCHITECTURE.md §6.2):
   - half-duplex gate (§6.2.7): while the rabbit is (estimated) speaking, mic
     frames are discarded and the wake detector held in reset — there is no AEC
     reference for the rabbit speaker, so we must not hear ourselves;
-  - on wake (§6.2.8): interrupt() so the rabbit snaps to attention, and a
-    SINGLE short non-blocking choreography acknowledges the wake: LED flash +
-    ear twitch on the DoA side, ending in the listening pose. One ChorCommand,
-    not two EarsCommand — same-priority EarsCommand are coalesced by the real
-    BodyController, which silently dropped the DoA bias (UX finding, July
-    2026). The ack runs as a background task: VAD/STT start immediately and
-    never wait for the DoA read or the OJN round-trip. All body output goes
-    through BodyController.submit at DOA_REFLEX priority, never the adapter.
-    DoA is fail-open: None just means an un-sided ack;
+  - on wake (§6.2.8): interrupt() so the rabbit snaps to attention, then a
+    small LED/ear state machine, ALL choreography-only (the posleft/posright
+    path triggers a firmware jingle — probe #7, hardware-confirmed):
+      * a SINGLE non-blocking wake-ack chor (white flash + 72° twitch on the
+        DoA side → listening pose), fired as a background task so VAD/STT
+        never wait for the DoA read or the OJN round-trip. One ChorCommand,
+        never two same-priority EarsCommand (the BodyController coalesces
+        those and silently drops the DoA bias — UX finding). DoA is
+        fail-open: None just means an un-sided ack;
+      * a persistent LISTENING indicator (cyan LED scanner) that loops for
+        the whole VAD recording and is turned off in finally;
+      * a PROCESSING indicator (pulsing orange) while the transcript is
+        handled by on_transcript (the agent loop, §6.2.5).
+    All body output goes through BodyController.submit at DOA_REFLEX priority,
+    never the adapter;
   - the utterance streams into the STT provider while still being spoken
     (VAD chunks go out as they pass the recorder), so cloud endpointing
     overlaps with capture.
@@ -26,7 +32,14 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
-from ..body.chor import build_wake_ack_chor
+from ..body.chor import (
+    LISTENING_SCANNER_CYCLE_S,
+    PROCESSING_PULSE_CYCLE_S,
+    build_leds_off_chor,
+    build_listening_scanner_chor,
+    build_processing_chor,
+    build_wake_ack_chor,
+)
 from ..body.controller import BodyController
 from ..body.types import ChorCommand, Priority
 from ..stt.base import STTProvider, STTResult
@@ -67,6 +80,7 @@ class VoicePipeline:
         self._wake_threshold = wake_threshold
         self._recorder_kwargs = recorder_kwargs or {}
         self._ack_tasks: set[asyncio.Task] = set()
+        self._indicator_tasks: set[asyncio.Task] = set()
 
     # --- half-duplex gate (§6.2.7) --------------------------------------
 
@@ -78,19 +92,30 @@ class VoicePipeline:
     # --- main loop ------------------------------------------------------
 
     async def run(self) -> None:
-        frames = aiter(self._capture.frames())
-        while True:
-            try:
-                frame = await anext(frames)
-            except StopAsyncIteration:
-                return
-            if self._gated():
-                self._wake.reset()
-                continue
-            if self._wake.feed(frame) >= self._wake_threshold:
-                log.info("wake word detected")
-                await self._handle_wake(frames)
-                self._wake.reset()
+        try:
+            frames = aiter(self._capture.frames())
+            while True:
+                try:
+                    frame = await anext(frames)
+                except StopAsyncIteration:
+                    return
+                if self._gated():
+                    self._wake.reset()
+                    continue
+                if self._wake.feed(frame) >= self._wake_threshold:
+                    log.info("wake word detected")
+                    await self._handle_wake(frames)
+                    self._wake.reset()
+        finally:
+            await self.aclose()
+
+    async def aclose(self) -> None:
+        """Cancel and collect every background task (wake acks + indicators)."""
+        tasks = list(self._ack_tasks | self._indicator_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _handle_wake(self, frames: AsyncIterator[bytes]) -> None:
         self._controller.interrupt()
@@ -99,10 +124,47 @@ class VoicePipeline:
         ack = asyncio.create_task(self._wake_ack())
         self._ack_tasks.add(ack)
         ack.add_done_callback(self._ack_tasks.discard)
-        result = await self._record_and_transcribe(frames)
+        # persistent LISTENING indicator for the whole recording window
+        listening = self._spawn_indicator(build_listening_scanner_chor(), LISTENING_SCANNER_CYCLE_S)
+        try:
+            result = await self._record_and_transcribe(frames)
+        finally:
+            await self._stop_indicator(listening)
+            await self._submit_chor(build_leds_off_chor())
         if result is not None and result.text:
             log.info("transcript (%s): %s", result.provider, result.text)
-            await self._on_transcript(result.text)
+            await self._process_transcript(result.text)
+
+    async def _process_transcript(self, text: str) -> None:
+        # PROCESSING indicator while the agent loop handles the utterance
+        processing = self._spawn_indicator(build_processing_chor(), PROCESSING_PULSE_CYCLE_S)
+        try:
+            await self._on_transcript(text)
+        finally:
+            await self._stop_indicator(processing)
+            await self._submit_chor(build_leds_off_chor())
+
+    # --- body indicators (all via BodyController, choreography-only) ------
+
+    async def _submit_chor(self, chor: str) -> None:
+        await self._controller.submit(ChorCommand(chor), Priority.DOA_REFLEX)
+
+    def _spawn_indicator(self, chor: str, cycle_s: float) -> asyncio.Task:
+        """A looping indicator that resubmits `chor` every cycle_s until stopped."""
+
+        async def loop() -> None:
+            while True:
+                await self._submit_chor(chor)
+                await asyncio.sleep(cycle_s)
+
+        task = asyncio.create_task(loop())
+        self._indicator_tasks.add(task)
+        task.add_done_callback(self._indicator_tasks.discard)
+        return task
+
+    async def _stop_indicator(self, task: asyncio.Task) -> None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     @staticmethod
     def _side_of(angle_deg: int) -> str | None:
