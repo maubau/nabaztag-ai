@@ -7,9 +7,9 @@ Wiring (docs/ARCHITECTURE.md §6.2):
   - on wake (§6.2.8): interrupt() so the rabbit snaps to attention, then a
     SINGLE sequential feedback task runs the body, ALL choreography-only (the
     posleft/posright path triggers a firmware jingle — probe #7, confirmed):
-        DoA read → wake ack (white flash + 72° twitch on the DoA side) → a
-        LISTENING loop (cyan LED scanner + a gentle ear nod toward the voice,
-        re-reading DoA ~once/second). Sequential so the ack always renders
+        wake ack (green LEDs + both ears forward) → a
+        LISTENING loop (all-LED magenta pulse + counter-rotating ears,
+        re-reading DoA once per ~1.9 s cycle). Sequential so the ack always renders
         before the scanner can replace it. VAD/STT run in a SEPARATE task and
         start immediately — they never wait for the DoA read or OJN;
   - the LISTENING feedback stops at the VAD end-of-speech event, BEFORE the
@@ -185,7 +185,7 @@ class VoicePipeline:
             # play on the rabbit at USER_SPEECH_SYNC so interrupt() won't drop
             # it; the half-duplex gate in the record loop keeps it out of STT
             await self._controller.submit(self._wake_beep, Priority.USER_SPEECH_SYNC)
-        # one sequential feedback task (DoA → ack → scanner); VAD/STT below run
+        # one sequential feedback task (ack → LISTENING); VAD/STT below run
         # concurrently and start immediately
         end_of_speech = asyncio.Event()
         feedback = self._spawn(
@@ -244,10 +244,9 @@ class VoicePipeline:
         try:
             if end_of_speech.is_set():
                 return
-            side = await self._read_side(end_of_speech)
-            if end_of_speech.is_set():  # utterance already over — no wake ack
-                return
-            await self._submit_chor(build_wake_ack_chor(side, listen_pose=self._listen_pose))
+            # Immediate and deterministic: the green wake acknowledgement must
+            # never wait for the comparatively slow USB DoA control transfer.
+            await self._submit_chor(build_wake_ack_chor(None, listen_pose=self._listen_pose))
             # let the ack render before the scanner can replace it (probe #8)
             await self._wait_or_end(end_of_speech, self._ack_render_s)
             while not end_of_speech.is_set():
@@ -257,8 +256,8 @@ class VoicePipeline:
                 await self._submit_chor(build_listening_chor(side, listen_pose=self._listen_pose))
                 await self._wait_or_end(end_of_speech, self._listening_cycle_s)
         finally:
-            # stop the LISTENING scanner: LEDs lit only while the user speaks
-            await self._submit_chor(build_leds_off_chor())
+            # stop LISTENING at EOS: LEDs off and both ears back to their pose
+            await self._submit_chor(build_leds_off_chor(ears_pose=self._listen_pose))
             # when the stop was ENQUEUED (≈ end-of-speech); wire execution is
             # a separate, controller-level measurement (probe #8)
             timings.scanner_stop_enqueued = time.monotonic()

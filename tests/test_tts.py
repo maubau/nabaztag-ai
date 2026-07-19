@@ -140,18 +140,15 @@ def test_build_wake_ack_chor_short_and_valid():
         chor = build_wake_ack_chor(side, listen_pose=(0, 0))
         tempo, last_tick = _chor_is_valid(chor)
         assert 300 <= last_tick * tempo <= 600  # UX: one short non-blocking ack
-        # all 5 LEDs flash white at t0
+        # all 5 LEDs turn green at t0
         for led in range(5):
-            assert f"0,led,{led},255,255,255" in chor
-        # ends in the listening pose (0° = position 0) for both ears
+            assert f"0,led,{led},0,255,0" in chor
+        # both ears face forward immediately (0° = position 0)
         for ear in ("0", "1"):
-            assert f",motor,{ear},0,0,1" in chor
-    # sided ack twitches only that ear at t0 by 72° (4 exact /18 steps)
-    assert "0,motor,0,72,0,0" in build_wake_ack_chor("left", listen_pose=(0, 0))
-    assert "0,motor,0,72" not in build_wake_ack_chor("right", listen_pose=(0, 0))
-    assert "0,motor,1,72,0,0" in build_wake_ack_chor("right", listen_pose=(0, 0))
-    # a non-zero listening pose shifts the twitch target but stays 4 steps out
-    assert "0,motor,0,108,0,0" in build_wake_ack_chor("left", listen_pose=(2, 2))  # 36+72
+            assert f"0,motor,{ear},0,0,1" in chor
+    # DoA side never changes this global state acknowledgement.
+    assert build_wake_ack_chor("left") == build_wake_ack_chor("right")
+    assert "0,motor,0,36,0,1" in build_wake_ack_chor("left", listen_pose=(2, 2))
 
 
 def test_listening_scanner_and_indicators_valid():
@@ -162,15 +159,19 @@ def test_listening_scanner_and_indicators_valid():
     )
 
     scanner = build_listening_chor()
-    _chor_is_valid(scanner)
-    # the lit dot visits every one of the 5 LEDs
+    tempo, last_tick = _chor_is_valid(scanner)
+    assert 1700 <= tempo * last_tick <= 1800
+    # all five LEDs, including the base LED 0, breathe magenta together
     for led in range(5):
-        assert f"led,{led},0,150,255" in scanner
-    # a sided cycle adds a gentle 36° (2-step) ear nod toward the voice, chor-only
+        assert f"5,led,{led},255,0,255" in scanner
+        assert f"11,led,{led},0,0,0" in scanner
+    # Both ears traverse the full supported range with opposite directions.
     right = build_listening_chor("right", listen_pose=(0, 0))
     _chor_is_valid(right)
-    assert "0,motor,1,36,0,0" in right
-    assert build_listening_chor("left", listen_pose=(0, 0)).count("motor,0,36,0,0") == 1
+    assert "0,motor,0,288,0,0" in right
+    assert "0,motor,1,288,0,1" in right
+    assert "6,motor,0,0,0,1" in right
+    assert "6,motor,1,0,0,0" in right
 
     processing = build_processing_chor()
     _chor_is_valid(processing)
@@ -181,6 +182,9 @@ def test_listening_scanner_and_indicators_valid():
     _chor_is_valid(off)
     for led in range(5):
         assert f"0,led,{led},0,0,0" in off  # every LED off
+    stopped = build_leds_off_chor(ears_pose=(2, 3))
+    assert "0,motor,0,36,0,1" in stopped
+    assert "0,motor,1,54,0,1" in stopped
 
 
 def test_build_dance_chor_capped():

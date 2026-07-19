@@ -83,8 +83,19 @@ Hardware half — status on the real rabbit:
    motion** (`OjnAdapter.set_ears` stays only for explicit MCP/agent ear poses). This also
    sidesteps `EarsCommand` coalescing (two same-priority ear commands collapse to the last,
    which had silently dropped the DoA bias). The brain's wake ack is a single ~500 ms chor
-   (white flash + 72° twitch on the DoA side → listening pose); a persistent LISTENING
-   scanner and a PROCESSING pulse are likewise chor-only, looped by resubmission.
+   (all LEDs green + both ears forward); persistent LISTENING feedback then pulses all five
+   LEDs magenta while the ears counter-rotate through the VAPI range. A PROCESSING pulse is
+   likewise chor-only and optional; looping states are resubmitted until their stop event.
+   **Motor-direction semantics (source-verified against `choregraphy.cpp`/`.h`, July 2026):**
+   the chor field order is `time,motor,<ear>,<angle°>,0,<dir>`; `ear` 0=left/1=right,
+   `dir` 0=forward/1=backward (`Direction` enum), `angle` encoded `/18` → 0..16 steps.
+   The LISTENING counter-rotation sends BOTH ears to the same target (288° = 16 steps, the
+   exact VAPI maximum — never out of range) with OPPOSITE `dir` flags, so one turns forward
+   and the other backward. The 0..16 position range is hardware-confirmed (S2 posleft/posright);
+   the one thing only the real rabbit finalizes is whether "backward to 288°" spins the long
+   way as intended (stock ears are continuous-rotation, so expected) vs the shortest path.
+   At end-of-speech the stop chor also returns both ears to the neutral listen pose
+   (`build_leds_off_chor(ears_pose=...)`).
 8. **OPEN — chor-interrupts-chor semantics.** Does submitting a new choreography while one
    is playing REPLACE it immediately, or queue behind it? The looping LISTENING/PROCESSING
    indicators and their all-off terminator assume prompt replacement so the stop is

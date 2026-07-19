@@ -154,7 +154,7 @@ Only if native \+ raw frames prove insufficient or too awkward to sequence do we
 
 1. **Audio front-end:** ALSA capture from reSpeaker (USB Audio Class). Read DoA angle via the XVF3800 USB control interface (Seeed provides a Python usb tuning/control utility — vendor lib, wrap it in `audio/doa.py`).  
 2. **Wake word:** openWakeWord on Bolt CPU.  
-3. **VAD:** silero-vad; end-of-speech at 700 ms silence.  
+3. **VAD:** silero-vad; end-of-speech at 1200 ms silence (700 ms proved too eager for natural mid-sentence pauses on hardware).
 4. **STT — dual profile behind `STTProvider` interface, selected in `config.yaml`:**  
    - `cloud`: **Deepgram streaming** (primary — credits available; model `nova-3`, set in `config.yaml` as `deepgram.model` so it can be swapped without code changes; language auto it/en). **OpenAI Whisper API** as `cloud_fallback` (credits available; non-streaming, acceptable for short utterances).  
    - `local`: faster-whisper (CTranslate2) on Bolt CPU, model `small` or `medium` int8 — benchmark both (T5) and record RTF for the video's local-vs-cloud segment.  

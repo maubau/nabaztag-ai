@@ -55,13 +55,15 @@ audio:
   sample_rate: 16000
   channels: 6
   selected_channel: 0
-  vad_end_of_speech_ms: 700
+  # Keep a natural mid-sentence pause open; 700 ms proved too eager on the
+  # real microphone and forced a new wake word after a brief hesitation.
+  vad_end_of_speech_ms: 1200
   half_duplex_guard_ms: 300
 
 leds:
-  # The user wants the LEDs lit only while speaking: the LISTENING scanner
-  # stops at VAD end-of-speech. PROCESSING (pulsing orange while the agent
-  # thinks) is therefore opt-in.
+  # LISTENING is a five-LED magenta breathing effect with counter-rotating
+  # ears. It stops at VAD end-of-speech. PROCESSING (pulsing orange while the
+  # agent thinks) is opt-in.
   processing_indicator: false
 
 wake_beep:

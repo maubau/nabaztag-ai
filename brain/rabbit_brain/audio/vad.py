@@ -1,4 +1,4 @@
-"""VAD-gated utterance recording — silero-vad, end of speech at 700 ms (§6.2.3).
+"""VAD-gated utterance recording — silero-vad, end of speech at 1200 ms (§6.2.3).
 
 `UtteranceRecorder` is a push-driven state machine generic over a
 `SpeechProbe` (chunk → speech probability), so tests run with a fake probe
@@ -15,7 +15,7 @@ from typing import Protocol, runtime_checkable
 log = logging.getLogger(__name__)
 
 VAD_CHUNK_SAMPLES = 512  # silero-vad native chunk @ 16 kHz (32 ms)
-DEFAULT_END_OF_SPEECH_MS = 700  # docs/ARCHITECTURE.md §6.2.3
+DEFAULT_END_OF_SPEECH_MS = 1200  # natural short pauses must not end the turn
 DEFAULT_MAX_UTTERANCE_S = 20.0
 DEFAULT_START_TIMEOUT_S = 6.0  # wake fired but nobody spoke
 DEFAULT_PRE_ROLL_MS = 300

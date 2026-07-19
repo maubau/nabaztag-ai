@@ -78,6 +78,6 @@ def test_push_accepts_arbitrary_block_sizes():
     assert b"".join(emitted).startswith(SPEECH)
 
 
-def test_default_end_of_speech_is_700ms():
+def test_default_end_of_speech_is_1200ms():
     rec = UtteranceRecorder(probe=loud_probe)
-    assert rec._silence_chunks == round(700 / 32)
+    assert rec._silence_chunks == round(1200 / 32)

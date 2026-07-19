@@ -168,10 +168,10 @@ async def test_wake_doa_vad_stt_flow():
     assert transcripts == ["ciao coniglio"]
     assert controller.interrupts == 1
     submitted_chors = chors(controller)
-    # wake ack (right ear for 90°) as a single non-coalescable choreography
-    assert build_wake_ack_chor("right", listen_pose=(0, 0)) in submitted_chors
+    # wake ack is immediate/global: green LEDs and both ears forward
+    assert build_wake_ack_chor(None, listen_pose=(0, 0)) in submitted_chors
     # the feedback always ends by turning the LEDs off; everything is chor
-    assert submitted_chors[-1] == build_leds_off_chor()
+    assert submitted_chors[-1] == build_leds_off_chor(ears_pose=(0, 0))
     assert not any(isinstance(cmd, EarsCommand) for cmd, _ in controller.submitted)
     assert all(p == Priority.DOA_REFLEX for _, p in controller.submitted)
     assert stt.pcm.count(SPEECH) == 6
@@ -202,7 +202,7 @@ async def test_wake_ack_precedes_scanner_on_real_controller(controller, mock_ojn
             )
         )
         wire = [c.params["chor"] for c in mock_ojn.calls_of("chor")]
-        assert wire[0] == build_wake_ack_chor("left", listen_pose=(0, 0))  # ack FIRST
+        assert wire[0] == build_wake_ack_chor(None, listen_pose=(0, 0))  # ack FIRST
         assert wire[1] == build_listening_chor("left", listen_pose=(0, 0))  # scanner AFTER
         assert mock_ojn.calls_of("ears") == []
     finally:
@@ -239,7 +239,7 @@ async def test_eos_during_ack_render_sends_no_scanner(controller, mock_ojn):
         gate.set()
     wire = [c.params["chor"] for c in mock_ojn.calls_of("chor")]
     assert build_listening_chor(None, listen_pose=(0, 0)) not in wire  # no scanner
-    assert wire[-1] == build_leds_off_chor()
+    assert wire[-1] == build_leds_off_chor(ears_pose=(0, 0))
 
 
 async def test_eos_during_slow_doa_read_sends_no_listening(controller, mock_ojn):
@@ -247,21 +247,19 @@ async def test_eos_during_slow_doa_read_sends_no_listening(controller, mock_ojn)
     flight (up to doa_timeout_s), no new LISTENING chor is submitted for that
     cycle — the read is cancelled by the EOS event."""
 
-    class SlowSecondDoa:
+    class SlowDoa:
         def __init__(self):
             self.reads = 0
             self.slow_started = asyncio.Event()
 
         async def read(self):
             self.reads += 1
-            if self.reads == 1:
-                return DoaReading(angle_deg=0)  # ack read: fast
             self.slow_started.set()
             await asyncio.sleep(5)  # loop read: slow, must be cancelled by EOS
             return DoaReading(angle_deg=0)
 
     gate = asyncio.Event()
-    doa = SlowSecondDoa()
+    doa = SlowDoa()
     pipeline = make_pipeline(
         GatedCapture([SILENCE, SPEECH, SPEECH], gate, [SILENCE] * 12),
         FakeWake(trigger_at=0),
@@ -282,7 +280,7 @@ async def test_eos_during_slow_doa_read_sends_no_listening(controller, mock_ojn)
     wire = [c.params["chor"] for c in mock_ojn.calls_of("chor")]
     assert build_wake_ack_chor(None, listen_pose=(0, 0)) in wire  # ack did go out
     assert build_listening_chor(None, listen_pose=(0, 0)) not in wire  # but no scanner
-    assert wire[-1] == build_leds_off_chor()
+    assert wire[-1] == build_leds_off_chor(ears_pose=(0, 0))
 
 
 async def test_scanner_stops_at_end_of_speech_not_at_stt(controller, mock_ojn):
@@ -304,7 +302,10 @@ async def test_scanner_stops_at_end_of_speech_not_at_stt(controller, mock_ojn):
     try:
         # LEDs go off (scanner stopped) while STT is still blocked → no transcript yet
         await wait_until(
-            lambda: build_leds_off_chor() in [c.params["chor"] for c in mock_ojn.calls_of("chor")]
+            lambda: (
+                build_leds_off_chor(ears_pose=(0, 0))
+                in [c.params["chor"] for c in mock_ojn.calls_of("chor")]
+            )
         )
         assert transcripts == []  # STT has not returned; the stop did not wait for it
     finally:
