@@ -6,10 +6,13 @@ stt_profile: cloud
 deepgram:
   # Pinned but swappable without code changes (docs/ARCHITECTURE.md §6.2.4)
   model: nova-3
-  # language "multi" mis-detected short Italian phrases as pt/en on hardware
-  # (July 2026) — pin the expected language. For a bilingual demo, swap this
-  # per session (planned fast it/en profiles) rather than relying on "multi".
-  language: it
+  # "multi" = automatic it/en code-switching, the desired bilingual behavior
+  # (a phrase transcribed as English was in fact spoken in English). Optional
+  # fixed profiles: set language to "it" or "en" per session if you ever want
+  # to force one. Deepgram recommends endpointing 100 ms for nova-3 multilingual
+  # code-switching.
+  language: multi
+  endpointing: 100
 
 openai_whisper:
   model: whisper-1
@@ -62,16 +65,14 @@ leds:
   processing_indicator: false
 
 wake_beep:
-  # Short local confirmation tone on the Bolt's own output (NOT the rabbit).
-  # Off by default: with no AEC the mic can hear it, so the pipeline drops the
-  # first guard_ms of capture after wake (keep duration_ms < guard_ms). Verify
-  # with Silero before enabling — if the tone reads as speech or leaks into a
-  # transcript, leave it disabled.
+  # Short confirmation sound played ON THE RABBIT (so the user hears it from
+  # the Nabaztag, not the Bolt). It rides the audio lane, so the half-duplex
+  # gate keeps it out of VAD/STT (no AEC) — no fixed guard needed. Off by
+  # default; before enabling on hardware confirm Silero does not classify the
+  # tone as speech and it never leaks into a transcript.
   enabled: false
+  mp3: www/audio/wake.mp3   # a 100-150 ms MP3 the rabbit can fetch (served by mp3_server)
   duration_ms: 120
-  guard_ms: 150
-  freq_hz: 880
-  volume: 0.2
 
 wake:
   # openWakeWord model names or paths. The stock hey_jarvis model is for the

@@ -11,7 +11,7 @@ from rabbit_brain.body.chor import (
     build_listening_chor,
     build_wake_ack_chor,
 )
-from rabbit_brain.body.types import ChorCommand, EarsCommand, Priority
+from rabbit_brain.body.types import ChorCommand, EarsCommand, PlayAudioCommand, Priority
 from rabbit_brain.stt import STTResult
 from test_audio_capture import make_multichannel_wav
 
@@ -170,8 +170,7 @@ async def test_wake_doa_vad_stt_flow():
     submitted_chors = chors(controller)
     # wake ack (right ear for 90°) as a single non-coalescable choreography
     assert build_wake_ack_chor("right", listen_pose=(0, 0)) in submitted_chors
-    # LISTENING scanner + ear nod on the voice side, then LEDs off; all chor
-    assert build_listening_chor("right", listen_pose=(0, 0)) in submitted_chors
+    # the feedback always ends by turning the LEDs off; everything is chor
     assert submitted_chors[-1] == build_leds_off_chor()
     assert not any(isinstance(cmd, EarsCommand) for cmd, _ in controller.submitted)
     assert all(p == Priority.DOA_REFLEX for _, p in controller.submitted)
@@ -210,6 +209,80 @@ async def test_wake_ack_precedes_scanner_on_real_controller(controller, mock_ojn
         gate.set()
         await asyncio.wait_for(run, 2)
     assert controller_transcripts == ["ciao coniglio"]
+
+
+async def test_eos_during_ack_render_sends_no_scanner(controller, mock_ojn):
+    """Required: if end-of-speech arrives during the ack-render wait, NO
+    LISTENING chor is sent (no scanner after the utterance), and LEDs-off is
+    the last command on the wire."""
+    gate = asyncio.Event()
+    pipeline = make_pipeline(
+        GatedCapture([SILENCE, SPEECH, SPEECH], gate, [SILENCE] * 12),
+        FakeWake(trigger_at=0),
+        controller,
+        [],
+        doa=FakeDoa(DoaReading(angle_deg=0)),  # side None
+        ack_render_s=5.0,  # long render window; EOS will land inside it
+        listening_cycle_s=5.0,
+    )
+    run = asyncio.create_task(pipeline.run())
+    try:
+        await wait_until(
+            lambda: (
+                build_wake_ack_chor(None, listen_pose=(0, 0))
+                in [c.params["chor"] for c in mock_ojn.calls_of("chor")]
+            )
+        )
+        gate.set()  # end of speech, during ack_render
+        await asyncio.wait_for(run, 2)
+    finally:
+        gate.set()
+    wire = [c.params["chor"] for c in mock_ojn.calls_of("chor")]
+    assert build_listening_chor(None, listen_pose=(0, 0)) not in wire  # no scanner
+    assert wire[-1] == build_leds_off_chor()
+
+
+async def test_eos_during_slow_doa_read_sends_no_listening(controller, mock_ojn):
+    """Required: if end-of-speech arrives while a periodic DoA read is in
+    flight (up to doa_timeout_s), no new LISTENING chor is submitted for that
+    cycle — the read is cancelled by the EOS event."""
+
+    class SlowSecondDoa:
+        def __init__(self):
+            self.reads = 0
+            self.slow_started = asyncio.Event()
+
+        async def read(self):
+            self.reads += 1
+            if self.reads == 1:
+                return DoaReading(angle_deg=0)  # ack read: fast
+            self.slow_started.set()
+            await asyncio.sleep(5)  # loop read: slow, must be cancelled by EOS
+            return DoaReading(angle_deg=0)
+
+    gate = asyncio.Event()
+    doa = SlowSecondDoa()
+    pipeline = make_pipeline(
+        GatedCapture([SILENCE, SPEECH, SPEECH], gate, [SILENCE] * 12),
+        FakeWake(trigger_at=0),
+        controller,
+        [],
+        doa=doa,
+        ack_render_s=0.0,
+        listening_cycle_s=0.0,
+        doa_timeout_s=10.0,  # long, so only the EOS event can end the slow read
+    )
+    run = asyncio.create_task(pipeline.run())
+    try:
+        await wait_until(lambda: doa.slow_started.is_set())  # inside the slow loop read
+        gate.set()  # end of speech during the read
+        await asyncio.wait_for(run, 2)
+    finally:
+        gate.set()
+    wire = [c.params["chor"] for c in mock_ojn.calls_of("chor")]
+    assert build_wake_ack_chor(None, listen_pose=(0, 0)) in wire  # ack did go out
+    assert build_listening_chor(None, listen_pose=(0, 0)) not in wire  # but no scanner
+    assert wire[-1] == build_leds_off_chor()
 
 
 async def test_scanner_stops_at_end_of_speech_not_at_stt(controller, mock_ojn):
@@ -282,34 +355,59 @@ async def test_recording_never_waits_for_doa():
     assert transcripts == ["ciao coniglio"]  # nothing blocked on DoA
 
 
-async def test_wake_beep_frames_excluded_from_stt():
-    """Required: the local wake beep must not enter VAD/STT (no AEC). The
-    beep-window frames are dropped, so the beep tone never reaches the STT."""
-    beep_played = asyncio.Event()
+class CountdownPlayback:
+    """A playback handle that reports 'playing' for its first `n` checks, then
+    finished — stands in for the wake beep's TimedPlaybackHandle."""
 
-    async def beep():
-        beep_played.set()
+    def __init__(self, gated_checks: int):
+        self._left = gated_checks
 
+    @property
+    def finished(self) -> bool:
+        if self._left > 0:
+            self._left -= 1
+            return False
+        return True
+
+
+class BeepGatingController(FakeController):
+    """Sets current_playback when a beep (PlayAudioCommand) is submitted, so the
+    half-duplex gate suppresses the mic for the next `gated_checks` frames."""
+
+    def __init__(self, gated_checks: int):
+        super().__init__()
+        self._gated_checks = gated_checks
+
+    async def submit(self, cmd, priority, deadline=None):
+        await super().submit(cmd, priority, deadline)
+        if isinstance(cmd, PlayAudioCommand):
+            self.current_playback = CountdownPlayback(self._gated_checks)
+
+
+async def test_wake_beep_plays_on_rabbit_and_is_gated_from_stt():
+    """Required: the wake beep must not enter VAD/STT (no AEC). It plays on the
+    RABBIT via the audio lane (USER_SPEECH_SYNC) and the half-duplex gate drops
+    the mic frames while it sounds — no fixed guard tied to the wake instant."""
     stt = FakeSTT()
-    controller = FakeController()
+    controller = BeepGatingController(gated_checks=2)  # beep spans 2 frames
     transcripts = []
-    # the first two blocks stand in for the beep tone (loud); the guard is sized
-    # to exactly those two frames (32 ms each)
-    guard_ms = round(2 * (VAD_CHUNK_SAMPLES / 16_000) * 1000)  # 64 ms → drops 2 frames
+    beep = PlayAudioCommand(("http://192.168.66.1:8090/wake.mp3",), 0.12)
+    # frame 0 fires wake; the next 2 frames are the beep window (gated); then speech
     pipeline = make_pipeline(
-        FakeCapture([SPEECH, SPEECH, SILENCE, SPEECH, SPEECH, SPEECH] + [SILENCE] * 12),
+        FakeCapture([SPEECH, SPEECH, SPEECH, SILENCE, SPEECH, SPEECH, SPEECH] + [SILENCE] * 12),
         FakeWake(trigger_at=0),
         controller,
         transcripts,
         doa=FakeDoa(DoaReading(angle_deg=0)),
         stt=stt,
-        wake_sound=beep,
-        beep_guard_ms=guard_ms,
+        wake_beep=beep,
     )
     await pipeline.run()
-    assert beep_played.is_set()  # the beep fired
-    # 5 SPEECH blocks total, 2 of them the beep window → only 3 reach the STT
+    # the beep was played on the rabbit, at a priority interrupt() won't drop
+    assert (beep, Priority.USER_SPEECH_SYNC) in controller.submitted
+    # 3 real SPEECH frames after the 2 gated beep frames reached the STT
     assert stt.pcm.count(SPEECH) == 3
+    assert transcripts == ["ciao coniglio"]
 
 
 async def test_side_of_angle():
@@ -403,22 +501,17 @@ async def test_no_speech_after_wake_gives_no_transcript():
 
 
 async def test_pipeline_close_collects_pending_tasks():
-    # aclose() must cancel/collect every background task (feedback + beep)
-    async def hung_beep():
-        await asyncio.Event().wait()
-
+    # aclose() must cancel/collect the feedback task even if it is mid-loop
     controller = FakeController()
     pipeline = make_pipeline(
-        FakeCapture([]), FakeWake(), controller, [], doa=FakeDoa(None), wake_sound=hung_beep
+        FakeCapture([]), FakeWake(), controller, [], doa=FakeDoa(None), listening_cycle_s=100.0
     )
-    beep = pipeline._spawn(pipeline._safe_beep(), pipeline._beep_tasks)
     eos = asyncio.Event()
     feedback = pipeline._spawn(pipeline._listening_feedback(eos), pipeline._feedback_tasks)
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.01)  # let it enter the (long) listening wait
     await pipeline.aclose()
-    assert beep.cancelled() and feedback.cancelled()
+    assert feedback.cancelled()
     await asyncio.sleep(0)
-    assert pipeline._beep_tasks == set()
     assert pipeline._feedback_tasks == set()
 
 

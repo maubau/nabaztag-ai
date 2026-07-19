@@ -23,8 +23,9 @@ import yaml
 from ..body.controller import BodyController
 from ..body.mock_ojn import MOCK_SERIAL, MOCK_VAPI_TOKEN, MockOjnServer
 from ..body.ojn_adapter import OjnAdapter
+from ..body.types import PlayAudioCommand
 from ..stt import make_stt
-from .beep import SineBeep
+from ..tts import Mp3Server
 from .capture import AlsaCapture, MicCapture, WavCapture
 from .doa import make_doa
 from .pipeline import VoicePipeline
@@ -76,13 +77,24 @@ async def run(args: argparse.Namespace, config: dict, moods: dict) -> None:
     async def on_transcript(text: str) -> None:
         print(f"\n>>> {text}\n")
 
+    # Optional wake beep played ON THE RABBIT: serve a short MP3 the rabbit can
+    # fetch (same Mp3Server the TTS layer uses; base_url must be the Bolt's
+    # legacy-segment IP, not localhost). Off unless wake_beep.enabled + mp3.
     beep_cfg = config.get("wake_beep", {})
-    wake_sound = None
-    if beep_cfg.get("enabled", False):
-        wake_sound = SineBeep(
-            freq_hz=beep_cfg.get("freq_hz", 880),
-            duration_ms=beep_cfg.get("duration_ms", 120),
-            volume=beep_cfg.get("volume", 0.2),
+    mp3_cfg = config.get("mp3_server", {})
+    wake_beep = None
+    beep_server = None
+    if beep_cfg.get("enabled", False) and beep_cfg.get("mp3"):
+        beep_path = Path(beep_cfg["mp3"])
+        beep_server = Mp3Server(
+            beep_path.parent,
+            host=mp3_cfg.get("host", "0.0.0.0"),
+            port=mp3_cfg.get("port", 8090),
+            base_url=mp3_cfg.get("base_url"),
+        )
+        await beep_server.start()
+        wake_beep = PlayAudioCommand(
+            (beep_server.url_for(beep_path),), beep_cfg.get("duration_ms", 120) / 1000
         )
 
     async with OjnAdapter(base_url, serial, token) as adapter:
@@ -101,8 +113,7 @@ async def run(args: argparse.Namespace, config: dict, moods: dict) -> None:
             recorder_kwargs={
                 "end_of_speech_ms": audio_cfg.get("vad_end_of_speech_ms", 700),
             },
-            wake_sound=wake_sound,
-            beep_guard_ms=beep_cfg.get("guard_ms", 150),
+            wake_beep=wake_beep,
             processing_indicator=config.get("leds", {}).get("processing_indicator", False),
         )
         print("listening… say the wake word (Ctrl-C to quit)")
@@ -110,6 +121,8 @@ async def run(args: argparse.Namespace, config: dict, moods: dict) -> None:
             await pipeline.run()
         finally:
             runner.cancel()
+            if beep_server is not None:
+                await beep_server.stop()
             if mock is not None:
                 await mock.stop()
 

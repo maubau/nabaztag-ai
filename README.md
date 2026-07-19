@@ -45,6 +45,13 @@ sudo udevadm control --reload && sudo udevadm trigger
 python -m rabbit_brain.audio.demo --config config.yaml --mock-ojn   # mic smoke test
 ```
 
+`config.yaml` is gitignored, so `git pull` never updates it — a config created from an older example can silently keep stale settings (e.g. a missing `deepgram.endpointing`). Check it against the current shape after pulling:
+
+```bash
+brain/scripts/config-doctor.py config.yaml         # report drift
+brain/scripts/config-doctor.py config.yaml --fix   # rewrite present-but-stale keys in place
+```
+
 (The script exists because openWakeWord's Linux dependency on tflite-runtime has no Python 3.12 wheel; we only use its ONNX backend, so it is installed `--no-deps` on top of the `brain[audio]` extra. CI runs the same script on Ubuntu 24.04/3.12.)
 
 ## Architecture

@@ -75,6 +75,7 @@ async def test_deepgram_streams_pcm_and_joins_finals():
     assert bytes(received) == PCM + PCM
     assert seen_query["model"] == "nova-3"
     assert seen_query["language"] == "multi"
+    assert seen_query["endpointing"] == "100"  # Deepgram's nova-3 multilingual recommendation
     assert seen_query["encoding"] == "linear16"
     assert seen_query["sample_rate"] == "16000"
 

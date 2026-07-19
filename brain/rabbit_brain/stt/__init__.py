@@ -30,7 +30,11 @@ def make_stt(config: dict[str, Any]) -> STTProvider:
         dg = config.get("deepgram", {})
         wh = config.get("openai_whisper", {})
         return FallbackSTT(
-            DeepgramSTT(model=dg.get("model", "nova-3"), language=dg.get("language", "multi")),
+            DeepgramSTT(
+                model=dg.get("model", "nova-3"),
+                language=dg.get("language", "multi"),
+                endpointing_ms=dg.get("endpointing", 100),
+            ),
             WhisperApiSTT(model=wh.get("model", "whisper-1")),
         )
     if profile == "local":

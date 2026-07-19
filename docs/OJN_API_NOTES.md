@@ -91,10 +91,12 @@ Hardware half — status on the real rabbit:
    instant; if OJN queues instead, the stop lands one cycle late (cosmetic). The
    `wake_to_scanner_stop_ms` vs `wake_to_eos_ms` deltas in the pipeline's WakeTimings log
    measure this directly on hardware.
-9. **Deepgram `language: multi` unreliable on short IT phrases (July 2026).** Short Italian
-   utterances were mis-detected as pt/en; `deepgram.language: it` fixes it. Planned: fast
-   per-session it/en profiles rather than `multi`. `deepgram.model`/`language` stay config,
-   never hardcoded.
+9. **Deepgram bilingual it/en via `language: multi` + `endpointing: 100` (July 2026).** The
+   desired behavior is automatic it/en code-switching (an "English" transcript was in fact
+   an English phrase, not a misdetection). Keep `language: multi`; add `endpointing: 100`
+   (Deepgram's recommendation for nova-3 multilingual code-switching). Optional fixed `it`/
+   `en` profiles per session if one language must be forced. `model`/`language`/`endpointing`
+   stay config, never hardcoded.
 10. **Optional local wake beep (100–150 ms) on the Bolt.** Implemented (`audio/beep.py`,
     off by default): plays on the Bolt output, and the pipeline drops the first `guard_ms`
     of capture so the tone cannot enter VAD/STT (no AEC). Before enabling on hardware,

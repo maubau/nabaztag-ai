@@ -1,4 +1,3 @@
-from .beep import SineBeep
 from .capture import AlsaCapture, MicCapture, WavCapture, extract_channel, resolve_input_device
 from .doa import (
     CommandDoa,
@@ -21,7 +20,6 @@ __all__ = [
     "FlexUsbDoa",
     "MicCapture",
     "OpenWakeWordDetector",
-    "SineBeep",
     "UtteranceRecorder",
     "VoicePipeline",
     "WakeTimings",

@@ -30,12 +30,16 @@ class DeepgramSTT:
         api_key: str | None = None,
         model: str = "nova-3",
         language: str = "multi",
+        endpointing_ms: int = 100,
         ws_base: str = DEFAULT_WS_BASE,
         timeout_s: float = DEFAULT_TIMEOUT_S,
     ):
         self._api_key = api_key or os.environ["DEEPGRAM_API_KEY"]
         self._model = model
         self._language = language
+        # Deepgram's own end-of-speech endpointing; 100 ms is their recommended
+        # value for nova-3 multilingual it/en code-switching.
+        self._endpointing_ms = endpointing_ms
         self._ws_base = ws_base
         self._timeout_s = timeout_s
 
@@ -43,6 +47,7 @@ class DeepgramSTT:
         params = {
             "model": self._model,
             "language": self._language,
+            "endpointing": str(self._endpointing_ms),
             "encoding": "linear16",
             "sample_rate": str(sample_rate),
             "channels": "1",
