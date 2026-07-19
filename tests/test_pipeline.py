@@ -464,6 +464,34 @@ async def test_wake_timings_recorded(caplog):
     with caplog.at_level(logging.INFO):
         await pipeline.run()
     assert any("wake cycle timings" in r.message for r in caplog.records)
+    assert "wake_to_scanner_stop_enqueued_ms" in pipeline.last_timings.as_dict()
+
+
+async def test_scanner_stop_metric_tracks_end_of_speech_not_stt():
+    """The scanner_stop_enqueued timestamp must be the LEDs-off ENQUEUE at
+    end-of-speech, not when STT finishes — with a slow STT the two diverge
+    (previously they always coincided because it was set after awaiting STT)."""
+    release = asyncio.Event()
+    controller = FakeController()
+    transcripts = []
+    pipeline = make_pipeline(
+        FakeCapture([SILENCE, SPEECH, SPEECH, SPEECH] + [SILENCE] * 12),
+        FakeWake(trigger_at=0),
+        controller,
+        transcripts,
+        doa=FakeDoa(DoaReading(angle_deg=0)),
+        stt=FakeSTT(release=release),
+        listening_cycle_s=0.01,
+    )
+    run = asyncio.create_task(pipeline.run())
+    await asyncio.sleep(0.05)  # STT still blocked, but end-of-speech has passed
+    release.set()
+    await asyncio.wait_for(run, 2)
+    t = pipeline.last_timings
+    # the stop was enqueued at end-of-speech, comfortably before STT finished
+    assert t.scanner_stop_enqueued is not None
+    assert t.end_of_speech <= t.scanner_stop_enqueued < t.stt_final
+    assert (t.stt_final - t.scanner_stop_enqueued) >= 0.04  # the ~50 ms STT block
 
 
 async def test_half_duplex_gate_blocks_wake():
@@ -507,7 +535,11 @@ async def test_pipeline_close_collects_pending_tasks():
         FakeCapture([]), FakeWake(), controller, [], doa=FakeDoa(None), listening_cycle_s=100.0
     )
     eos = asyncio.Event()
-    feedback = pipeline._spawn(pipeline._listening_feedback(eos), pipeline._feedback_tasks)
+    from rabbit_brain.audio.pipeline import WakeTimings
+
+    feedback = pipeline._spawn(
+        pipeline._listening_feedback(eos, WakeTimings(wake=0.0)), pipeline._feedback_tasks
+    )
     await asyncio.sleep(0.01)  # let it enter the (long) listening wait
     await pipeline.aclose()
     assert feedback.cancelled()

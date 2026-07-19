@@ -203,6 +203,24 @@ async def test_mp3_server_purges_old_files(tmp_path):
     assert fresh.exists()
 
 
+def test_mp3_server_keeps_protected_static_assets(tmp_path):
+    import os
+    import time
+
+    # a static wake beep lives alongside throwaway TTS output; retention must
+    # purge the expired TTS but keep the protected asset
+    server = Mp3Server(tmp_path, host="127.0.0.1", port=0, retention_s=60, protected={"wake.mp3"})
+    tts, beep = tmp_path / "utt-old.mp3", tmp_path / "wake.mp3"
+    tts.write_bytes(b"x")
+    beep.write_bytes(b"x")
+    stale = time.time() - 3600
+    os.utime(tts, (stale, stale))
+    os.utime(beep, (stale, stale))  # the beep is old too, but protected
+    assert server.purge_now() == 1
+    assert not tts.exists()
+    assert beep.exists()
+
+
 def test_recording_controller_matches_bodycontroller_surface():
     # Speaker only calls submit(cmd, priority); ensure the real controller has it
     assert callable(BodyController.submit)

@@ -70,9 +70,14 @@ wake_beep:
   # gate keeps it out of VAD/STT (no AEC) — no fixed guard needed. Off by
   # default; before enabling on hardware confirm Silero does not classify the
   # tone as speech and it never leaks into a transcript.
+  # NOTE (hardware, July 2026): a ~120 ms/1 KB MP3 fetched fine (GET 200) but
+  # was inaudible — likely too short for the MTL decoder; use ~200-300 ms. A
+  # firmware-resident tone is NOT remotely triggerable (docs/OJN_API_NOTES #11),
+  # so an external MP3 is the only controllable wake sound. The wake file is
+  # kept out of the retention purge (Mp3Server protected set).
   enabled: false
-  mp3: www/audio/wake.mp3   # a 100-150 ms MP3 the rabbit can fetch (served by mp3_server)
-  duration_ms: 120
+  mp3: www/audio/wake.mp3   # a ~200-300 ms MP3 the rabbit can fetch (served by mp3_server)
+  duration_ms: 250
 
 wake:
   # openWakeWord model names or paths. The stock hey_jarvis model is for the

@@ -29,6 +29,7 @@ class Mp3Server:
         port: int = DEFAULT_PORT,
         base_url: str | None = None,
         retention_s: float = DEFAULT_RETENTION_S,
+        protected: set[str] | None = None,
     ):
         self._audio_dir = Path(audio_dir)
         self._audio_dir.mkdir(parents=True, exist_ok=True)
@@ -36,6 +37,9 @@ class Mp3Server:
         self._port = port
         self._base_url = (base_url or f"http://192.168.66.1:{port}").rstrip("/")
         self._retention_s = retention_s
+        # Static assets (e.g. a wake beep) live alongside throwaway TTS output
+        # but must survive the retention purge — by filename, matched by basename.
+        self._protected = set(protected or ())
         self._app = web.Application()
         self._app.router.add_static("/", self._audio_dir)
         self._runner: web.AppRunner | None = None
@@ -77,6 +81,8 @@ class Mp3Server:
         removed = 0
         for pattern in ("*.mp3", "*.wav"):
             for f in self._audio_dir.glob(pattern):
+                if f.name in self._protected:  # static asset, never purged
+                    continue
                 try:
                     if f.stat().st_mtime < cutoff:
                         f.unlink()

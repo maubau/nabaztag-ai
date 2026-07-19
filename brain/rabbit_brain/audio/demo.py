@@ -91,6 +91,7 @@ async def run(args: argparse.Namespace, config: dict, moods: dict) -> None:
             host=mp3_cfg.get("host", "0.0.0.0"),
             port=mp3_cfg.get("port", 8090),
             base_url=mp3_cfg.get("base_url"),
+            protected={beep_path.name},  # static asset: never purged by retention
         )
         await beep_server.start()
         wake_beep = PlayAudioCommand(

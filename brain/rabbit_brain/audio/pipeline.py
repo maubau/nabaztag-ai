@@ -65,13 +65,20 @@ _CLOSE = object()  # sentinel ending the STT chunk stream
 @dataclass
 class WakeTimings:
     """Monotonic diagnostics for one wake→listen→transcribe cycle. Separates
-    VAD delay, Deepgram endpointing, and choreography-stop latency."""
+    VAD delay, Deepgram endpointing, and the feedback-stop reaction.
+
+    scanner_stop_enqueued is when the LISTENING feedback SUBMITTED the LEDs-off
+    chor (right at end-of-speech), NOT when it reached the rabbit:
+    BodyController.submit only enqueues. Wire-execution latency (controller
+    queue + HTTP) is a separate measurement that needs a controller ack —
+    OJN_API_NOTES probe #8.
+    """
 
     wake: float
     speech_start: float | None = None
     end_of_speech: float | None = None
     stt_final: float | None = None
-    scanner_stop: float | None = None
+    scanner_stop_enqueued: float | None = None
 
     def as_dict(self) -> dict[str, int | None]:
         def ms(t: float | None) -> int | None:
@@ -86,7 +93,7 @@ class WakeTimings:
             "wake_to_speech_ms": ms(self.speech_start),
             "wake_to_eos_ms": ms(self.end_of_speech),
             "wake_to_stt_final_ms": ms(self.stt_final),
-            "wake_to_scanner_stop_ms": ms(self.scanner_stop),
+            "wake_to_scanner_stop_enqueued_ms": ms(self.scanner_stop_enqueued),
             "stt_endpointing_ms": endpointing,
         }
 
@@ -134,6 +141,7 @@ class VoicePipeline:
 
         self._feedback_tasks: set[asyncio.Task] = set()
         self.doa_reads = 0  # diagnostics/tests: periodic DoA reads during LISTENING
+        self.last_timings: WakeTimings | None = None  # last wake cycle, for diagnostics
 
     # --- half-duplex gate (§6.2.7) --------------------------------------
 
@@ -180,16 +188,18 @@ class VoicePipeline:
         # one sequential feedback task (DoA → ack → scanner); VAD/STT below run
         # concurrently and start immediately
         end_of_speech = asyncio.Event()
-        feedback = self._spawn(self._listening_feedback(end_of_speech), self._feedback_tasks)
+        feedback = self._spawn(
+            self._listening_feedback(end_of_speech, timings), self._feedback_tasks
+        )
         try:
             result = await self._record_and_transcribe(frames, end_of_speech, timings)
         finally:
             end_of_speech.set()  # ensure the feedback stops on any exit path
             with contextlib.suppress(asyncio.CancelledError):
-                await feedback  # feedback turns the LEDs off in its own finally
-            timings.scanner_stop = time.monotonic()
+                await feedback  # records scanner_stop_enqueued in its own finally
         if result is not None and result.text:
             await self._process_transcript(result.text)
+        self.last_timings = timings
         log.info("wake cycle timings: %s", timings.as_dict())
 
     # --- body feedback (single sequential task, choreography-only) ------
@@ -230,7 +240,7 @@ class VoicePipeline:
             return "left"
         return None  # front or behind: both
 
-    async def _listening_feedback(self, end_of_speech: asyncio.Event) -> None:
+    async def _listening_feedback(self, end_of_speech: asyncio.Event, timings: WakeTimings) -> None:
         try:
             if end_of_speech.is_set():
                 return
@@ -249,6 +259,9 @@ class VoicePipeline:
         finally:
             # stop the LISTENING scanner: LEDs lit only while the user speaks
             await self._submit_chor(build_leds_off_chor())
+            # when the stop was ENQUEUED (≈ end-of-speech); wire execution is
+            # a separate, controller-level measurement (probe #8)
+            timings.scanner_stop_enqueued = time.monotonic()
 
     async def _process_transcript(self, text: str) -> None:
         if not self._processing_indicator:

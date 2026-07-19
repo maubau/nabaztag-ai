@@ -88,19 +88,49 @@ Hardware half — status on the real rabbit:
 8. **OPEN — chor-interrupts-chor semantics.** Does submitting a new choreography while one
    is playing REPLACE it immediately, or queue behind it? The looping LISTENING/PROCESSING
    indicators and their all-off terminator assume prompt replacement so the stop is
-   instant; if OJN queues instead, the stop lands one cycle late (cosmetic). The
-   `wake_to_scanner_stop_ms` vs `wake_to_eos_ms` deltas in the pipeline's WakeTimings log
-   measure this directly on hardware.
+   instant; if OJN queues instead, the stop lands one cycle late (cosmetic). The pipeline's
+   WakeTimings log records `wake_to_scanner_stop_enqueued_ms` (when the LEDs-off chor was
+   SUBMITTED, ≈ end-of-speech) — but wire execution needs a BodyController completion/ack to
+   measure; submit() only enqueues (hardware finding: the old `scanner_stop` metric was set
+   after awaiting STT, so it always equalled `stt_final`; now it is stamped at the enqueue
+   inside `_listening_feedback`, distinguishing enqueue from wire).
 9. **Deepgram bilingual it/en via `language: multi` + `endpointing: 100` (July 2026).** The
    desired behavior is automatic it/en code-switching (an "English" transcript was in fact
    an English phrase, not a misdetection). Keep `language: multi`; add `endpointing: 100`
    (Deepgram's recommendation for nova-3 multilingual code-switching). Optional fixed `it`/
    `en` profiles per session if one language must be forced. `model`/`language`/`endpointing`
    stay config, never hardcoded.
-10. **Optional local wake beep (100–150 ms) on the Bolt.** Implemented (`audio/beep.py`,
-    off by default): plays on the Bolt output, and the pipeline drops the first `guard_ms`
-    of capture so the tone cannot enter VAD/STT (no AEC). Before enabling on hardware,
-    confirm Silero does not classify the tone as speech and it never leaks into a transcript.
+10. **Wake beep plays on the RABBIT via the audio lane (`MU/PL/MW`), off by default.** The
+    beep is a `PlayAudioCommand` (MP3-by-URL) at USER_SPEECH_SYNC; the half-duplex gate in
+    the record loop drops mic frames while it plays (no AEC), tying the guard to the real
+    playback timer. Before enabling: confirm Silero does not classify it as speech / it never
+    leaks into a transcript. Hardware finding (July 2026): the software+network path is
+    confirmed (rabbit issues `GET /wake.mp3` → 200 on every wake), but a ~120 ms / ~1 KB MP3
+    is inaudible — likely too short for the MTL decoder. Fallback: a slightly longer, valid
+    MP3 (~200–300 ms). Static beep assets served from the Mp3Server dir must be `protected`
+    from the retention purge (it deletes `*.mp3`/`*.wav` older than retention).
+11. **No independent resident-sound command exists (source review of OJN + MTL bootcode,
+    commit 640257f3, July 2026).** Goal was a short firmware wake tone (no HTTP, no motion,
+    no long jingle). Findings:
+    - **The long jingle IS firmware-resident and needs no HTTP.** `info.mtl newInfoUpdate`
+      parses the AmbientPacket services; when the ear keys (4=MoveLeftEar, 5=MoveRightEar)
+      change it calls `controlsound midi_communion` (a ~155-byte resident MIDI) **and**
+      `earsGoToRefPos`. So `posleft/posright` (AmbientPacket, `ambientpacket.cpp
+      SetEarsPosition`) always triggers the carillon + an ear reset — confirming probe #7
+      from source (a tcpdump would show the jingle with zero GET). Never use it for reflex.
+    - **Choreography carries no audio.** `choregraphy.cpp` emits only opcode `0x07` (LED) and
+      `0x08` (motor); the rabbit plays a `CH <file>` with just those. This is why chor-only
+      feedback is silent — the desired property, kept.
+    - **Resident short sounds exist but are not remotely triggerable.** `const_data.mtl` holds
+      `midi_ack`, `midi_acquired`, `midi_ministop`, `midi_abort`, `midi_start/endInteractive`,
+      `midi_ears`, single notes `midi_1noteA4…` — all played by `controlsound`, which the
+      bootcode only calls internally (button/interactive/ambient). OJN's packet builders
+      (`bunny.cpp`) emit only `MU/PL/MW` (MP3 audio), `CH` (chor) and the AmbientPacket; there
+      is **no ping command to play a resident MIDI on its own**.
+    - **Decision:** a resident wake tone would need either bootcode modification (add a
+      play-sound ping command — invasive, out of scope) or the ambient-ear path (long jingle +
+      ear reset — unacceptable). So the external MP3 on the audio lane stays the only
+      controllable wake sound; probe #10's longer-MP3 fallback is the path if a beep is wanted.
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 
