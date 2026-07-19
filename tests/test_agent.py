@@ -36,12 +36,14 @@ class FakeLLM:
 class FakeSpeaker:
     def __init__(self, raises: Exception | None = None):
         self.spoken = []
+        self.languages = []
         self._raises = raises
 
-    async def speak(self, text, priority=None):
+    async def speak(self, text, priority=None, language=None):
         if self._raises is not None:
             raise self._raises
         self.spoken.append(text)
+        self.languages.append(language)
         return 1.5
 
 
@@ -131,6 +133,18 @@ async def test_invalid_tool_call_recovers():
     assert ctrl.submitted == []  # bad gesture never reached the body
     tool_turn = next(m for m in agent.history if isinstance(m, ToolTurn))
     assert tool_turn.results[0].output.startswith("error")
+
+
+async def test_stt_language_forwarded_to_tts():
+    # the STT-detected language reaches the speaker for voice routing —
+    # never inferred from the reply text
+    speaker = FakeSpeaker()
+    agent = make_agent(FakeLLM(LLMResult(text="I'm great!")), speaker)
+    await agent.handle("how are you?", language="en")
+    assert speaker.languages == ["en"]
+    agent.provider = FakeLLM(LLMResult(text="Benissimo!"))
+    await agent.handle("come stai?", language="it")
+    assert speaker.languages == ["en", "it"]
 
 
 async def test_responds_in_italian():

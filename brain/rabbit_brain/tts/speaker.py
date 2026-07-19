@@ -32,9 +32,16 @@ class Speaker:
         self._provider = provider
         self._mp3 = mp3_server
 
-    async def speak(self, text: str, priority: Priority = Priority.USER_SPEECH_SYNC) -> float:
+    async def speak(
+        self,
+        text: str,
+        priority: Priority = Priority.USER_SPEECH_SYNC,
+        language: str | None = None,
+    ) -> float:
         """Synthesize and queue `text`; returns the summed MP3 duration in seconds
         (excluding inter-file gaps, which the adapter adds to its estimate).
+        `language` is the STT-detected utterance language, passed to the TTS
+        provider for voice routing (Deepgram it/en); never guessed from text.
 
         Time-to-first-audio: the first sentence is submitted as soon as it is
         synthesized; the remaining sentences are synthesized while it plays and
@@ -43,13 +50,13 @@ class Speaker:
         chunks = [text] if len(text) <= SINGLE_FILE_MAX_CHARS else split_sentences(text)
         if not chunks:
             return 0.0
-        first = await self._provider.synth(chunks[0])
+        first = await self._provider.synth(chunks[0], language=language)
         await self._controller.submit(
             PlayAudioCommand((self._mp3.url_for(first.path),), first.duration_s), priority
         )
         total = first.duration_s
         if len(chunks) > 1:
-            rest = [await self._provider.synth(chunk) for chunk in chunks[1:]]
+            rest = [await self._provider.synth(chunk, language=language) for chunk in chunks[1:]]
             rest_total = sum(r.duration_s for r in rest)
             await self._controller.submit(
                 PlayAudioCommand(tuple(self._mp3.url_for(r.path) for r in rest), rest_total),

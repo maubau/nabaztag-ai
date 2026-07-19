@@ -20,6 +20,8 @@ class TTSResult:
 
 @runtime_checkable
 class TTSProvider(Protocol):
-    async def synth(self, text: str) -> TTSResult:
-        """Synthesize `text` to an MP3 file inside the provider's audio dir."""
+    async def synth(self, text: str, language: str | None = None) -> TTSResult:
+        """Synthesize `text` to an MP3 file inside the provider's audio dir.
+        `language` is the utterance language as detected by the STT ("it",
+        "en", …) for voice routing; providers with one voice ignore it."""
         ...

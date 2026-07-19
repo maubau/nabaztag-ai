@@ -61,10 +61,10 @@ class DeepgramSTT:
                 ) as ws:
                     sender = asyncio.create_task(self._send(ws, chunks))
                     try:
-                        text = await self._receive(ws)
+                        text, language = await self._receive(ws)
                     finally:
                         sender.cancel()
-                    return STTResult(text=text, provider="deepgram")
+                    return STTResult(text=text, provider="deepgram", language=language)
 
     async def _send(
         self, ws: aiohttp.ClientWebSocketResponse, chunks: AsyncIterator[bytes]
@@ -73,8 +73,9 @@ class DeepgramSTT:
             await ws.send_bytes(chunk)
         await ws.send_str(json.dumps({"type": "CloseStream"}))
 
-    async def _receive(self, ws: aiohttp.ClientWebSocketResponse) -> str:
+    async def _receive(self, ws: aiohttp.ClientWebSocketResponse) -> tuple[str, str | None]:
         finals: list[str] = []
+        languages: list[str] = []
         async for msg in ws:
             if msg.type != aiohttp.WSMsgType.TEXT:
                 break
@@ -83,7 +84,11 @@ class DeepgramSTT:
                 alt = data["channel"]["alternatives"][0]
                 if data.get("is_final") and alt.get("transcript"):
                     finals.append(alt["transcript"])
+                    # multi mode: per-segment detected languages (e.g. ["it"]) —
+                    # the STT's own detection drives TTS voice routing (§6.2.6)
+                    languages.extend(alt.get("languages") or [])
             elif data.get("type") == "Metadata":
                 # sent after CloseStream: the stream is fully processed
                 break
-        return " ".join(finals).strip()
+        language = max(set(languages), key=languages.count) if languages else None
+        return " ".join(finals).strip(), language

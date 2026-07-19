@@ -40,7 +40,8 @@ class PiperTTS:
         if proc.returncode != 0:
             raise RuntimeError(f"{cmd[0]} failed ({proc.returncode}): {stderr.decode()[-500:]}")
 
-    async def synth(self, text: str) -> TTSResult:
+    async def synth(self, text: str, language: str | None = None) -> TTSResult:
+        del language  # single local voice model — no routing
         stem = self._audio_dir / uuid.uuid4().hex
         wav_path, mp3_path = stem.with_suffix(".wav"), stem.with_suffix(".mp3")
         try:

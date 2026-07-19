@@ -15,8 +15,9 @@ class FakeTTS:
     seconds_per_synth: float = 1.5
     synths: list[str] = field(default_factory=list)
 
-    async def synth(self, text: str) -> TTSResult:
+    async def synth(self, text: str, language: str | None = None) -> TTSResult:
         self.synths.append(text)
+        self.languages = [*getattr(self, "languages", []), language]
         path = self.audio_dir / f"utt{len(self.synths)}.mp3"
         path.write_bytes(b"fake-mp3")
         return TTSResult(path=path, duration_s=self.seconds_per_synth)
@@ -228,6 +229,95 @@ def test_mp3_server_keeps_protected_static_assets(tmp_path):
 def test_recording_controller_matches_bodycontroller_surface():
     # Speaker only calls submit(cmd, priority); ensure the real controller has it
     assert callable(BodyController.submit)
+
+
+async def test_mp3_server_storage_only_mode(tmp_path):
+    """serve_http=False: no HTTP listener (Apache delivers via alias — the MTL
+    decoder ignores aiohttp-served audio), but storage/URLs/purge still work."""
+    server = Mp3Server(
+        tmp_path, port=8090, base_url="http://192.168.66.1/brain-audio", serve_http=False
+    )
+    await server.start()
+    try:
+        assert server._runner is None  # nothing bound
+        mp3 = tmp_path / "utt.mp3"
+        mp3.write_bytes(b"x")
+        assert server.url_for(mp3) == "http://192.168.66.1/brain-audio/utt.mp3"
+        assert server._purge_task is not None  # retention still owned here
+    finally:
+        await server.stop()
+
+
+async def test_speaker_routes_language_to_provider(tmp_path):
+    server = Mp3Server(tmp_path, host="127.0.0.1", port=0)
+    await server.start()
+    try:
+        tts = FakeTTS(tmp_path)
+        controller = RecordingController()
+        speaker = Speaker(controller, tts, server)
+        await speaker.speak("Hello there!", language="en")
+        assert tts.languages == ["en"]
+    finally:
+        await server.stop()
+
+
+async def test_deepgram_tts_voice_routing_and_request(tmp_path, monkeypatch):
+    from aiohttp import web
+    from rabbit_brain.tts.deepgram_tts import DeepgramTTS
+
+    got = []
+
+    async def handler(request: web.Request) -> web.Response:
+        got.append(
+            {
+                "model": request.query.get("model"),
+                "auth": request.headers.get("Authorization"),
+                "text": (await request.json())["text"],
+            }
+        )
+        return web.Response(body=b"fake-mp3", content_type="audio/mpeg")
+
+    app = web.Application()
+    app.router.add_post("/v1/speak", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+
+    monkeypatch.setattr(DeepgramTTS, "_mp3_duration", staticmethod(lambda _p: 0.5))
+    try:
+        async with DeepgramTTS(
+            tmp_path, api_key="k", api_base=f"http://127.0.0.1:{port}/v1/speak"
+        ) as tts:
+            # italian by STT-detected language
+            r_it = await tts.synth("Ciao dal coniglio", language="it")
+            # english, including region tags
+            await tts.synth("Hello!", language="en-US")
+            # no language → default (italian)
+            await tts.synth("Boh")
+            assert r_it.path.exists() and r_it.duration_s == 0.5
+    finally:
+        await runner.cleanup()
+
+    assert [g["model"] for g in got] == ["aura-2-livia-it", "aura-2-thalia-en", "aura-2-livia-it"]
+    assert got[0]["auth"] == "Token k"
+    assert got[0]["text"] == "Ciao dal coniglio"
+
+
+def test_make_tts_provider_deepgram_profile(tmp_path):
+    from rabbit_brain.tts import make_tts_provider
+    from rabbit_brain.tts.deepgram_tts import DeepgramTTS
+
+    env = {
+        "TTS_PROFILE": "deepgram",
+        "DEEPGRAM_API_KEY": "k",
+        "DEEPGRAM_TTS_VOICE_EN": "aura-2-orion-en",
+    }
+    prov = make_tts_provider(tmp_path, env=env)
+    assert isinstance(prov, DeepgramTTS)
+    assert prov.voice_for("en") == "aura-2-orion-en"
+    assert prov.voice_for("it") == "aura-2-livia-it"
 
 
 def test_make_tts_provider_profiles(monkeypatch, tmp_path):

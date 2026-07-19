@@ -50,7 +50,8 @@ class ElevenLabsTTS:
             await self._session.close()
             self._session = None
 
-    async def synth(self, text: str) -> TTSResult:
+    async def synth(self, text: str, language: str | None = None) -> TTSResult:
+        del language  # one multilingual voice — no routing needed
         if self._session is None:
             self._session = aiohttp.ClientSession()
             self._own_session = True

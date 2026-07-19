@@ -1,8 +1,16 @@
-"""Tiny HTTP server exposing TTS MP3s to the rabbit (docs/ARCHITECTURE.md §5).
+"""TTS MP3 storage + (optional) HTTP serving (docs/ARCHITECTURE.md §5).
 
-Binds 0.0.0.0 so the legacy segment can reach it; the URL handed to OJN must
-be the one the RABBIT can resolve — i.e. the Bolt's legacy IP, not localhost —
-hence the explicit base_url (default http://192.168.66.1:<port>).
+Hardware finding (July 2026): the MTL decoder does NOT play audio served by
+this aiohttp server — the rabbit GETs it (HTTP/1.0, answered 200 OK) but stays
+silent, while the SAME file served by Apache on :80 plays fine. For rabbit
+delivery, serve the audio dir through Apache with a dedicated alias
+(ojn/apache/brain-audio.conf.example) and run this component storage-only
+(serve_http=False): it keeps ownership of the audio dir, retention purge,
+protected assets and URL building; base_url then points at the Apache alias.
+The aiohttp listener remains for tests and debugging.
+
+When it does serve, it binds 0.0.0.0 so the legacy segment can reach it; the
+URL handed to OJN must be one the RABBIT can resolve — never localhost.
 """
 
 from __future__ import annotations
@@ -30,6 +38,7 @@ class Mp3Server:
         base_url: str | None = None,
         retention_s: float = DEFAULT_RETENTION_S,
         protected: set[str] | None = None,
+        serve_http: bool = True,
     ):
         self._audio_dir = Path(audio_dir)
         self._audio_dir.mkdir(parents=True, exist_ok=True)
@@ -40,8 +49,9 @@ class Mp3Server:
         # Static assets (e.g. a wake beep) live alongside throwaway TTS output
         # but must survive the retention purge — by filename, matched by basename.
         self._protected = set(protected or ())
-        self._app = web.Application()
-        self._app.router.add_static("/", self._audio_dir)
+        # serve_http=False → storage-only: Apache delivers the files (the MTL
+        # decoder ignores aiohttp-served audio); we keep dir/retention/urls.
+        self._serve_http = serve_http
         self._runner: web.AppRunner | None = None
         self._purge_task: asyncio.Task | None = None
 
@@ -59,15 +69,22 @@ class Mp3Server:
         return f"{self._base_url}/{rel}"
 
     async def start(self) -> None:
-        self._runner = web.AppRunner(self._app)
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, self._host, self._port)
-        await site.start()
-        if self._port == 0:  # ephemeral port (tests): patch base_url accordingly
-            self._port = self._runner.addresses[0][1]
-            self._base_url = f"http://127.0.0.1:{self._port}"
+        if self._serve_http:
+            app = web.Application()
+            app.router.add_static("/", self._audio_dir)
+            self._runner = web.AppRunner(app)
+            await self._runner.setup()
+            site = web.TCPSite(self._runner, self._host, self._port)
+            await site.start()
+            if self._port == 0:  # ephemeral port (tests): patch base_url accordingly
+                self._port = self._runner.addresses[0][1]
+                self._base_url = f"http://127.0.0.1:{self._port}"
+            log.info("mp3 server on %s:%s serving %s", self._host, self._port, self._audio_dir)
+        else:
+            log.info(
+                "mp3 storage-only: %s delivered via %s (Apache)", self._audio_dir, self._base_url
+            )
         self._purge_task = asyncio.create_task(self._purge_loop())
-        log.info("mp3 server on %s:%s serving %s", self._host, self._port, self._audio_dir)
 
     async def stop(self) -> None:
         if self._purge_task:

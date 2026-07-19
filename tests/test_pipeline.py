@@ -495,6 +495,87 @@ async def test_scanner_stop_metric_tracks_end_of_speech_not_stt():
     assert (t.stt_final - t.scanner_stop_enqueued) >= 0.04  # the ~50 ms STT block
 
 
+class EndlessCapture:
+    """Finite prelude, then silence forever — like a real mic. Counts pulls."""
+
+    sample_rate = 16_000
+
+    def __init__(self, prelude):
+        self._prelude = prelude
+        self.pulled = 0
+
+    async def frames(self):
+        for block in self._prelude:
+            self.pulled += 1
+            yield block
+            await asyncio.sleep(0)
+        while True:
+            self.pulled += 1
+            yield SILENCE
+            await asyncio.sleep(0.001)
+
+
+async def test_capture_drained_during_agent_processing():
+    """While on_transcript (agent/TTS) runs, the pipeline must keep consuming
+    and DISCARDING capture frames — a starved ALSA queue backs up with stale
+    audio ('capture queue full') and can fake a second wake."""
+    release = asyncio.Event()
+    capture = EndlessCapture([SILENCE, SPEECH, SPEECH, SPEECH] + [SILENCE] * 12)
+    controller = FakeController()
+    wake = FakeWake(trigger_at=0)
+    transcripts = []
+
+    async def slow_on_transcript(text: str) -> None:
+        transcripts.append(text)
+        await release.wait()  # the agent is "thinking"
+
+    pipeline = make_pipeline(
+        capture, wake, controller, transcripts, on_transcript=slow_on_transcript
+    )
+    run = asyncio.create_task(pipeline.run())
+    try:
+        await wait_until(lambda: transcripts == ["ciao coniglio"])
+        # while the agent is still busy, the capture keeps being drained…
+        pulled_before, feeds_before = capture.pulled, wake.feeds
+        await asyncio.sleep(0.05)
+        assert capture.pulled > pulled_before  # frames still flowing (discarded)
+        # …and none of the drained frames reached the wake detector
+        assert wake.feeds == feeds_before
+        release.set()
+        # once the agent is done, the main loop resumes feeding the detector
+        await wait_until(lambda: wake.feeds > feeds_before)
+    finally:
+        run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_gate_covers_queued_but_not_started_audio():
+    # audio accepted by submit() but not yet in current_playback must gate the mic
+    controller = FakeController()
+    controller.audio_busy = True  # queued, nothing playing yet
+    controller.current_playback = None
+    wake = FakeWake(trigger_at=0)
+    pipeline = make_pipeline(FakeCapture([SPEECH] * 5), wake, controller, [])
+    await pipeline.run()
+    assert wake.feeds == 0  # fully gated
+    assert wake.resets == 5
+
+
+async def test_real_controller_audio_busy_property(controller, mock_ojn):
+    from rabbit_brain.body.types import PlayAudioCommand
+
+    assert controller.audio_busy is False
+    await controller.submit(
+        PlayAudioCommand(("http://192.168.66.1/brain-audio/x.mp3",), 0.2),
+        Priority.USER_SPEECH_SYNC,
+    )
+    assert controller.audio_busy is True  # pending: not yet in current_playback
+    await asyncio.wait_for(controller.wait_idle(), 2)
+    assert controller.audio_busy is True  # now playing (duration timer + guard)
+    await asyncio.wait_for(controller.current_playback.wait_finished(), 2)
+    assert controller.audio_busy is False  # finished → gate lifts
+
+
 async def test_half_duplex_gate_blocks_wake():
     controller = FakeController()
     controller.current_playback = FakePlayback(finished=False)

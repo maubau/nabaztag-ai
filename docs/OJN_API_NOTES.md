@@ -142,6 +142,22 @@ Hardware half — status on the real rabbit:
       play-sound ping command — invasive, out of scope) or the ambient-ear path (long jingle +
       ear reset — unacceptable). So the external MP3 on the audio lane stays the only
       controllable wake sound; probe #10's longer-MP3 fallback is the path if a beep is wanted.
+12. **The MTL decoder does not play audio served by the aiohttp Mp3Server — serve MP3s via
+    Apache (hardware finding, July 2026).** The SAME MP3 played fine through Apache/OJN on
+    :80, but served by aiohttp on :8090 the rabbit issues `GET … HTTP/1.0`, receives 200 OK,
+    and stays silent — MP3/decoder/TTS/speaker are all fine; the difference is in the HTTP
+    response the old HTTP/1.0 MTL client gets from aiohttp. Resolution: rabbit-facing audio
+    is delivered by Apache via a dedicated alias (`ojn/apache/brain-audio.conf.example`,
+    `Alias /brain-audio/ → www/audio/`); the brain's Mp3Server runs storage-only
+    (`NABAZTAG_MP3_SERVE_HTTP=0`, `NABAZTAG_MP3_BASE_URL=http://192.168.66.1/brain-audio`),
+    keeping the audio dir, retention purge, protected assets and URL building.
+13. **OPEN — XMPP connection can wedge with a persistent Send-Q.** After a test session the
+    rabbit's XMPP socket sat ESTAB with Send-Q≈846 stuck bytes: OJN kept answering CHORSENT
+    but the rabbit no longer fetched `.chor` files. Restarting the OJN container did NOT make
+    the rabbit reconnect; only a physical power-cycle of the Nabaztag recovered it (LEDs red
+    until reboot). Ideas: a health check watching `ss` for a non-draining Send-Q on :5222
+    and/or the age of the last `.chor`/audio GET in the Apache log, alerting (or restarting
+    OJN + prompting a power cycle); the bootcode's own reconnect behavior is out of our reach.
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 

@@ -143,11 +143,18 @@ class VoicePipeline:
         self.doa_reads = 0  # diagnostics/tests: periodic DoA reads during LISTENING
         self.last_timings: WakeTimings | None = None  # last wake cycle, for diagnostics
         self.last_doa_deg: int | None = None  # last DoA angle, for get_direction() (§6.3)
+        self.last_stt_language: str | None = None  # detected language of the last utterance
 
     # --- half-duplex gate (§6.2.7) --------------------------------------
 
     def _gated(self) -> bool:
-        """True while the rabbit is speaking (playback timer incl. guard)."""
+        """True while the rabbit is speaking OR has audio queued (playback
+        timer incl. guard). Uses BodyController.audio_busy when available so
+        the gate also covers audio accepted by submit() but not yet started —
+        current_playback alone misses that window (hardware finding)."""
+        busy = getattr(self._controller, "audio_busy", None)
+        if busy is not None:
+            return bool(busy)
         handle = self._controller.current_playback
         return handle is not None and not getattr(handle, "finished", False)
 
@@ -199,9 +206,39 @@ class VoicePipeline:
             with contextlib.suppress(asyncio.CancelledError):
                 await feedback  # records scanner_stop_enqueued in its own finally
         if result is not None and result.text:
-            await self._process_transcript(result.text)
+            self.last_stt_language = getattr(result, "language", None)
+            # ALSA must keep being consumed while the agent/TTS run, or the
+            # capture queue backs up ("capture queue full") and stale audio can
+            # fake a second wake. Drain and DISCARD mic frames for the whole
+            # processing window; the wake detector is reset afterwards, and the
+            # gate (audio_busy) keeps it silent through playback + guard.
+            done = asyncio.Event()
+
+            async def process() -> None:
+                try:
+                    await self._process_transcript(result.text)
+                finally:
+                    done.set()
+
+            proc = asyncio.create_task(process())
+            dropped = await self._drain_frames(frames, done)
+            await proc
+            if dropped:
+                log.debug("discarded %d stale mic frames during agent processing", dropped)
         self.last_timings = timings
         log.info("wake cycle timings: %s", timings.as_dict())
+
+    async def _drain_frames(self, frames: AsyncIterator[bytes], until: asyncio.Event) -> int:
+        """Consume and discard capture frames until `until` fires (returns the
+        count). Keeps the ALSA queue empty while something else has the floor."""
+        dropped = 0
+        while not until.is_set():
+            try:
+                await anext(frames)
+            except StopAsyncIteration:
+                break
+            dropped += 1
+        return dropped
 
     # --- body feedback (single sequential task, choreography-only) ------
 

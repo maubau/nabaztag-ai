@@ -66,9 +66,11 @@ class AgentLoop:
     _history: list[Message] = field(default_factory=list, init=False)
     last_timings: TurnTimings | None = None
 
-    async def handle(self, transcript: str) -> str:
+    async def handle(self, transcript: str, language: str | None = None) -> str:
         """Run one turn. Returns the spoken text ("" on empty/failed turns).
-        Never raises: every error recovers and returns for the next wake word."""
+        `language` is the STT-detected utterance language, forwarded to the TTS
+        for voice routing (never inferred from text). Never raises: every error
+        recovers and returns for the next wake word."""
         timings = TurnTimings(start=time.monotonic())
         self._history.append(UserTurn(transcript))
         try:
@@ -81,7 +83,7 @@ class AgentLoop:
         text = result.text.strip()
         if text and self.speaker is not None:
             try:
-                await self.speaker.speak(text, Priority.USER_SPEECH_SYNC)
+                await self.speaker.speak(text, Priority.USER_SPEECH_SYNC, language=language)
                 timings.audio_queued = time.monotonic()
             except Exception:
                 log.exception("TTS/playback failed; recovering")

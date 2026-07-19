@@ -1,0 +1,27 @@
+# Serve rabbit-brain's generated audio (www/audio) through Apache on :80.
+#
+# Hardware finding (July 2026): the MTL decoder does not play audio served by
+# the brain's aiohttp Mp3Server on :8090 — the rabbit GETs the file (HTTP/1.0,
+# 200 OK) but stays silent, while the SAME MP3 served by Apache plays fine.
+# So rabbit-facing delivery goes through this alias; the brain keeps only
+# storage/retention (NABAZTAG_MP3_SERVE_HTTP=0).
+#
+# Install on the Bolt (adjust the repo path):
+#   sudo sed 's#__REPO_DIR__#/home/maurizio/nabaztag-ai#' \
+#       ojn/apache/brain-audio.conf.example | \
+#       sudo tee /etc/apache2/conf-available/brain-audio.conf
+#   sudo a2enconf brain-audio && sudo systemctl reload apache2
+#
+# Then in .env:
+#   NABAZTAG_MP3_BASE_URL=http://192.168.66.1/brain-audio
+#   NABAZTAG_MP3_SERVE_HTTP=0
+#
+# Apache (www-data) needs read access to the audio dir:
+#   chmod 755 __REPO_DIR__ __REPO_DIR__/www __REPO_DIR__/www/audio
+
+Alias /brain-audio/ __REPO_DIR__/www/audio/
+<Directory __REPO_DIR__/www/audio/>
+    Options None
+    AllowOverride None
+    Require all granted
+</Directory>

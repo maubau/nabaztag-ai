@@ -22,8 +22,15 @@ local_whisper:
   model: small
   compute_type: int8
 
-# TTS profile: "elevenlabs" (cloud, Italian voice) or "piper" (local)
-tts_profile: elevenlabs
+# TTS profile (informational — the runtime reads TTS_PROFILE from .env):
+# "deepgram" (Aura, voice routed by the STT-detected it/en language),
+# "elevenlabs" (one multilingual voice) or "piper" (local).
+tts_profile: deepgram
+
+deepgram_tts:
+  # voices per utterance language (env: DEEPGRAM_TTS_VOICE_IT/_EN)
+  voice_it: aura-2-livia-it
+  voice_en: aura-2-thalia-en
 
 elevenlabs:
   voice_id: ""      # your Italian voice id

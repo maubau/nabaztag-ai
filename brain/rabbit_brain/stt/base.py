@@ -21,6 +21,9 @@ class STTResult:
     # real-time factor (processing time / audio time) — logged for the
     # local-vs-cloud comparison (task T5); None where it isn't meaningful.
     rtf: float | None = None
+    # language detected BY THE STT ("it", "en", …) — drives TTS voice routing
+    # (§6.2.6); never inferred from the text with heuristics.
+    language: str | None = None
 
 
 @runtime_checkable

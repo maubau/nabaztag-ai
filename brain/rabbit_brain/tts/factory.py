@@ -20,10 +20,20 @@ from .speaker import Speaker
 def make_tts_provider(
     audio_dir: str | Path, env: dict[str, str] | None = None
 ) -> TTSProvider | None:
-    """TTS_PROFILE=elevenlabs|piper selects the backend; unset → None (no local
-    TTS, callers fall back to OJN's dead tts/say). Keys come only from env."""
+    """TTS_PROFILE=deepgram|elevenlabs|piper selects the backend; unset → None
+    (no local TTS, callers fall back to OJN's dead tts/say). Keys come only
+    from env and are never logged."""
     env = env if env is not None else os.environ
     profile = env.get("TTS_PROFILE", "").lower()
+    if profile == "deepgram":
+        from .deepgram_tts import DeepgramTTS
+
+        return DeepgramTTS(
+            audio_dir,
+            api_key=env.get("DEEPGRAM_API_KEY"),  # None → provider reads env itself
+            voice_it=env.get("DEEPGRAM_TTS_VOICE_IT", "aura-2-livia-it"),
+            voice_en=env.get("DEEPGRAM_TTS_VOICE_EN", "aura-2-thalia-en"),
+        )
     if profile == "elevenlabs":
         from .elevenlabs_tts import ElevenLabsTTS
 
@@ -72,11 +82,16 @@ async def build_speech_stack(
     provider = make_tts_provider(audio_dir, env)
     if provider is None:
         return SpeechStack()
+    # NABAZTAG_MP3_SERVE_HTTP=0 → storage-only: Apache delivers the files via
+    # the brain-audio alias (the MTL decoder ignores aiohttp-served audio —
+    # hardware finding, July 2026). base_url must then point at the alias.
+    serve_http = env.get("NABAZTAG_MP3_SERVE_HTTP", "1").lower() not in ("0", "false", "no")
     mp3_server = Mp3Server(
         audio_dir,
         port=int(env.get("NABAZTAG_MP3_PORT", "8090")),
         base_url=env.get("NABAZTAG_MP3_BASE_URL"),
         protected=protected_assets,
+        serve_http=serve_http,
     )
     await mp3_server.start()
     return SpeechStack(provider, mp3_server, Speaker(controller, provider, mp3_server))

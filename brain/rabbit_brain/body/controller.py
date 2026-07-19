@@ -222,3 +222,14 @@ class BodyController:
     def current_playback(self) -> PlaybackHandle | None:
         """The in-flight playback, if any — the half-duplex gate awaits this."""
         return self._current_playback
+
+    @property
+    def audio_busy(self) -> bool:
+        """True while ANY audio is queued or (estimated) playing — including
+        commands accepted by submit() but not yet executed, which
+        current_playback alone cannot see. The half-duplex gate uses this so
+        the mic never hears audio that is about to start (§6.2.7)."""
+        if self._audio_pending:
+            return True
+        handle = self._current_playback
+        return handle is not None and not getattr(handle, "finished", False)

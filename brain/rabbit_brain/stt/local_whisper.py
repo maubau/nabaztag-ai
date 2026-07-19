@@ -37,7 +37,7 @@ class LocalWhisperSTT:
         pcm = await drain(chunks)
         audio_s = len(pcm) / 2 / sample_rate
         start = time.monotonic()
-        text = await asyncio.to_thread(self._transcribe_sync, pcm, sample_rate)
+        text, language = await asyncio.to_thread(self._transcribe_sync, pcm, sample_rate)
         elapsed = time.monotonic() - start
         rtf = elapsed / audio_s if audio_s > 0 else None
         log.info(
@@ -48,13 +48,14 @@ class LocalWhisperSTT:
             elapsed,
             rtf or 0.0,
         )
-        return STTResult(text=text, provider="faster_whisper", rtf=rtf)
+        return STTResult(text=text, provider="faster_whisper", rtf=rtf, language=language)
 
-    def _transcribe_sync(self, pcm: bytes, sample_rate: int) -> str:
+    def _transcribe_sync(self, pcm: bytes, sample_rate: int) -> tuple[str, str | None]:
         import numpy as np
 
         model = self._ensure_model()
         audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
         # faster-whisper resamples internally when given a 16 kHz float array
-        segments, _info = model.transcribe(audio, language=self._language)
-        return " ".join(s.text.strip() for s in segments).strip()
+        segments, info = model.transcribe(audio, language=self._language)
+        text = " ".join(s.text.strip() for s in segments).strip()
+        return text, getattr(info, "language", None)

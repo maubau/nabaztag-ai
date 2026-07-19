@@ -59,6 +59,29 @@ def _read_text(path: str) -> str:
         return f.read()
 
 
+def load_env_file(path: str | Path) -> int:
+    """Load KEY=VALUE lines from a .env file into os.environ (existing
+    variables win, so an exported shell env still overrides the file).
+    Returns the number of keys set. Values are never logged."""
+    p = Path(path)
+    if not p.exists():
+        return 0
+    loaded = 0
+    for raw in p.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :]
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+            loaded += 1
+    return loaded
+
+
 def _capture_from_config(audio_cfg: dict) -> AlsaCapture:
     return AlsaCapture(
         device=audio_cfg.get(
@@ -120,13 +143,17 @@ async def run(config_path: str, moods_path: str, system_prompt_path: str) -> Non
             ),
         )
 
+        async def on_transcript(text: str) -> None:
+            # forward the STT-detected utterance language for TTS voice routing
+            await agent.handle(text, language=pipeline.last_stt_language)
+
         pipeline = VoicePipeline(
             capture=_capture_from_config(audio_cfg),
             wake=OpenWakeWordDetector(models=tuple(wake_cfg.get("models", ["hey_jarvis"]))),
             probe_factory=SileroProbe,
             stt=make_stt(config),
             controller=controller,
-            on_transcript=agent.handle,
+            on_transcript=on_transcript,
             doa=make_doa(config),
             doa_moods=moods.get("doa", {}),
             wake_threshold=wake_cfg.get("threshold", 0.5),
@@ -178,9 +205,18 @@ def main() -> None:
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--moods", default="moods.yaml")
     parser.add_argument("--system-prompt", default=str(SYSTEM_PROMPT_PATH))
+    parser.add_argument(
+        "--env-file",
+        default=".env",
+        help="KEY=VALUE file loaded into the environment (shell env wins); '' to disable",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
     logging.basicConfig(level=args.log_level.upper())
+    if args.env_file:
+        loaded = load_env_file(args.env_file)
+        if loaded:
+            log.info("loaded %d variable(s) from %s", loaded, args.env_file)
     asyncio.run(run(args.config, args.moods, args.system_prompt))
 
 

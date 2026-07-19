@@ -56,7 +56,7 @@ async def test_deepgram_streams_pcm_and_joins_finals():
                 {
                     "type": "Results",
                     "is_final": final,
-                    "channel": {"alternatives": [{"transcript": part}]},
+                    "channel": {"alternatives": [{"transcript": part, "languages": ["it"]}]},
                 }
             )
         await ws.send_json({"type": "Metadata"})
@@ -71,7 +71,8 @@ async def test_deepgram_streams_pcm_and_joins_finals():
         result = await stt.transcribe(stream([PCM, PCM]), 16_000)
     finally:
         await runner.cleanup()
-    assert result == STTResult(text="ciao coniglio", provider="deepgram")
+    # the STT's own language detection rides along (drives TTS voice routing)
+    assert result == STTResult(text="ciao coniglio", provider="deepgram", language="it")
     assert bytes(received) == PCM + PCM
     assert seen_query["model"] == "nova-3"
     assert seen_query["language"] == "multi"
