@@ -74,6 +74,15 @@ Hardware half — status on the real rabbit:
    still to measure (risk R3 expects 1–2 s from the rabbit's ping interval).
 6. **OPEN** — precise round-trip latency of a VAPI ear command (feeds BodyController deadlines
    and the p50 budget).
+7. **OPEN — unexpected jingle on body commands (UX finding, July 2026).** During real
+   audio-in tests the rabbit played a long carillon/jingle although the pipeline sent no
+   audio. Suspect: the `posleft/posright` path (`AmbientPacket::SetEarsPosition`) or a
+   message-packet side effect in OJN/firmware. Probe: drive the same pose via `chor=`
+   instead of `posleft/posright` and compare. Meanwhile the brain's wake ack deliberately
+   uses a single motor+LED choreography and no ear-position commands (also because two
+   same-priority `EarsCommand` get coalesced by the BodyController — the DoA bias was
+   silently dropped). A short (100–200 ms) LOCAL confirmation beep on the Bolt is a
+   possible future addition, only after verifying it does not leak into VAD/STT (no AEC).
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 

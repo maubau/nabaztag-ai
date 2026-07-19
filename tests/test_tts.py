@@ -123,6 +123,24 @@ async def test_speaker_through_real_controller_hits_ojn_stream(controller, mock_
         await server.stop()
 
 
+def test_build_wake_ack_chor_short_and_valid():
+    from rabbit_brain.body.chor import build_wake_ack_chor
+
+    for side in ("left", "right", None):
+        chor = build_wake_ack_chor(side, listen_pose=(0, 0))
+        fields = chor.split(",")
+        assert (len(fields) - 1) % 6 == 0  # Choregraphy::Parse validity
+        tempo = int(fields[0])
+        last_tick = max(int(fields[i]) for i in range(1, len(fields), 6))
+        assert 300 <= last_tick * tempo <= 500  # UX: one short non-blocking ack
+        # ends in the listening pose (0° = position 0) for both ears
+        for ear in ("0", "1"):
+            assert f",motor,{ear},0,0,1" in chor
+    # sided ack twitches only that ear at t0 (motor 0=left, 1=right)
+    assert "0,motor,0,45,0,0" in build_wake_ack_chor("left", listen_pose=(0, 0))
+    assert "0,motor,0,45" not in build_wake_ack_chor("right", listen_pose=(0, 0))
+
+
 def test_build_dance_chor_capped():
     from rabbit_brain.body.chor import MAX_DANCE_S
 

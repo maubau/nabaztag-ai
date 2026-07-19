@@ -21,6 +21,41 @@ DANCE_COLORS = [
 ]
 
 
+def build_wake_ack_chor(
+    side: str | None,
+    listen_pose: tuple[int, int] = (0, 0),
+    duration_ms: int = 400,
+    tempo_ms: int = 50,
+) -> str:
+    """Wake acknowledgement: one short (300-500 ms) non-blocking choreography.
+
+    LED flash on the nose + a quick twitch of the ear on the DoA side
+    (`side`: "left" | "right" | None = both), ending in the listening pose.
+    One ChorCommand instead of two same-priority EarsCommand: EarsCommand is
+    coalescable, so the real BodyController would drop the DoA bias and keep
+    only the final pose (UX finding, July 2026). Motor-only choreography also
+    avoids posleft/posright while the jingle side effect is under
+    investigation (docs/OJN_API_NOTES.md).
+    """
+    ticks = max(2, duration_ms // tempo_ms)
+    mid = ticks // 2
+    # motor ear index: 0=left, 1=right (docs/OJN_API_NOTES.md §2)
+    ears = ("0", "1") if side is None else (("0",) if side == "left" else ("1",))
+    parts = [str(tempo_ms)]
+    # t0: nose flash + twitch out (45° off the listening pose, capped at 180°)
+    parts += ["0", "led", "2", "0", "128", "255"]
+    for ear in ears:
+        pose_deg = listen_pose[int(ear)] * 18
+        twitch_deg = min(180, pose_deg + 45)
+        parts += ["0", "motor", ear, str(twitch_deg), "0", "0"]
+    # mid: back toward the listening pose
+    for ear in ("0", "1"):
+        parts += [str(mid), "motor", ear, str(listen_pose[int(ear)] * 18), "0", "1"]
+    # end: LED off, listening pose held
+    parts += [str(ticks), "led", "2", "0", "0", "0"]
+    return ",".join(parts)
+
+
 def build_dance_chor(duration_s: float, tempo_ms: int = 100) -> str:
     """A LED/ear dance sized to span ~duration_s (e.g. a spoken sentence).
 
