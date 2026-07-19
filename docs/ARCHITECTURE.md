@@ -154,11 +154,11 @@ Only if native \+ raw frames prove insufficient or too awkward to sequence do we
 
 1. **Audio front-end:** ALSA capture from reSpeaker (USB Audio Class). Read DoA angle via the XVF3800 USB control interface (Seeed provides a Python usb tuning/control utility — vendor lib, wrap it in `audio/doa.py`).  
 2. **Wake word:** openWakeWord on Bolt CPU.  
-3. **VAD:** silero-vad; end-of-speech at 1200 ms silence (700 ms proved too eager for natural mid-sentence pauses on hardware).
+3. **VAD:** silero-vad; end-of-speech at 1600 ms silence (700 then 1200 ms proved too eager for natural mid-sentence pauses on hardware).
 4. **STT — dual profile behind `STTProvider` interface, selected in `config.yaml`:**  
    - `cloud`: **Deepgram streaming** (primary — credits available; model `nova-3`, set in `config.yaml` as `deepgram.model` so it can be swapped without code changes; language auto it/en). **OpenAI Whisper API** as `cloud_fallback` (credits available; non-streaming, acceptable for short utterances).  
    - `local`: faster-whisper (CTranslate2) on Bolt CPU, model `small` or `medium` int8 — benchmark both (T5) and record RTF for the video's local-vs-cloud segment.  
-5. **Agent loop:** Claude API (`claude-sonnet-4-6`), streaming, tools below, rolling history, personality system prompt (`prompts/system.md`).  
+5. **Agent loop:** LLM behind a provider-neutral `LLMProvider` interface (`llm/base.py`). **OpenAI is the active provider** (Responses API, streaming + function calling; model configurable via `llm.model`, e.g. `gpt-5.4-mini`, never hardcoded); other providers are future extensions and none is required. Streaming, body tools below, rolling history (`llm.max_history_turns`), personality system prompt (`prompts/system.md`). Tool-call rounds capped by `llm.max_tool_rounds`. `OPENAI_API_KEY` comes only from the environment (and doubles as the Whisper STT fallback key); it is never logged.  
 6. **TTS:** ElevenLabs (primary, Italian voice) or Piper on Bolt (local profile). Output MP3 to `www/audio/`, served by a tiny HTTP server; then OJN call to play the URL on the rabbit. Because playback is whole-file, split long replies into sentence-level MP3s queued sequentially to cut time-to-first-audio.  
 7. **Half-duplex gate:** mic pipeline pauses from OJN play command until estimated playback end (+300 ms guard).  
 8. **DoA behavior:** on wake word, read DoA angle → map to ear gesture "turning toward the speaker" (both ears biased toward source side) before listening pose. Config in `moods.yaml`.  

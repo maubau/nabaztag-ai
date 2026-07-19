@@ -25,7 +25,7 @@ CHECKS = {
         "reSpeaker XVF3800 stable ALSA card name (numeric indices drift across reboots)",
     ),
     ("audio", "vad_end_of_speech_ms"): (
-        1200,
+        1600,
         "natural brief pauses must not close the utterance prematurely",
     ),
 }

@@ -30,8 +30,16 @@ elevenlabs:
   model: eleven_multilingual_v2
 
 llm:
-  model: claude-sonnet-4-6
-  max_history_turns: 20
+  # OpenAI is the active provider (§6.2.5). The interface (LLMProvider) stays
+  # swappable so other providers can be added later; none is required now.
+  # The model is configuration, never hardcoded.
+  provider: openai
+  model: gpt-5.4-mini
+  reasoning_effort: low     # low|medium|high (reasoning models)
+  max_output_tokens: 300    # replies are spoken — keep them short
+  timeout_s: 20
+  max_tool_rounds: 4        # cap tool-call rounds per turn (no infinite loops)
+  max_history_turns: 20     # rolling conversation memory, kept locally
 
 ojn:
   # Self-hosted OpenJabNab on the Bolt: the Apache wrapper on port 80.
@@ -57,7 +65,7 @@ audio:
   selected_channel: 0
   # Keep a natural mid-sentence pause open; 700 ms proved too eager on the
   # real microphone and forced a new wake word after a brief hesitation.
-  vad_end_of_speech_ms: 1200
+  vad_end_of_speech_ms: 1600
   half_duplex_guard_ms: 300
 
 leds:

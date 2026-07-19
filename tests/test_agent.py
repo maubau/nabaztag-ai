@@ -1,0 +1,219 @@
+"""Agent loop with a fake LLM provider (no real API calls in CI)."""
+
+import asyncio
+
+from rabbit_brain.body.types import ChorCommand, EarsCommand
+from rabbit_brain.llm import AgentConfig, AgentLoop, BodyTools, LLMResult, ToolCall
+from rabbit_brain.llm.base import ToolTurn, UserTurn
+
+SYSTEM = "you are a rabbit"
+
+
+class FakeLLM:
+    """Returns scripted LLMResults in sequence; records what it was asked."""
+
+    def __init__(self, *results, raises: Exception | None = None):
+        self._results = list(results)
+        self._raises = raises
+        self.calls = 0
+        self.last_history = None
+        self.last_tools = None
+
+    async def respond(self, system, history, tools, on_text_delta=None):
+        self.calls += 1
+        self.last_history = list(history)
+        self.last_tools = list(tools)
+        if self._raises is not None:
+            raise self._raises
+        result = self._results.pop(0) if self._results else LLMResult(text="")
+        if on_text_delta and result.text:
+            r = on_text_delta(result.text)
+            if r is not None:
+                await r
+        return result
+
+
+class FakeSpeaker:
+    def __init__(self, raises: Exception | None = None):
+        self.spoken = []
+        self._raises = raises
+
+    async def speak(self, text, priority=None):
+        if self._raises is not None:
+            raise self._raises
+        self.spoken.append(text)
+        return 1.5
+
+
+class RecordingController:
+    def __init__(self):
+        self.submitted = []
+
+    async def submit(self, cmd, priority, deadline=None):
+        self.submitted.append((cmd, priority))
+
+    def snapshot(self):
+        from rabbit_brain.body.types import BodyState
+
+        return BodyState(ears=(0, 0), leds={}, playing=False)
+
+
+def make_agent(llm, speaker=None, controller=None, **cfg):
+    ctrl = controller or RecordingController()
+    return AgentLoop(
+        provider=llm,
+        tools=BodyTools(ctrl),
+        system_prompt=SYSTEM,
+        speaker=speaker,
+        config=AgentConfig(**cfg),
+    )
+
+
+def tool_call(name, cid="c1", **args):
+    return ToolCall(call_id=cid, name=name, arguments=args)
+
+
+async def test_transcript_to_speaker():
+    llm = FakeLLM(LLMResult(text="Ciao! Sto bene, grazie."))
+    speaker = FakeSpeaker()
+    agent = make_agent(llm, speaker)
+    out = await agent.handle("Nabaztag, come stai oggi?")
+    assert out == "Ciao! Sto bene, grazie."
+    assert speaker.spoken == ["Ciao! Sto bene, grazie."]
+    # the transcript entered the history as a user turn
+    assert isinstance(agent.history[0], UserTurn)
+
+
+async def test_function_call_reaches_controller():
+    ctrl = RecordingController()
+    llm = FakeLLM(
+        LLMResult(tool_calls=[tool_call("gesture_ears", left=2, right=2)]),
+        LLMResult(text="Fatto!"),
+    )
+    agent = make_agent(llm, FakeSpeaker(), controller=ctrl)
+    await agent.handle("muovi le orecchie")
+    # the gesture reached the body as a ChorCommand (never EarsCommand)
+    cmds = [c for c, _ in ctrl.submitted]
+    assert any(isinstance(c, ChorCommand) for c in cmds)
+    assert not any(isinstance(c, EarsCommand) for c in cmds)
+    # and the tool result was fed back to the model (second call happened)
+    assert llm.calls == 2
+    assert any(isinstance(m, ToolTurn) for m in agent.history)
+
+
+async def test_multiple_tool_calls_in_one_turn():
+    ctrl = RecordingController()
+    llm = FakeLLM(
+        LLMResult(
+            tool_calls=[
+                tool_call("set_mood_lights", cid="a", mood="happy"),
+                tool_call("gesture_ears", cid="b", left=0, right=0),
+            ]
+        ),
+        LLMResult(text="Ecco!"),
+    )
+    agent = make_agent(llm, FakeSpeaker(), controller=ctrl)
+    await agent.handle("festeggia")
+    assert len(ctrl.submitted) == 2  # both tools ran
+    tool_turn = next(m for m in agent.history if isinstance(m, ToolTurn))
+    assert len(tool_turn.results) == 2
+
+
+async def test_invalid_tool_call_recovers():
+    ctrl = RecordingController()
+    llm = FakeLLM(
+        LLMResult(tool_calls=[tool_call("gesture_ears", left=0, right=99)]),  # out of range
+        LLMResult(text="Scusa, riprovo."),
+    )
+    agent = make_agent(llm, FakeSpeaker(), controller=ctrl)
+    out = await agent.handle("muovi")
+    assert out == "Scusa, riprovo."
+    assert ctrl.submitted == []  # bad gesture never reached the body
+    tool_turn = next(m for m in agent.history if isinstance(m, ToolTurn))
+    assert tool_turn.results[0].output.startswith("error")
+
+
+async def test_responds_in_italian():
+    speaker = FakeSpeaker()
+    agent = make_agent(FakeLLM(LLMResult(text="Oggi mi sento benissimo!")), speaker)
+    await agent.handle("come stai?")
+    assert speaker.spoken == ["Oggi mi sento benissimo!"]
+
+
+async def test_responds_in_english():
+    speaker = FakeSpeaker()
+    agent = make_agent(FakeLLM(LLMResult(text="I feel great today!")), speaker)
+    await agent.handle("how are you?")
+    assert speaker.spoken == ["I feel great today!"]
+
+
+async def test_history_is_trimmed():
+    speaker = FakeSpeaker()
+    # each turn returns text, no tools → one user + one assistant per turn
+    llm = FakeLLM(*[LLMResult(text=f"r{i}") for i in range(10)])
+    agent = make_agent(llm, speaker, max_history_turns=3)
+    for i in range(10):
+        await agent.handle(f"msg {i}")
+    user_turns = [m for m in agent.history if isinstance(m, UserTurn)]
+    assert len(user_turns) == 3  # only the last 3 exchanges kept
+    assert user_turns[0].text == "msg 7"
+
+
+async def test_llm_error_recovers_and_rearms():
+    speaker = FakeSpeaker()
+    agent = make_agent(FakeLLM(raises=TimeoutError("openai timeout")), speaker)
+    out = await agent.handle("ciao")
+    assert out == ""  # empty turn, no crash
+    assert speaker.spoken == []
+    # the runtime is still usable: a healthy provider works next
+    agent.provider = FakeLLM(LLMResult(text="Eccomi!"))
+    assert await agent.handle("ci sei?") == "Eccomi!"
+    assert speaker.spoken == ["Eccomi!"]
+
+
+async def test_tts_error_recovers():
+    speaker = FakeSpeaker(raises=RuntimeError("elevenlabs down"))
+    agent = make_agent(FakeLLM(LLMResult(text="Ciao")), speaker)
+    out = await agent.handle("ciao")  # must not raise
+    assert out == "Ciao"  # the reply text is still produced
+
+
+async def test_max_tool_rounds_caps_loops():
+    ctrl = RecordingController()
+    # the model keeps calling a tool forever; the cap must stop it
+    always_tool = [
+        LLMResult(tool_calls=[tool_call("get_direction", cid=f"c{i}")]) for i in range(10)
+    ]
+    llm = FakeLLM(*always_tool)
+    agent = make_agent(llm, FakeSpeaker(), controller=ctrl, max_tool_rounds=2)
+    await agent.handle("dove sono?")
+    # request rounds are capped: max_tool_rounds+1 provider calls at most
+    assert llm.calls == 3
+
+
+async def test_timings_recorded():
+    agent = make_agent(FakeLLM(LLMResult(text="ok")), FakeSpeaker())
+    await agent.handle("ciao")
+    t = agent.last_timings.as_dict()
+    assert t["to_request_ms"] is not None
+    assert t["to_final_text_ms"] is not None
+    assert t["to_audio_queued_ms"] is not None
+
+
+async def test_agent_expression_never_hits_posleft_posright(controller, mock_ojn):
+    """End-to-end through the REAL BodyController + mock OJN: autonomous agent
+    body language reaches OJN as chor only — zero posleft/posright ear calls."""
+    llm = FakeLLM(
+        LLMResult(tool_calls=[tool_call("gesture_ears", left=5, right=11)]),
+        LLMResult(text="Ecco le orecchie!"),
+    )
+    agent = AgentLoop(
+        provider=llm,
+        tools=BodyTools(controller),
+        system_prompt=SYSTEM,
+        speaker=FakeSpeaker(),
+    )
+    await agent.handle("muovi le orecchie")
+    await asyncio.wait_for(controller.wait_idle(), 2)
+    assert len(mock_ojn.calls_of("chor")) == 1
+    assert mock_ojn.calls_of("ears") == []

@@ -54,11 +54,21 @@ brain/scripts/config-doctor.py config.yaml --fix   # rewrite present-but-stale k
 
 (The script exists because openWakeWord's Linux dependency on tflite-runtime has no Python 3.12 wheel; we only use its ONNX backend, so it is installed `--no-deps` on top of the `brain[audio]` extra. CI runs the same script on Ubuntu 24.04/3.12.)
 
+### Full voice runtime
+
+One persistent process owns the whole conversation loop (one BodyController, one Mp3Server on :8090, one EventListener on :8091):
+
+```bash
+python -m rabbit_brain.runtime --config config.yaml
+```
+
+Pipeline: reSpeaker → openWakeWord → silero VAD → Deepgram nova-3 (multi it/en) → **OpenAI Responses** → ElevenLabs → local MP3 → OpenJabNab → Nabaztag speaker. Needs `OPENAI_API_KEY`, `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY` and the OJN vars in `.env` (values never logged). **Do not run the runtime and the MCP server at the same time** — both bind :8090/:8091 and each would create its own BodyController. Pick one per session.
+
 ## Architecture
 
 ```
 Nabaztag:tag ◄─Violet proto─► OpenJabNab (self-hosted) ◄─REST─► rabbit-brain
-   stock, WPA-TKIP segment         on the Bolt                wake→VAD→STT→Claude(tools)→TTS
+   stock, WPA-TKIP segment         on the Bolt            wake→VAD→STT→LLM(tools)→TTS
                                                                     │
 reSpeaker XVF3800 ──USB audio + DoA──────────────────────► BodyController (arbiter)
                                                                     ▲

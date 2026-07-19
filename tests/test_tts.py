@@ -228,3 +228,24 @@ def test_mp3_server_keeps_protected_static_assets(tmp_path):
 def test_recording_controller_matches_bodycontroller_surface():
     # Speaker only calls submit(cmd, priority); ensure the real controller has it
     assert callable(BodyController.submit)
+
+
+def test_make_tts_provider_profiles(monkeypatch, tmp_path):
+    from rabbit_brain.tts import make_tts_provider
+
+    # no TTS_PROFILE → None (no local speech; keys never touched)
+    assert make_tts_provider(tmp_path, env={}) is None
+    # elevenlabs profile builds a provider from env only
+    prov = make_tts_provider(
+        tmp_path,
+        env={"TTS_PROFILE": "elevenlabs", "ELEVENLABS_VOICE_ID": "v", "ELEVENLABS_API_KEY": "k"},
+    )
+    assert prov is not None
+
+
+async def test_build_speech_stack_without_profile(tmp_path):
+    from rabbit_brain.tts import build_speech_stack
+
+    stack = await build_speech_stack(RecordingController(), env={})
+    assert stack.speaker is None and stack.mp3_server is None
+    await stack.aclose()  # no-op, must not raise

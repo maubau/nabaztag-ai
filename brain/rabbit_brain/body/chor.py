@@ -150,6 +150,22 @@ def build_leds_off_chor(tempo_ms: int = 10, ears_pose: tuple[int, int] | None = 
     return ",".join(parts)
 
 
+def build_gesture_ears_chor(left: int, right: int, tempo_ms: int = 100) -> str:
+    """Move both ears to positions 0..16 as a MOTOR CHOREOGRAPHY (never
+    posleft/posright — that path triggers the firmware jingle, probe #7).
+
+    This is the agent's only ear-movement primitive. Positions are validated
+    by the caller; here they are compiled into a single-frame chor.
+    """
+    for v in (left, right):
+        if not 0 <= v <= 16:
+            raise ValueError(f"ear position {v} outside 0..16")
+    parts = [str(tempo_ms)]
+    parts += ["0", "motor", "0", str(left * _EAR_STEP_DEG), "0", "0"]
+    parts += ["0", "motor", "1", str(right * _EAR_STEP_DEG), "0", "0"]
+    return ",".join(parts)
+
+
 def build_dance_chor(duration_s: float, tempo_ms: int = 100) -> str:
     """A LED/ear dance sized to span ~duration_s (e.g. a spoken sentence).
 

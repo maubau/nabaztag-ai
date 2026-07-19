@@ -1,0 +1,129 @@
+"""Agent loop (§6.2.5): transcript → LLM (+ tools) → reply → TTS on the rabbit.
+
+One turn: append the user transcript, call the LLM, run any function calls
+through the BodyController, feed results back, get the final text, and speak it
+via the Speaker. Multiple tool calls per response are supported, bounded by
+max_tool_rounds. Every failure path stops cleanly and leaves the runtime ready
+for the next wake word; API keys and request content are never logged.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+
+from ..body.types import Priority
+from ..tts.speaker import Speaker
+from .base import AssistantTurn, LLMProvider, LLMResult, Message, ToolTurn, UserTurn
+from .tools import BodyTools
+
+log = logging.getLogger(__name__)
+
+DEFAULT_MAX_HISTORY_TURNS = 20
+DEFAULT_MAX_TOOL_ROUNDS = 4
+
+
+@dataclass
+class AgentConfig:
+    max_history_turns: int = DEFAULT_MAX_HISTORY_TURNS
+    max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS
+
+
+@dataclass
+class TurnTimings:
+    """Monotonic diagnostics for one conversational turn, measured from the
+    moment the transcript is ready (≈ STT final; the pipeline's WakeTimings
+    covers wake→STT). No request/response content is recorded."""
+
+    start: float
+    request_sent: float | None = None
+    first_token: float | None = None
+    final_text: float | None = None
+    audio_queued: float | None = None
+    tool_rounds: int = 0
+
+    def as_dict(self) -> dict[str, int | None]:
+        def ms(t: float | None) -> int | None:
+            return None if t is None else round((t - self.start) * 1000)
+
+        return {
+            "to_request_ms": ms(self.request_sent),
+            "to_first_token_ms": ms(self.first_token),
+            "to_final_text_ms": ms(self.final_text),
+            "to_audio_queued_ms": ms(self.audio_queued),
+            "tool_rounds": self.tool_rounds,
+        }
+
+
+@dataclass
+class AgentLoop:
+    provider: LLMProvider
+    tools: BodyTools
+    system_prompt: str
+    speaker: Speaker | None = None
+    config: AgentConfig = field(default_factory=AgentConfig)
+    _history: list[Message] = field(default_factory=list, init=False)
+    last_timings: TurnTimings | None = None
+
+    async def handle(self, transcript: str) -> str:
+        """Run one turn. Returns the spoken text ("" on empty/failed turns).
+        Never raises: every error recovers and returns for the next wake word."""
+        timings = TurnTimings(start=time.monotonic())
+        self._history.append(UserTurn(transcript))
+        try:
+            result = await self._run_rounds(timings)
+        except Exception:
+            log.exception("LLM turn failed; recovering")
+            self._trim()
+            return ""
+
+        text = result.text.strip()
+        if text and self.speaker is not None:
+            try:
+                await self.speaker.speak(text, Priority.USER_SPEECH_SYNC)
+                timings.audio_queued = time.monotonic()
+            except Exception:
+                log.exception("TTS/playback failed; recovering")
+        self._trim()
+        self.last_timings = timings
+        log.info("agent turn timings: %s", timings.as_dict())
+        return text
+
+    async def _run_rounds(self, timings: TurnTimings) -> LLMResult:
+        specs = self.tools.specs()
+
+        def on_delta(_delta: str) -> None:
+            if timings.first_token is None:
+                timings.first_token = time.monotonic()
+
+        result = LLMResult()
+        for round_i in range(self.config.max_tool_rounds + 1):
+            if timings.request_sent is None:
+                timings.request_sent = time.monotonic()
+            result = await self.provider.respond(self.system_prompt, self._history, specs, on_delta)
+            self._history.append(AssistantTurn(result.text, tuple(result.tool_calls)))
+            if not result.tool_calls:
+                break
+            timings.tool_rounds = round_i + 1
+            if round_i == self.config.max_tool_rounds:
+                # out of rounds: don't call tools again, take whatever text we have
+                log.warning("max_tool_rounds reached, stopping tool execution")
+                break
+            results = tuple([await self.tools.execute(c) for c in result.tool_calls])
+            self._history.append(ToolTurn(results))
+        timings.final_text = time.monotonic()
+        return result
+
+    def _trim(self) -> None:
+        """Keep the last max_history_turns user turns (with their assistant/tool
+        follow-ups). Counting user turns keeps whole exchanges intact."""
+        limit = self.config.max_history_turns
+        user_idx = [i for i, m in enumerate(self._history) if isinstance(m, UserTurn)]
+        if len(user_idx) > limit:
+            cut = user_idx[-limit]
+            self._history = self._history[cut:]
+
+    @property
+    def history(self) -> list[Message]:
+        return self._history

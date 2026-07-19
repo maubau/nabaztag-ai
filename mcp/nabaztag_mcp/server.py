@@ -45,7 +45,7 @@ from rabbit_brain.body.chor import build_dance_chor
 from rabbit_brain.body.events_server import EventListener
 from rabbit_brain.body.mock_ojn import MOCK_SERIAL, MOCK_VAPI_TOKEN, MockOjnServer
 from rabbit_brain.body.ojn_adapter import OjnAdapter
-from rabbit_brain.tts import Mp3Server, Speaker
+from rabbit_brain.tts import Speaker, build_speech_stack
 
 # Named choreographies for play_choreography(); VAPI chor strings
 # (format: docs/OJN_API_NOTES.md §2). Tune on camera, like moods.yaml.
@@ -61,29 +61,6 @@ class RabbitContext:
     controller: BodyController
     speaker: Speaker | None = None
     last_rfid: str | None = None
-
-
-def _make_tts_provider(audio_dir):
-    """TTS_PROFILE=elevenlabs|piper selects the backend; unset → no local TTS
-    (speak falls back to OJN's built-in tts/say, whose 2010 backends are dead)."""
-    profile = os.environ.get("TTS_PROFILE", "").lower()
-    if profile == "elevenlabs":
-        from rabbit_brain.tts.elevenlabs_tts import ElevenLabsTTS
-
-        return ElevenLabsTTS(
-            audio_dir,
-            voice_id=os.environ["ELEVENLABS_VOICE_ID"],
-            model=os.environ.get("ELEVENLABS_MODEL", "eleven_multilingual_v2"),
-        )
-    if profile == "piper":
-        from rabbit_brain.tts.piper_tts import PiperTTS
-
-        return PiperTTS(
-            audio_dir,
-            model_path=os.environ["PIPER_MODEL"],
-            piper_bin=os.environ.get("PIPER_BIN", "piper"),
-        )
-    return None
 
 
 @asynccontextmanager
@@ -109,20 +86,11 @@ async def rabbit_lifespan(_server: FastMCP) -> AsyncIterator[RabbitContext]:
 
         controller = BodyController(adapter)
 
-        # Local TTS (Phase 2 audio-out): synth → Mp3Server → urlList playback
-        mp3_server = None
-        speaker = None
-        provider = _make_tts_provider(os.environ.get("NABAZTAG_AUDIO_DIR", "www/audio"))
-        if provider is not None:
-            mp3_server = Mp3Server(
-                os.environ.get("NABAZTAG_AUDIO_DIR", "www/audio"),
-                port=int(os.environ.get("NABAZTAG_MP3_PORT", "8090")),
-                base_url=os.environ.get("NABAZTAG_MP3_BASE_URL"),
-            )
-            await mp3_server.start()
-            speaker = Speaker(controller, provider, mp3_server)
+        # Local TTS (Phase 2 audio-out): synth → Mp3Server → urlList playback.
+        # Same shared factory the voice runtime uses (no divergence).
+        speech = await build_speech_stack(controller)
 
-        ctx = RabbitContext(controller=controller, speaker=speaker)
+        ctx = RabbitContext(controller=controller, speaker=speech.speaker)
         run_task = asyncio.create_task(ctx.controller.run())
 
         async def watch_events() -> None:
@@ -139,10 +107,7 @@ async def rabbit_lifespan(_server: FastMCP) -> AsyncIterator[RabbitContext]:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
             await listener.stop()
-            if mp3_server is not None:
-                await mp3_server.stop()
-            if provider is not None and hasattr(provider, "close"):
-                await provider.close()
+            await speech.aclose()
             if mock is not None:
                 await mock.stop()
 

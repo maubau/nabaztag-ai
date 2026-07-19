@@ -1,0 +1,28 @@
+# Proposed systemd unit for the Nabaztag voice runtime on the Bolt.
+# Install (adjust User/paths to your setup):
+#   sudo cp deploy/nabaztag-runtime.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nabaztag-runtime
+#   journalctl -u nabaztag-runtime -f
+#
+# Do NOT enable this together with the MCP server — both bind :8090/:8091 and
+# each creates its own BodyController (single-ownership rule, §8).
+[Unit]
+Description=Nabaztag voice runtime (wake -> STT -> OpenAI -> ElevenLabs -> rabbit)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=maurizio
+WorkingDirectory=/home/maurizio/nabaztag-ai
+# Keys and config live in .env (gitignored); never put them in this unit.
+EnvironmentFile=/home/maurizio/nabaztag-ai/.env
+ExecStart=/home/maurizio/nabaztag-ai/.venv/bin/python -m rabbit_brain.runtime --config config.yaml
+Restart=on-failure
+RestartSec=3
+# The service needs USB (reSpeaker) and audio; run as a normal user in plugdev/audio.
+SupplementaryGroups=plugdev audio
+
+[Install]
+WantedBy=multi-user.target

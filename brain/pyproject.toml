@@ -13,6 +13,7 @@ dependencies = [
     "aiohttp>=3.9",
     "pyyaml>=6.0",
     "mutagen>=1.47",
+    "openai>=1.40",
 ]
 
 [project.optional-dependencies]

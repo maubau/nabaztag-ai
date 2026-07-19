@@ -112,7 +112,7 @@ async def run(args: argparse.Namespace, config: dict, moods: dict) -> None:
             doa_moods=moods.get("doa", {}),
             wake_threshold=wake_cfg.get("threshold", 0.5),
             recorder_kwargs={
-                "end_of_speech_ms": audio_cfg.get("vad_end_of_speech_ms", 1200),
+                "end_of_speech_ms": audio_cfg.get("vad_end_of_speech_ms", 1600),
             },
             wake_beep=wake_beep,
             processing_indicator=config.get("leds", {}).get("processing_indicator", False),

@@ -142,6 +142,7 @@ class VoicePipeline:
         self._feedback_tasks: set[asyncio.Task] = set()
         self.doa_reads = 0  # diagnostics/tests: periodic DoA reads during LISTENING
         self.last_timings: WakeTimings | None = None  # last wake cycle, for diagnostics
+        self.last_doa_deg: int | None = None  # last DoA angle, for get_direction() (§6.3)
 
     # --- half-duplex gate (§6.2.7) --------------------------------------
 
@@ -215,7 +216,10 @@ class VoicePipeline:
                 reading = await self._doa.read()
         except Exception:
             return None
-        return None if reading is None else self._side_of(reading.angle_deg)
+        if reading is None:
+            return None
+        self.last_doa_deg = reading.angle_deg % 360  # for get_direction() (§6.3)
+        return self._side_of(reading.angle_deg)
 
     async def _read_side(self, end_of_speech: asyncio.Event) -> str | None:
         """DoA read that returns early (None) the moment end-of-speech fires,
