@@ -6,7 +6,10 @@ stt_profile: cloud
 deepgram:
   # Pinned but swappable without code changes (docs/ARCHITECTURE.md §6.2.4)
   model: nova-3
-  language: multi   # auto it/en
+  # language "multi" mis-detected short Italian phrases as pt/en on hardware
+  # (July 2026) — pin the expected language. For a bilingual demo, swap this
+  # per session (planned fast it/en profiles) rather than relying on "multi".
+  language: it
 
 openai_whisper:
   model: whisper-1
@@ -51,6 +54,24 @@ audio:
   selected_channel: 0
   vad_end_of_speech_ms: 700
   half_duplex_guard_ms: 300
+
+leds:
+  # The user wants the LEDs lit only while speaking: the LISTENING scanner
+  # stops at VAD end-of-speech. PROCESSING (pulsing orange while the agent
+  # thinks) is therefore opt-in.
+  processing_indicator: false
+
+wake_beep:
+  # Short local confirmation tone on the Bolt's own output (NOT the rabbit).
+  # Off by default: with no AEC the mic can hear it, so the pipeline drops the
+  # first guard_ms of capture after wake (keep duration_ms < guard_ms). Verify
+  # with Silero before enabling — if the tone reads as speech or leaks into a
+  # transcript, leave it disabled.
+  enabled: false
+  duration_ms: 120
+  guard_ms: 150
+  freq_hz: 880
+  volume: 0.2
 
 wake:
   # openWakeWord model names or paths. The stock hey_jarvis model is for the

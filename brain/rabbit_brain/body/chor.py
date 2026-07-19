@@ -29,12 +29,16 @@ WAKE_TWITCH_DEG = 72
 _EAR_STEP_DEG = 18
 _EAR_MAX_DEG = 16 * _EAR_STEP_DEG  # 288°
 
-# LISTENING indicator: a lit dot sweeping the 5 LEDs front↔back, meant to loop
-# for the whole VAD recording. Cyan reads clearly and is distinct from the
-# wake flash (white) and PROCESSING (orange).
-LISTENING_SCANNER_TEMPO_MS = 120
+# LISTENING indicator: a lit dot sweeping the 5 LEDs front↔back plus a gentle
+# periodic ear nod toward the voice, meant to loop for the whole VAD recording.
+# Cyan reads clearly and is distinct from the wake flash (white) and PROCESSING
+# (orange). One sweep spans ~1 s, which is also the DoA re-read cadence.
+LISTENING_TEMPO_MS = 125
 _SCANNER_POSITIONS = (0, 1, 2, 3, 4, 3, 2, 1)  # bottom→top→bottom (period 8)
-LISTENING_SCANNER_CYCLE_S = len(_SCANNER_POSITIONS) * LISTENING_SCANNER_TEMPO_MS / 1000
+LISTENING_CYCLE_S = len(_SCANNER_POSITIONS) * LISTENING_TEMPO_MS / 1000  # ~1.0 s
+# A 2-step (36°) nod is gentle enough to repeat every second without looking
+# frantic; still choreography-only (never posleft/posright — probe #7).
+LISTENING_EAR_NOD_DEG = 36
 
 # PROCESSING indicator: all LEDs pulsing orange (on 500 ms / off 500 ms),
 # meant to loop while the transcript is handled (agent loop, §6.2.5).
@@ -79,14 +83,19 @@ def build_wake_ack_chor(
     return ",".join(parts)
 
 
-def build_listening_scanner_chor(
+def build_listening_chor(
+    side: str | None = None,
+    listen_pose: tuple[int, int] = (0, 0),
     color: tuple[int, int, int] = (0, 150, 255),
-    tempo_ms: int = LISTENING_SCANNER_TEMPO_MS,
+    tempo_ms: int = LISTENING_TEMPO_MS,
 ) -> str:
-    """One sweep of a lit dot across the 5 LEDs (front↔back). Loops by
-    resubmission for the whole listening window; LISTENING_SCANNER_CYCLE_S is
-    its wall duration."""
+    """One LISTENING cycle: a lit dot sweeping the 5 LEDs (front↔back) plus,
+    if `side` is given, a gentle nod of that ear toward the voice. Loops by
+    resubmission for the whole listening window; LISTENING_CYCLE_S is its wall
+    duration and also the DoA re-read cadence. Choreography-only (no
+    posleft/posright — probe #7)."""
     r, g, b = color
+    n = len(_SCANNER_POSITIONS)
     parts = [str(tempo_ms)]
     prev: int | None = None
     for t, pos in enumerate(_SCANNER_POSITIONS):
@@ -94,7 +103,14 @@ def build_listening_scanner_chor(
             parts += [str(t), "led", str(prev), "0", "0", "0"]
         parts += [str(t), "led", str(pos), str(r), str(g), str(b)]
         prev = pos
-    parts += [str(len(_SCANNER_POSITIONS)), "led", str(prev), "0", "0", "0"]
+    parts += [str(n), "led", str(prev), "0", "0", "0"]
+    if side is not None:
+        # motor ear index: 0=left, 1=right (docs/OJN_API_NOTES.md §2)
+        ear = "0" if side == "left" else "1"
+        pose_deg = listen_pose[int(ear)] * _EAR_STEP_DEG
+        nod_deg = min(_EAR_MAX_DEG, pose_deg + LISTENING_EAR_NOD_DEG)
+        parts += ["0", "motor", ear, str(nod_deg), "0", "0"]
+        parts += [str(n // 2), "motor", ear, str(pose_deg), "0", "1"]
     return ",".join(parts)
 
 

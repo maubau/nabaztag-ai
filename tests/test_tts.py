@@ -157,15 +157,20 @@ def test_build_wake_ack_chor_short_and_valid():
 def test_listening_scanner_and_indicators_valid():
     from rabbit_brain.body.chor import (
         build_leds_off_chor,
-        build_listening_scanner_chor,
+        build_listening_chor,
         build_processing_chor,
     )
 
-    scanner = build_listening_scanner_chor()
+    scanner = build_listening_chor()
     _chor_is_valid(scanner)
     # the lit dot visits every one of the 5 LEDs
     for led in range(5):
         assert f"led,{led},0,150,255" in scanner
+    # a sided cycle adds a gentle 36° (2-step) ear nod toward the voice, chor-only
+    right = build_listening_chor("right", listen_pose=(0, 0))
+    _chor_is_valid(right)
+    assert "0,motor,1,36,0,0" in right
+    assert build_listening_chor("left", listen_pose=(0, 0)).count("motor,0,36,0,0") == 1
 
     processing = build_processing_chor()
     _chor_is_valid(processing)

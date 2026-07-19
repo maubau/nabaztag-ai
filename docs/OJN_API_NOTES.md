@@ -88,9 +88,17 @@ Hardware half — status on the real rabbit:
 8. **OPEN — chor-interrupts-chor semantics.** Does submitting a new choreography while one
    is playing REPLACE it immediately, or queue behind it? The looping LISTENING/PROCESSING
    indicators and their all-off terminator assume prompt replacement so the stop is
-   instant; if OJN queues instead, the stop lands one cycle late (cosmetic). Measure on
-   hardware. A short (100–200 ms) LOCAL confirmation beep on the Bolt is possible future
-   work, only after verifying it cannot leak into VAD/STT (no AEC).
+   instant; if OJN queues instead, the stop lands one cycle late (cosmetic). The
+   `wake_to_scanner_stop_ms` vs `wake_to_eos_ms` deltas in the pipeline's WakeTimings log
+   measure this directly on hardware.
+9. **Deepgram `language: multi` unreliable on short IT phrases (July 2026).** Short Italian
+   utterances were mis-detected as pt/en; `deepgram.language: it` fixes it. Planned: fast
+   per-session it/en profiles rather than `multi`. `deepgram.model`/`language` stay config,
+   never hardcoded.
+10. **Optional local wake beep (100–150 ms) on the Bolt.** Implemented (`audio/beep.py`,
+    off by default): plays on the Bolt output, and the pipeline drops the first `guard_ms`
+    of capture so the tone cannot enter VAD/STT (no AEC). Before enabling on hardware,
+    confirm Silero does not classify the tone as speech and it never leaks into a transcript.
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 

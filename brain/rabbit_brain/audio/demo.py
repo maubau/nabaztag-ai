@@ -24,6 +24,7 @@ from ..body.controller import BodyController
 from ..body.mock_ojn import MOCK_SERIAL, MOCK_VAPI_TOKEN, MockOjnServer
 from ..body.ojn_adapter import OjnAdapter
 from ..stt import make_stt
+from .beep import SineBeep
 from .capture import AlsaCapture, MicCapture, WavCapture
 from .doa import make_doa
 from .pipeline import VoicePipeline
@@ -75,6 +76,15 @@ async def run(args: argparse.Namespace, config: dict, moods: dict) -> None:
     async def on_transcript(text: str) -> None:
         print(f"\n>>> {text}\n")
 
+    beep_cfg = config.get("wake_beep", {})
+    wake_sound = None
+    if beep_cfg.get("enabled", False):
+        wake_sound = SineBeep(
+            freq_hz=beep_cfg.get("freq_hz", 880),
+            duration_ms=beep_cfg.get("duration_ms", 120),
+            volume=beep_cfg.get("volume", 0.2),
+        )
+
     async with OjnAdapter(base_url, serial, token) as adapter:
         controller = BodyController(adapter)
         runner = asyncio.create_task(controller.run())
@@ -91,6 +101,9 @@ async def run(args: argparse.Namespace, config: dict, moods: dict) -> None:
             recorder_kwargs={
                 "end_of_speech_ms": audio_cfg.get("vad_end_of_speech_ms", 700),
             },
+            wake_sound=wake_sound,
+            beep_guard_ms=beep_cfg.get("guard_ms", 150),
+            processing_indicator=config.get("leds", {}).get("processing_indicator", False),
         )
         print("listening… say the wake word (Ctrl-C to quit)")
         try:

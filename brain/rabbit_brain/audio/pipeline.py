@@ -5,23 +5,22 @@ Wiring (docs/ARCHITECTURE.md §6.2):
     frames are discarded and the wake detector held in reset — there is no AEC
     reference for the rabbit speaker, so we must not hear ourselves;
   - on wake (§6.2.8): interrupt() so the rabbit snaps to attention, then a
-    small LED/ear state machine, ALL choreography-only (the posleft/posright
-    path triggers a firmware jingle — probe #7, hardware-confirmed):
-      * a SINGLE non-blocking wake-ack chor (white flash + 72° twitch on the
-        DoA side → listening pose), fired as a background task so VAD/STT
-        never wait for the DoA read or the OJN round-trip. One ChorCommand,
-        never two same-priority EarsCommand (the BodyController coalesces
-        those and silently drops the DoA bias — UX finding). DoA is
-        fail-open: None just means an un-sided ack;
-      * a persistent LISTENING indicator (cyan LED scanner) that loops for
-        the whole VAD recording and is turned off in finally;
-      * a PROCESSING indicator (pulsing orange) while the transcript is
-        handled by on_transcript (the agent loop, §6.2.5).
-    All body output goes through BodyController.submit at DOA_REFLEX priority,
-    never the adapter;
-  - the utterance streams into the STT provider while still being spoken
-    (VAD chunks go out as they pass the recorder), so cloud endpointing
-    overlaps with capture.
+    SINGLE sequential feedback task runs the body, ALL choreography-only (the
+    posleft/posright path triggers a firmware jingle — probe #7, confirmed):
+        DoA read → wake ack (white flash + 72° twitch on the DoA side) → a
+        LISTENING loop (cyan LED scanner + a gentle ear nod toward the voice,
+        re-reading DoA ~once/second). Sequential so the ack always renders
+        before the scanner can replace it. VAD/STT run in a SEPARATE task and
+        start immediately — they never wait for the DoA read or OJN;
+  - the LISTENING feedback stops at the VAD end-of-speech event, BEFORE the
+    STT result is awaited (so the LEDs are lit only while the user speaks, not
+    through Deepgram endpointing/network). PROCESSING (pulsing orange) is
+    opt-in for the same reason;
+  - an optional short local wake beep (§6.2, off by default): its frames are
+    dropped from the VAD/STT stream (no AEC) so it cannot be transcribed;
+  - the utterance streams into the STT provider while still being spoken, so
+    cloud endpointing overlaps with capture. WakeTimings records wake,
+    speech-start, end-of-speech, STT-final and scanner-stop for diagnostics.
 """
 
 from __future__ import annotations
@@ -29,14 +28,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from ..body.chor import (
-    LISTENING_SCANNER_CYCLE_S,
+    LISTENING_CYCLE_S,
     PROCESSING_PULSE_CYCLE_S,
     build_leds_off_chor,
-    build_listening_scanner_chor,
+    build_listening_chor,
     build_processing_chor,
     build_wake_ack_chor,
 )
@@ -51,8 +52,41 @@ from .wake import WakeDetector
 log = logging.getLogger(__name__)
 
 DEFAULT_WAKE_THRESHOLD = 0.5
+# Let the wake ack render before the LISTENING scanner can replace it on the
+# wire (chor-interrupts-chor, probe #8). Roughly the ack's own duration.
+WAKE_ACK_RENDER_S = 0.5
+DEFAULT_DOA_TIMEOUT_S = 0.5  # a stalled DoA read must not freeze the feedback
 
 _CLOSE = object()  # sentinel ending the STT chunk stream
+
+
+@dataclass
+class WakeTimings:
+    """Monotonic diagnostics for one wake→listen→transcribe cycle. Separates
+    VAD delay, Deepgram endpointing, and choreography-stop latency."""
+
+    wake: float
+    speech_start: float | None = None
+    end_of_speech: float | None = None
+    stt_final: float | None = None
+    scanner_stop: float | None = None
+
+    def as_dict(self) -> dict[str, int | None]:
+        def ms(t: float | None) -> int | None:
+            return None if t is None else round((t - self.wake) * 1000)
+
+        endpointing = (
+            None
+            if self.stt_final is None or self.end_of_speech is None
+            else round((self.stt_final - self.end_of_speech) * 1000)
+        )
+        return {
+            "wake_to_speech_ms": ms(self.speech_start),
+            "wake_to_eos_ms": ms(self.end_of_speech),
+            "wake_to_stt_final_ms": ms(self.stt_final),
+            "wake_to_scanner_stop_ms": ms(self.scanner_stop),
+            "stt_endpointing_ms": endpointing,
+        }
 
 
 class VoicePipeline:
@@ -68,6 +102,12 @@ class VoicePipeline:
         doa_moods: dict[str, Any] | None = None,
         wake_threshold: float = DEFAULT_WAKE_THRESHOLD,
         recorder_kwargs: dict[str, Any] | None = None,
+        wake_sound: Callable[[], Awaitable[None]] | None = None,
+        beep_guard_ms: int = 0,
+        processing_indicator: bool = False,
+        ack_render_s: float = WAKE_ACK_RENDER_S,
+        listening_cycle_s: float = LISTENING_CYCLE_S,
+        doa_timeout_s: float = DEFAULT_DOA_TIMEOUT_S,
     ):
         self._capture = capture
         self._wake = wake
@@ -77,10 +117,20 @@ class VoicePipeline:
         self._on_transcript = on_transcript
         self._doa = doa
         self._doa_moods = doa_moods or {}
+        listen = self._doa_moods.get("listen_pose", {})
+        self._listen_pose = (listen.get("left", 0), listen.get("right", 0))
         self._wake_threshold = wake_threshold
         self._recorder_kwargs = recorder_kwargs or {}
-        self._ack_tasks: set[asyncio.Task] = set()
-        self._indicator_tasks: set[asyncio.Task] = set()
+        self._wake_sound = wake_sound
+        self._beep_guard_ms = beep_guard_ms
+        self._processing_indicator = processing_indicator
+        self._ack_render_s = ack_render_s
+        self._listening_cycle_s = listening_cycle_s
+        self._doa_timeout_s = doa_timeout_s
+
+        self._feedback_tasks: set[asyncio.Task] = set()
+        self._beep_tasks: set[asyncio.Task] = set()
+        self.doa_reads = 0  # diagnostics/tests: periodic DoA reads during LISTENING
 
     # --- half-duplex gate (§6.2.7) --------------------------------------
 
@@ -110,87 +160,105 @@ class VoicePipeline:
             await self.aclose()
 
     async def aclose(self) -> None:
-        """Cancel and collect every background task (wake acks + indicators)."""
-        tasks = list(self._ack_tasks | self._indicator_tasks)
+        """Cancel and collect every background task (feedback + beep)."""
+        tasks = list(self._feedback_tasks | self._beep_tasks)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _handle_wake(self, frames: AsyncIterator[bytes]) -> None:
+        timings = WakeTimings(wake=time.monotonic())
         self._controller.interrupt()
-        # fire-and-forget: listening must start NOW, not after the DoA USB
-        # read and the OJN round-trip
-        ack = asyncio.create_task(self._wake_ack())
-        self._ack_tasks.add(ack)
-        ack.add_done_callback(self._ack_tasks.discard)
-        # persistent LISTENING indicator for the whole recording window
-        listening = self._spawn_indicator(build_listening_scanner_chor(), LISTENING_SCANNER_CYCLE_S)
+        if self._wake_sound is not None:
+            self._spawn(self._safe_beep(), self._beep_tasks)
+        # one sequential feedback task (DoA → ack → scanner); VAD/STT below run
+        # concurrently and start immediately
+        end_of_speech = asyncio.Event()
+        feedback = self._spawn(self._listening_feedback(end_of_speech), self._feedback_tasks)
         try:
-            result = await self._record_and_transcribe(frames)
+            result = await self._record_and_transcribe(frames, end_of_speech, timings)
         finally:
-            await self._stop_indicator(listening)
-            await self._submit_chor(build_leds_off_chor())
+            end_of_speech.set()  # ensure the feedback stops on any exit path
+            with contextlib.suppress(asyncio.CancelledError):
+                await feedback  # feedback turns the LEDs off in its own finally
+            timings.scanner_stop = time.monotonic()
         if result is not None and result.text:
-            log.info("transcript (%s): %s", result.provider, result.text)
             await self._process_transcript(result.text)
+        log.info("wake cycle timings: %s", timings.as_dict())
 
-    async def _process_transcript(self, text: str) -> None:
-        # PROCESSING indicator while the agent loop handles the utterance
-        processing = self._spawn_indicator(build_processing_chor(), PROCESSING_PULSE_CYCLE_S)
+    # --- body feedback (single sequential task, choreography-only) ------
+
+    async def _read_side(self) -> str | None:
+        """DoA side toward the voice, fail-open and time-bounded (a USB stall
+        must not freeze the feedback)."""
+        if self._doa is None:
+            return None
+        self.doa_reads += 1
         try:
-            await self._on_transcript(text)
-        finally:
-            await self._stop_indicator(processing)
-            await self._submit_chor(build_leds_off_chor())
-
-    # --- body indicators (all via BodyController, choreography-only) ------
-
-    async def _submit_chor(self, chor: str) -> None:
-        await self._controller.submit(ChorCommand(chor), Priority.DOA_REFLEX)
-
-    def _spawn_indicator(self, chor: str, cycle_s: float) -> asyncio.Task:
-        """A looping indicator that resubmits `chor` every cycle_s until stopped."""
-
-        async def loop() -> None:
-            while True:
-                await self._submit_chor(chor)
-                await asyncio.sleep(cycle_s)
-
-        task = asyncio.create_task(loop())
-        self._indicator_tasks.add(task)
-        task.add_done_callback(self._indicator_tasks.discard)
-        return task
-
-    async def _stop_indicator(self, task: asyncio.Task) -> None:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+            async with asyncio.timeout(self._doa_timeout_s):
+                reading = await self._doa.read()
+        except Exception:
+            return None
+        return None if reading is None else self._side_of(reading.angle_deg)
 
     @staticmethod
     def _side_of(angle_deg: int) -> str | None:
-        """Which ear to twitch for a DoA angle (0° = front, clockwise)."""
+        """Which ear to move for a DoA angle (0° = front, clockwise)."""
         angle = angle_deg % 360
         if 45 <= angle < 135:
             return "right"
         if 225 <= angle < 315:
             return "left"
-        return None  # front or behind: twitch both
+        return None  # front or behind: both
 
-    async def _wake_ack(self) -> None:
-        side = None
-        if self._doa is not None:
-            reading = await self._doa.read()  # fail-open: None on any error
-            if reading is not None:
-                side = self._side_of(reading.angle_deg)
-        listen = self._doa_moods.get("listen_pose", {})
-        pose = (listen.get("left", 0), listen.get("right", 0))
-        chor = build_wake_ack_chor(side, listen_pose=pose)
-        await self._controller.submit(ChorCommand(chor), Priority.DOA_REFLEX)
+    async def _listening_feedback(self, end_of_speech: asyncio.Event) -> None:
+        try:
+            side = await self._read_side()
+            await self._submit_chor(build_wake_ack_chor(side, listen_pose=self._listen_pose))
+            # let the ack render before the scanner can replace it (probe #8)
+            await self._wait_or_end(end_of_speech, self._ack_render_s)
+            while True:  # at least one scanner cycle, then loop until end-of-speech
+                side = await self._read_side()  # periodic ear-toward-voice, ~1/s
+                await self._submit_chor(build_listening_chor(side, listen_pose=self._listen_pose))
+                if end_of_speech.is_set():
+                    break
+                await self._wait_or_end(end_of_speech, self._listening_cycle_s)
+        finally:
+            # stop the LISTENING scanner: LEDs lit only while the user speaks
+            await self._submit_chor(build_leds_off_chor())
 
-    async def _record_and_transcribe(self, frames: AsyncIterator[bytes]) -> STTResult | None:
-        recorder = UtteranceRecorder(
-            self._probe_factory(), sample_rate=self._capture.sample_rate, **self._recorder_kwargs
-        )
+    async def _process_transcript(self, text: str) -> None:
+        if not self._processing_indicator:
+            await self._on_transcript(text)
+            return
+        stop = asyncio.Event()
+
+        async def pulse() -> None:
+            try:
+                while True:
+                    await self._submit_chor(build_processing_chor())
+                    if stop.is_set():
+                        break
+                    await self._wait_or_end(stop, PROCESSING_PULSE_CYCLE_S)
+            finally:
+                await self._submit_chor(build_leds_off_chor())
+
+        task = self._spawn(pulse(), self._feedback_tasks)
+        try:
+            await self._on_transcript(text)
+        finally:
+            stop.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    # --- capture → VAD → STT (independent of the feedback task) ----------
+
+    async def _record_and_transcribe(
+        self, frames: AsyncIterator[bytes], end_of_speech: asyncio.Event, timings: WakeTimings
+    ) -> STTResult | None:
+        sr = self._capture.sample_rate
+        recorder = UtteranceRecorder(self._probe_factory(), sample_rate=sr, **self._recorder_kwargs)
         queue: asyncio.Queue[bytes | object] = asyncio.Queue()
 
         async def chunk_stream() -> AsyncIterator[bytes]:
@@ -201,28 +269,62 @@ class VoicePipeline:
                 assert isinstance(item, bytes)
                 yield item
 
-        stt_task = asyncio.create_task(
-            self._stt.transcribe(chunk_stream(), self._capture.sample_rate)
-        )
+        stt_task = asyncio.create_task(self._stt.transcribe(chunk_stream(), sr))
+        # drop the local wake beep so it cannot enter VAD/STT (no AEC)
+        guard_bytes = int(self._beep_guard_ms / 1000 * sr) * 2 if self._wake_sound else 0
+        dropped = 0
         try:
             while True:
                 try:
                     frame = await anext(frames)
                 except StopAsyncIteration:
                     break
+                if dropped < guard_bytes:
+                    dropped += len(frame)
+                    continue
                 emit, done = recorder.push(frame)
+                if emit and timings.speech_start is None:
+                    timings.speech_start = time.monotonic()
                 for chunk in emit:
                     queue.put_nowait(chunk)
                 if done:
                     break
+            timings.end_of_speech = time.monotonic()
+            end_of_speech.set()  # stop LISTENING now, before STT endpointing/network
             queue.put_nowait(_CLOSE)
             if not recorder.got_speech:
                 stt_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await stt_task
                 return None
-            return await stt_task
+            result = await stt_task
+            timings.stt_final = time.monotonic()
+            return result
         except Exception:
             stt_task.cancel()
             log.exception("utterance transcription failed")
             return None
+        finally:
+            end_of_speech.set()
+
+    # --- helpers ---------------------------------------------------------
+
+    async def _submit_chor(self, chor: str) -> None:
+        await self._controller.submit(ChorCommand(chor), Priority.DOA_REFLEX)
+
+    async def _wait_or_end(self, event: asyncio.Event, seconds: float) -> None:
+        """Return after `seconds` or as soon as `event` is set, whichever first."""
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(event.wait(), seconds)
+
+    async def _safe_beep(self) -> None:
+        try:
+            await self._wake_sound()  # type: ignore[misc]
+        except Exception:
+            log.warning("wake beep failed", exc_info=True)
+
+    def _spawn(self, coro: Awaitable[None], taskset: set[asyncio.Task]) -> asyncio.Task:
+        task = asyncio.ensure_future(coro)
+        taskset.add(task)
+        task.add_done_callback(taskset.discard)
+        return task
