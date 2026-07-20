@@ -225,6 +225,29 @@ Hardware half — status on the real rabbit:
       not run from here.
     Streaming the first LLM sentence into TTS before the full response completes was
     considered again and still deferred (tool-call-vs-partial-speech risk, needs its own pass).
+17. **First real llm-bench.py run (hardware round, July 2026, runtime 60106fb) ruled out
+    gpt-5.4-nano and exposed the round-skip's real failure mode.** Results: gpt-5.4-mini/none
+    median first-token 1952ms, final 2248ms; mini/low 1904ms/3129ms; nano/none 3084ms/3483ms
+    (often 3 calls / 2 tool rounds); nano/low 4955ms/5499ms. nano is marketed as the fast model
+    for simple tasks but was slower AND less tool-efficient on this agent/tool loop — mini
+    stays the model, `reasoning_effort: none` is now the config default (still provisional,
+    needs a clean none-vs-low re-run after the fix below).
+    `single-round-with-tools=0/3` in every combo: the round-skip from #16 depended on the model
+    producing free text alongside a tool call in the SAME response, and it didn't — round 1 was
+    reliably a bare tool call with empty text, forcing round 2 every time. Fixed by NOT relying
+    on that: a new `express(spoken_text, ears?, gesture?, mood?)` tool carries the reply INSIDE
+    the tool call's own arguments. `AgentLoop._run_rounds` reads `spoken_text` back out of the
+    raw `ToolCall.arguments` (works even if the tool's own execution fails validation — a bad
+    gesture must not silence the reply) and skips the follow-up round exactly as before.
+    `get_direction`/`body_state` are unaffected (still `informational=True`, still force a
+    round). Also: `make_llm_provider`'s fallback defaults were stale (300 tokens, "low") despite
+    config.example.yaml already saying 150/none — a gitignored config.yaml missing the new keys
+    would have silently kept the old behavior; fixed, and config-doctor now migrates
+    `reasoning_effort: low`→`none` and `max_output_tokens: 300|220`→`150` (present-and-stale
+    only, same pattern as the provider/model migration). llm-bench.py now logs per-round tool
+    names + text length and flags two hard invariants (expected call count per prompt, spoken
+    text never empty) instead of just latency numbers.
+    Next: re-run the none-vs-low A/B now that `express` removes the confound, on hardware.
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 

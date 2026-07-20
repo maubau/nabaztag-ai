@@ -46,8 +46,12 @@ def make_llm_provider(config: dict[str, Any]) -> LLMProvider:
 
         return OpenAIProvider(
             model=llm.get("model", "gpt-5.4-mini"),
-            reasoning_effort=llm.get("reasoning_effort", "low"),
-            max_output_tokens=llm.get("max_output_tokens", 300),
+            # "none": OpenAI's own latency baseline, and the candidate this
+            # rabbit's turns mostly don't need more than (hardware benchmark,
+            # July 2026: gpt-5.4-nano was markedly worse on this agent/tool
+            # loop despite being marketed as the fast option — mini stays).
+            reasoning_effort=llm.get("reasoning_effort", "none"),
+            max_output_tokens=llm.get("max_output_tokens", 150),
             timeout_s=llm.get("timeout_s", 20),
         )
     raise ValueError(f"unknown llm.provider {provider!r} (only 'openai' in this phase)")

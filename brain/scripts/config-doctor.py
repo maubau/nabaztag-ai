@@ -76,6 +76,24 @@ CHECKS: list[Check] = [
         required=False,
         is_stale=_is_anthropic_model,
     ),
+    # Latency round, July 2026: real A/B benchmark (brain/scripts/llm-bench.py)
+    # picked reasoning_effort: none and max_output_tokens: 150 over the prior
+    # examples' low/300/220 — only migrate those SPECIFIC old values, never a
+    # deliberate choice (medium/high, or a manually raised token budget).
+    Check(
+        ("llm", "reasoning_effort"),
+        "none",
+        "hardware A/B: median final-text 2248ms (none) vs 3129ms (low)",
+        required=False,
+        is_stale=lambda v: v == "low",
+    ),
+    Check(
+        ("llm", "max_output_tokens"),
+        150,
+        "prior example defaults (300, then 220); the prompt now asks for ONE short sentence",
+        required=False,
+        is_stale=lambda v: v in (300, 220),
+    ),
 ]
 
 

@@ -88,3 +88,37 @@ def test_custom_openai_model_is_not_touched():
     fixed, problems = doctor.diagnose(text, fix=True)
     assert not any("llm.model" in p for p in problems)
     assert yaml.safe_load(fixed)["llm"]["model"] == "gpt-4o-mini"
+
+
+def test_stale_reasoning_effort_and_max_tokens_migrated():
+    text = (
+        "llm:\n  provider: openai\n  model: gpt-5.4-mini\n"
+        "  reasoning_effort: low\n  max_output_tokens: 220\n"
+    )
+    fixed, problems = doctor.diagnose(text, fix=True)
+    joined = " ".join(problems)
+    assert "llm.reasoning_effort" in joined and "llm.max_output_tokens" in joined
+    cfg = yaml.safe_load(fixed)["llm"]
+    assert cfg["reasoning_effort"] == "none"
+    assert cfg["max_output_tokens"] == 150
+
+
+_BASELINE = (
+    "deepgram:\n  endpointing: 100\n"
+    'audio:\n  capture_device: "hw:CARD=C16K6Ch,DEV=0"\n  vad_end_of_speech_ms: 1600\n'
+)
+
+
+def test_deliberate_reasoning_effort_and_token_budget_not_touched():
+    # medium/high and a manually raised token budget are deliberate choices,
+    # not stale defaults — must be left alone
+    text = _BASELINE + "llm:\n  reasoning_effort: medium\n  max_output_tokens: 400\n"
+    _fixed, problems = doctor.diagnose(text, fix=True)
+    assert problems == []
+
+
+def test_missing_reasoning_effort_and_max_tokens_is_fine():
+    # missing keys are fine — the code defaults already match (none, 150)
+    text = _BASELINE + "llm:\n  model: gpt-5.4-mini\n"
+    _fixed, problems = doctor.diagnose(text, fix=True)
+    assert problems == []

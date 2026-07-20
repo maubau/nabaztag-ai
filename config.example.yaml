@@ -41,15 +41,16 @@ llm:
   # swappable so other providers can be added later; none is required now.
   # The model is configuration, never hardcoded.
   provider: openai
+  # gpt-5.4-mini: real A/B (July 2026, brain/scripts/llm-bench.py) ruled out
+  # gpt-5.4-nano for this agent/tool loop — median final-text 3.5-5.5s vs
+  # mini's 2.2-3.1s, and it needed extra tool rounds more often, despite
+  # being marketed as the fast option for simple tasks.
   model: gpt-5.4-mini
-  # none|low|medium|high (reasoning models). Latency round, July 2026: wake ->
-  # audio queued was ~14s on "low", with OpenAI first-token alone ~3.3-5s.
-  # OpenAI's own guidance is "none" as the latency baseline, "low" only if the
-  # task actually needs some reasoning — this rabbit's turns mostly don't.
-  # A/B before committing to a change: brain/scripts/llm-bench.py compares
-  # models/efforts on fixed prompts (timing + raw replies/tool calls, no
-  # auto-pick — judge quality yourself). Try model: gpt-5.4-nano too.
-  reasoning_effort: low
+  # none|low|medium|high (reasoning models). "none" is the current candidate
+  # (median final-text 2248ms vs low's 3129ms in the same benchmark) — still
+  # provisional, the none-vs-low comparison needs re-running now that the
+  # redundant tool round-trip is gone (see the `express` tool below).
+  reasoning_effort: none
   # Replies are spoken — keep them short. Also a latency lever: 150 tokens is
   # still ample for the ONE short sentence the prompt asks for now, and caps
   # the tail case (a reasoning model can otherwise burn the budget on hidden

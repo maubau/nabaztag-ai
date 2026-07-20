@@ -37,11 +37,15 @@ class FakeProvider:
 async def test_one_run_reports_result(monkeypatch):
     mod = _load()
     monkeypatch.setattr(mod, "OpenAIProvider", FakeProvider)
-    result = await mod._one_run("gpt-x", "none", "ciao", "you are a rabbit")
+    result = await mod._one_run("gpt-x", "none", "ciao", 1, "you are a rabbit")
     assert result.text == "reply from gpt-x/none"
     assert result.model == "gpt-x"
     assert result.effort == "none"
     assert result.calls == 1  # counting wrapper saw exactly one respond() call
+    assert result.violations() == []  # 1 call as expected, non-empty text
+    assert len(result.rounds) == 1
+    assert result.rounds[0].tool_names == []
+    assert result.rounds[0].text_len == len("reply from gpt-x/none")
 
 
 async def test_one_run_counts_a_follow_up_round(monkeypatch):
@@ -63,9 +67,28 @@ async def test_one_run_counts_a_follow_up_round(monkeypatch):
             return LLMResult(text="fatto")
 
     monkeypatch.setattr(mod, "OpenAIProvider", TwoRoundProvider)
-    result = await mod._one_run("gpt-x", "low", "da che direzione?", "you are a rabbit")
+    result = await mod._one_run("gpt-x", "low", "da che direzione?", 2, "you are a rabbit")
     assert result.calls == 2
     assert result.text == "fatto"
+    assert result.violations() == []
+    assert [r.tool_names for r in result.rounds] == [["get_direction"], []]
+
+
+async def test_violations_flag_wrong_call_count_and_empty_text(monkeypatch):
+    mod = _load()
+    monkeypatch.setattr(mod, "OpenAIProvider", FakeProvider)
+    # expected 1 call but nothing about this provider makes a second round —
+    # so exercise the empty-text and wrong-count paths directly instead
+    result = await mod._one_run("gpt-x", "none", "ciao", 2, "you are a rabbit")
+    assert "expected 2 call(s), got 1" in result.violations()
+
+    class SilentProvider(FakeProvider):
+        async def respond(self, system, history, tools, on_text_delta=None):
+            return LLMResult(text="")
+
+    monkeypatch.setattr(mod, "OpenAIProvider", SilentProvider)
+    silent = await mod._one_run("gpt-x", "none", "ciao", 1, "you are a rabbit")
+    assert "spoken text is empty" in silent.violations()
 
 
 def test_fmt_ms_empty_and_populated():
@@ -73,3 +96,10 @@ def test_fmt_ms_empty_and_populated():
     assert mod._fmt_ms([]) == "n/a"
     formatted = mod._fmt_ms([100, 300, 200])
     assert "ms" in formatted and "min 100" in formatted and "max 300" in formatted
+
+
+def test_fmt_rounds():
+    mod = _load()
+    rounds = [mod.RoundLog(round=1, tool_names=["express"], text_len=5)]
+    assert "express" in mod._fmt_rounds(rounds)
+    assert "text_len=5" in mod._fmt_rounds(rounds)

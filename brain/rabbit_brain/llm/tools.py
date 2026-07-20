@@ -63,6 +63,44 @@ class BodyTools:
     def specs(self) -> list[ToolSpec]:
         return [
             ToolSpec(
+                "express",
+                "Speak AND express yourself in ONE call: put your full spoken reply in "
+                "spoken_text, plus any gesture/mood for this turn. This is the ONLY way to "
+                "combine a reply with a gesture — calling gesture_ears/play_gesture/"
+                "set_mood_lights separately does not attach a reply to them.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "spoken_text": {
+                            "type": "string",
+                            "description": "What to say out loud, in the user's language.",
+                        },
+                        "ears": {
+                            "type": "object",
+                            "properties": {
+                                "left": {
+                                    "type": "integer",
+                                    "minimum": EAR_MIN,
+                                    "maximum": EAR_MAX,
+                                },
+                                "right": {
+                                    "type": "integer",
+                                    "minimum": EAR_MIN,
+                                    "maximum": EAR_MAX,
+                                },
+                            },
+                            "required": ["left", "right"],
+                            "additionalProperties": False,
+                        },
+                        "gesture": {"type": "string", "enum": sorted(GESTURE_PRESETS)},
+                        "mood": {"type": "string", "enum": sorted(MOOD_LIGHTS)},
+                        "pulse": {"type": "boolean"},
+                    },
+                    "required": ["spoken_text"],
+                    "additionalProperties": False,
+                },
+            ),
+            ToolSpec(
                 "gesture_ears",
                 "Move the ears for body language. left/right are 0 (fully forward) to 16 "
                 "(fully back). Use sparingly and briefly.",
@@ -124,6 +162,8 @@ class BodyTools:
         return ToolResult(call_id=call.call_id, output=output)
 
     async def _dispatch(self, name: str, args: dict) -> str:
+        if name == "express":
+            return await self._express(args)
         if name == "gesture_ears":
             return await self._gesture_ears(args)
         if name == "set_mood_lights":
@@ -139,6 +179,48 @@ class BodyTools:
         raise ToolError(f"unknown tool {name!r}")
 
     # --- individual tools (validate, then submit choreography-only) -------
+
+    async def _express(self, args: dict) -> str:
+        """Speak + gesture in one call (§6.2.5, hardware round July 2026: the
+        model didn't reliably combine free text with a separate tool call, so
+        the reply text has to travel INSIDE the tool call itself — AgentLoop
+        reads spoken_text back out of the raw ToolCall arguments).
+
+        Validates every provided field BEFORE submitting anything: a mistake
+        in one field (e.g. an unknown gesture) must not leave a half-applied
+        body state (ears moved, gesture rejected)."""
+        spoken_text = args.get("spoken_text")
+        if not isinstance(spoken_text, str) or not spoken_text.strip():
+            raise ToolError("spoken_text is required and must be non-empty")
+
+        ears = args.get("ears")
+        if ears is not None:
+            left, right = _req_int(ears, "left"), _req_int(ears, "right")
+            if not (EAR_MIN <= left <= EAR_MAX and EAR_MIN <= right <= EAR_MAX):
+                raise ToolError(f"ear positions must be {EAR_MIN}..{EAR_MAX}")
+
+        gesture = args.get("gesture")
+        if gesture is not None and gesture not in GESTURE_PRESETS:
+            valid = ", ".join(sorted(GESTURE_PRESETS))
+            raise ToolError(f"unknown gesture {gesture!r}; valid: {valid}")
+
+        mood = args.get("mood")
+        if mood is not None and mood not in MOOD_LIGHTS:
+            raise ToolError(f"unknown mood {mood!r}; valid: {', '.join(sorted(MOOD_LIGHTS))}")
+
+        actions: list[str] = []
+        if ears is not None:
+            await self._submit(ChorCommand(build_gesture_ears_chor(left, right)))
+            actions.append(f"ears -> ({left}, {right})")
+        if gesture is not None:
+            await self._submit(ChorCommand(GESTURE_PRESETS[gesture]))
+            actions.append(f"gesture -> {gesture}")
+        if mood is not None:
+            pulse = bool(args.get("pulse", False))
+            spec = LedSpec.from_dict(MOOD_LIGHTS[mood], pulse=pulse)
+            await self._submit(LedsCommand(spec))
+            actions.append(f"mood -> {mood}" + (" (pulsing)" if pulse else ""))
+        return "said" + (f"; {'; '.join(actions)}" if actions else "")
 
     async def _gesture_ears(self, args: dict) -> str:
         left, right = _req_int(args, "left"), _req_int(args, "right")

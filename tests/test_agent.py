@@ -176,6 +176,59 @@ async def test_mixed_expressive_and_informational_forces_followup_round():
     assert llm.calls == 2
 
 
+async def test_express_tool_carries_reply_skips_followup_round():
+    """The benchmark (July 2026) showed the model does NOT reliably produce
+    free text alongside a separate gesture tool call in the same response —
+    the realistic case is EMPTY free text plus an express() call carrying the
+    reply. AgentLoop must still resolve in one round by reading spoken_text
+    out of the tool call's own arguments, not the response's free-text field."""
+    ctrl = RecordingController()
+    llm = FakeLLM(
+        LLMResult(
+            tool_calls=[tool_call("express", spoken_text="Ecco le orecchie!", gesture="wiggle")]
+        )
+    )
+    agent = make_agent(llm, FakeSpeaker(), controller=ctrl)
+    out = await agent.handle("saluta muovendo le orecchie")
+    assert out == "Ecco le orecchie!"
+    assert llm.calls == 1
+    cmds = [c for c, _ in ctrl.submitted]
+    assert any(isinstance(c, ChorCommand) for c in cmds)
+
+
+async def test_express_with_bad_gesture_still_speaks():
+    """A tool-level validation failure (bad gesture/mood) must not silence
+    the reply — spoken_text is pulled from the raw arguments independently of
+    whether the tool execution itself succeeded."""
+    ctrl = RecordingController()
+    llm = FakeLLM(
+        LLMResult(
+            tool_calls=[tool_call("express", spoken_text="Ciao comunque!", gesture="backflip")]
+        )
+    )
+    agent = make_agent(llm, FakeSpeaker(), controller=ctrl)
+    out = await agent.handle("fai un salto e saluta")
+    assert out == "Ciao comunque!"
+    assert ctrl.submitted == []  # the bad gesture never reached the body
+
+
+async def test_express_with_informational_tool_still_forces_followup():
+    ctrl = RecordingController()
+    llm = FakeLLM(
+        LLMResult(
+            tool_calls=[
+                tool_call("express", cid="a", spoken_text="Un attimo..."),
+                tool_call("get_direction", cid="b"),
+            ]
+        ),
+        LLMResult(text="Sei a nord."),
+    )
+    agent = make_agent(llm, FakeSpeaker(), controller=ctrl)
+    out = await agent.handle("da dove mi parli?")
+    assert out == "Sei a nord."
+    assert llm.calls == 2
+
+
 async def test_invalid_tool_call_recovers():
     ctrl = RecordingController()
     llm = FakeLLM(

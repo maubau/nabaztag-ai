@@ -133,6 +133,18 @@ class AgentLoop:
                 break
             results = tuple([await self.tools.execute(c) for c in result.tool_calls])
             self._history.append(ToolTurn(results))
+            # `express` carries its reply INSIDE the tool call (spoken_text),
+            # not in the response's free-text field — the benchmark showed
+            # the model does not reliably produce free text alongside a tool
+            # call in the same response, so the reply can't depend on that.
+            # Pull it from the raw arguments regardless of whether the tool
+            # execution above succeeded (a bad gesture/mood must not silence
+            # the reply too).
+            express_call = next((c for c in result.tool_calls if c.name == "express"), None)
+            if express_call is not None:
+                spoken_text = express_call.arguments.get("spoken_text")
+                if isinstance(spoken_text, str) and spoken_text.strip():
+                    result.text = spoken_text
             # Skip the extra LLM round when this response ALREADY has final
             # text and every tool it called is purely expressive (no return
             # value the model needs) — the common "say X and gesture" case

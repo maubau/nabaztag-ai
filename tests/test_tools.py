@@ -87,15 +87,65 @@ async def test_specs_are_valid_json_schema():
     specs = BodyTools(RecordingController()).specs()
     names = {s.name for s in specs}
     assert names == {
+        "express",
         "gesture_ears",
         "set_mood_lights",
         "play_gesture",
         "get_direction",
         "body_state",
     }
+    informational = {s.name for s in specs if s.informational}
+    assert informational == {"get_direction", "body_state"}
     for spec in specs:
         assert spec.parameters["type"] == "object"
         assert isinstance(spec.description, str) and spec.description
+
+
+async def test_express_speaks_and_gestures_in_one_call():
+    ctrl = RecordingController()
+    tools = BodyTools(ctrl)
+    res = await tools.execute(
+        call(
+            "express",
+            spoken_text="Ciao!",
+            ears={"left": 3, "right": 3},
+            gesture="wiggle",
+            mood="happy",
+        )
+    )
+    assert "error" not in res.output
+    cmds = [c for c, _ in ctrl.submitted]
+    assert len(cmds) == 3  # ears (chor), gesture (chor), mood (leds)
+    assert all(isinstance(c, ChorCommand | LedsCommand) for c in cmds)
+    assert not any(isinstance(c, EarsCommand) for c in cmds)
+
+
+async def test_express_spoken_text_only_no_gesture():
+    ctrl = RecordingController()
+    tools = BodyTools(ctrl)
+    res = await tools.execute(call("express", spoken_text="Solo una risposta."))
+    assert res.output == "said"
+    assert ctrl.submitted == []
+
+
+async def test_express_requires_spoken_text():
+    ctrl = RecordingController()
+    tools = BodyTools(ctrl)
+    res = await tools.execute(call("express", gesture="nod"))
+    assert res.output.startswith("error")
+    assert ctrl.submitted == []
+
+
+async def test_express_invalid_field_is_atomic_nothing_submitted():
+    # valid ears + an invalid gesture must not leave a half-applied body
+    # state — everything is validated before anything is submitted
+    ctrl = RecordingController()
+    tools = BodyTools(ctrl)
+    res = await tools.execute(
+        call("express", spoken_text="Ciao!", ears={"left": 2, "right": 2}, gesture="backflip")
+    )
+    assert res.output.startswith("error")
+    assert ctrl.submitted == []
 
 
 async def test_gesture_ears_reaches_ojn_as_chor_not_ears(controller, mock_ojn):
