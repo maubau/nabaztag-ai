@@ -428,7 +428,9 @@ async def test_deepgram_tts_applies_gain_via_ffmpeg(tmp_path, monkeypatch):
     boosted = await tts._apply_gain(path)
     assert boosted.name == "x.gain.mp3"
     assert not path.exists()  # original replaced
-    assert "volume=6.0dB" in calls[0]
+    filter_arg = next(a for a in calls[0] if isinstance(a, str) and a.startswith("volume="))
+    assert filter_arg.startswith("volume=6.0dB,")
+    assert "alimiter" in filter_arg  # peak limiter, so higher gain can't clip
 
 
 async def test_deepgram_tts_gain_falls_back_on_ffmpeg_failure(tmp_path, monkeypatch):

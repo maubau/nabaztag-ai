@@ -27,6 +27,7 @@ import contextlib
 import logging
 import os
 import signal
+import sys
 from pathlib import Path
 
 import yaml
@@ -48,6 +49,22 @@ from .tts import build_speech_stack
 log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT_PATH = Path("prompts/system.md")
+TEARDOWN_STEP_TIMEOUT_S = 5.0
+
+
+async def _teardown_step(name: str, coro) -> None:
+    """One shutdown step, bounded so a stuck one (a hung network close, a
+    task ignoring cancellation) can't block the rest of teardown or the final
+    'nabaztag runtime stopped' log — hardware round, July 2026: the process
+    never printed it after several Ctrl-C."""
+    try:
+        await asyncio.wait_for(coro, TEARDOWN_STEP_TIMEOUT_S)
+    except TimeoutError:
+        log.warning("teardown step %r exceeded %.0fs, continuing", name, TEARDOWN_STEP_TIMEOUT_S)
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        log.exception("teardown step %r failed, continuing", name)
 
 
 def _load_yaml(path: str) -> dict:
@@ -176,32 +193,61 @@ async def run(config_path: str, moods_path: str, system_prompt_path: str) -> Non
         pipeline_task = asyncio.create_task(pipeline.run())
         pipeline_task.add_done_callback(lambda _t: stop.set())
 
+        force_stop = asyncio.Event()
+
+        def _on_signal() -> None:
+            if stop.is_set():
+                log.warning("second interrupt received, forcing an immediate exit")
+                force_stop.set()
+            else:
+                log.info("stopping (interrupt again to force-quit)")
+                stop.set()
+
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(NotImplementedError):
-                loop.add_signal_handler(sig, stop.set)
+                loop.add_signal_handler(sig, _on_signal)
 
         log.info("nabaztag runtime listening (say the wake word; Ctrl-C to stop)")
-        try:
-            await stop.wait()
-        finally:
-            # ordered teardown: stop input, then body, then servers/sessions
+        await stop.wait()
+
+        async def _teardown() -> None:
+            # ordered teardown: stop input, then body, then servers/sessions.
+            # Every step is bounded (_teardown_step) so one stuck step (a hung
+            # network close, a task ignoring cancellation) can't swallow the
+            # rest or the final log line.
             pipeline_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await pipeline_task
-            await pipeline.aclose()
+            await _teardown_step("pipeline_task", pipeline_task)
+            await _teardown_step("pipeline.aclose", pipeline.aclose())
             events_task.cancel()
             controller_task.cancel()
-            for t in (events_task, controller_task):
-                with contextlib.suppress(asyncio.CancelledError):
-                    await t
-            await listener.stop()
-            await speech.aclose()
+            await _teardown_step("events_task", events_task)
+            await _teardown_step("controller_task", controller_task)
+            await _teardown_step("listener.stop", listener.stop())
+            await _teardown_step("speech.aclose", speech.aclose())
             if hasattr(llm, "aclose"):
-                await llm.aclose()
+                await _teardown_step("llm.aclose", llm.aclose())
             if mock is not None:
-                await mock.stop()
+                await _teardown_step("mock.stop", mock.stop())
             log.info("nabaztag runtime stopped")
+
+        teardown_task = asyncio.ensure_future(_teardown())
+        force_task = asyncio.ensure_future(force_stop.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {teardown_task, force_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if force_task in done and teardown_task not in done:
+                log.warning("teardown did not finish before the forced exit — skipping the rest")
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(1)  # tee/pipes may buffer; a clean return can't be guaranteed here
+        finally:
+            force_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await force_task
+        sys.stdout.flush()
+        sys.stderr.flush()
 
 
 def main() -> None:

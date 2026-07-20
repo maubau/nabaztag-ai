@@ -75,6 +75,13 @@ class BodyController:
         self._latest: dict[tuple[type, Priority], int] = {}
 
         self._current_playback: PlaybackHandle | None = None
+        # True from the moment an audio entry is popped off _audio_pending
+        # until either a playback handle is assigned or the attempt fails —
+        # covers the adapter.play_audio()/say() round-trip itself, where
+        # _audio_pending is already empty but _current_playback isn't set
+        # yet (hardware round, July 2026: audio_busy went False during that
+        # window, opening the half-duplex gate mid-turn).
+        self._audio_inflight = False
         self._outstanding = 0
         self._idle = asyncio.Event()
         self._idle.set()
@@ -204,6 +211,10 @@ class BodyController:
             if entry is None:
                 self._audio_ready.clear()
                 continue
+            # popped but not yet playing: audio_busy must still hold through
+            # the adapter round-trip below, not just once current_playback
+            # is assigned (hardware finding, July 2026).
+            self._audio_inflight = True
             try:
                 if isinstance(entry.cmd, PlayAudioCommand):
                     handle = await self._adapter.play_audio(entry.cmd.urls, entry.cmd.duration_s)
@@ -216,6 +227,7 @@ class BodyController:
             except Exception:
                 log.exception("audio command failed: %s", entry.cmd)
             finally:
+                self._audio_inflight = False
                 self._finish_one()
 
     @property
@@ -225,11 +237,14 @@ class BodyController:
 
     @property
     def audio_busy(self) -> bool:
-        """True while ANY audio is queued or (estimated) playing — including
-        commands accepted by submit() but not yet executed, which
-        current_playback alone cannot see. The half-duplex gate uses this so
-        the mic never hears audio that is about to start (§6.2.7)."""
-        if self._audio_pending:
+        """True while ANY audio is queued, being submitted to the body, or
+        (estimated) playing — including commands accepted by submit() but not
+        yet executed (current_playback alone cannot see those) AND the
+        adapter round-trip between popping an entry and it becoming
+        current_playback (current_playback alone cannot see that gap either —
+        hardware finding, July 2026). The half-duplex gate uses this so the
+        mic never hears audio that is about to start (§6.2.7)."""
+        if self._audio_pending or self._audio_inflight:
             return True
         handle = self._current_playback
         return handle is not None and not getattr(handle, "finished", False)

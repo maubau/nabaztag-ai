@@ -8,11 +8,13 @@ duration measured (mutagen), like the other providers. DEEPGRAM_API_KEY comes
 from the environment and is never logged.
 
 Optional gain (hardware round, July 2026: voice quality good, volume a touch
-low): Aura's /v1/speak has no volume/gain request parameter, so a configured
-gain_db is applied as a post-processing pass through ffmpeg (already a system
-dependency for the piper profile). Off by default (gain_db=0) — zero behavior
-change unless DEEPGRAM_TTS_GAIN_DB is set, and a failed/missing ffmpeg falls
-back to the unmodified file rather than breaking TTS.
+low even at +3dB). Aura's /v1/speak has no volume/gain request parameter, so
+a configured gain_db is applied as a post-processing pass through ffmpeg
+(already a system dependency for the piper profile), chained with a peak
+limiter (alimiter) so raising the gain further can't clip — a plain volume
+boost alone would. Off by default (gain_db=0) — zero behavior change unless
+DEEPGRAM_TTS_GAIN_DB is set, and a failed/missing ffmpeg falls back to the
+unmodified file rather than breaking TTS.
 """
 
 from __future__ import annotations
@@ -112,7 +114,11 @@ class DeepgramTTS:
                 "-i",
                 str(path),
                 "-filter:a",
-                f"volume={self._gain_db}dB",
+                # alimiter caps true peaks at ~-0.5 dBFS so a higher gain_db
+                # can't clip — plain "volume=XdB" alone would (hardware
+                # round, July 2026: still quiet at +3dB, +6dB was the next
+                # thing to try, so headroom against clipping matters here).
+                f"volume={self._gain_db}dB,alimiter=limit=0.95:attack=5:release=50",
                 "-codec:a",
                 "libmp3lame",
                 str(boosted),

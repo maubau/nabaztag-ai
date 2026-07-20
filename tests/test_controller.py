@@ -225,6 +225,41 @@ async def test_motion_runs_while_audio_plays():
     task.cancel()
 
 
+async def test_audio_busy_true_during_play_audio_round_trip():
+    """audio_busy must hold from the moment an entry is popped off
+    _audio_pending, through the adapter.play_audio()/say() round-trip itself,
+    not just once current_playback is assigned (hardware finding, July 2026:
+    _audio_pending was already empty and current_playback not yet set during
+    the round-trip, so audio_busy — and the pipeline's half-duplex gate —
+    went False mid-turn)."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowAdapter(FakeAdapter):
+        async def play_audio(self, urls, duration_s):
+            started.set()
+            await release.wait()
+            return await super().play_audio(urls, duration_s)
+
+    adapter = SlowAdapter()
+    c = BodyController(adapter)
+    task = await run_controller(c)
+    assert c.audio_busy is False
+    await c.submit(PlayAudioCommand(("http://x/s.mp3",), 1.0), Priority.USER_SPEECH_SYNC)
+    await asyncio.wait_for(started.wait(), 2)
+    # entry popped (_audio_pending now empty), adapter call in flight,
+    # current_playback not assigned yet — this is the gap that used to leak.
+    assert c.audio_busy is True
+    assert adapter.calls == []  # the round-trip hasn't even reached the adapter's own call log
+    release.set()
+    await drain(c)
+    assert c.audio_busy is True  # now actually playing
+    adapter.playbacks[0].finish()
+    await asyncio.sleep(0)
+    assert c.audio_busy is False
+    task.cancel()
+
+
 async def test_end_to_end_against_mock_ojn(controller, mock_ojn):
     """Same arbitration paths, real HTTP against the mock OJN server."""
     await controller.submit(EarsCommand(3, 12), Priority.AGENT_EXPRESSION)

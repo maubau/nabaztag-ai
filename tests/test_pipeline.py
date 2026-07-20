@@ -603,6 +603,63 @@ async def test_playing_drain_and_state_transitions_logged(caplog):
     assert pipeline.frame_counts.get("playing", 0) >= 3
 
 
+async def test_playing_drain_spans_slow_ojn_round_trip(caplog):
+    """Real BodyController + OjnAdapter against a deliberately slow mock OJN:
+    audio_busy (hence the PLAYING drain) must hold through the adapter's
+    play_audio() round-trip itself — not just once current_playback is
+    assigned — and through the estimated duration + guard after (hardware
+    finding, July 2026: _audio_pending was already empty and
+    current_playback not yet set during the round-trip, so audio_busy went
+    False and the mic reopened mid-turn: 'PLAYING (processing discarded=222)'
+    then 'REARMED (playing discarded=0, flushed=3)' — the drain never ran)."""
+    import logging
+
+    from rabbit_brain.body.controller import BodyController
+    from rabbit_brain.body.mock_ojn import MOCK_SERIAL, MOCK_VAPI_TOKEN, MockOjnServer
+    from rabbit_brain.body.ojn_adapter import OjnAdapter
+
+    slow_ojn = MockOjnServer(latency_s=0.15)
+    await slow_ojn.start()
+    controller_task = None
+    try:
+        async with OjnAdapter(slow_ojn.base_url, MOCK_SERIAL, MOCK_VAPI_TOKEN) as adapter:
+            controller = BodyController(adapter)
+            controller_task = asyncio.create_task(controller.run())
+            wake = FakeWake(trigger_at=0)
+            capture = EndlessCapture([SILENCE, SPEECH, SPEECH, SPEECH] + [SILENCE] * 12)
+
+            async def on_transcript(text: str) -> None:
+                await controller.submit(
+                    PlayAudioCommand(("http://192.168.66.1/brain-audio/x.mp3",), 0.05),
+                    Priority.USER_SPEECH_SYNC,
+                )
+
+            pipeline = make_pipeline(capture, wake, controller, [], on_transcript=on_transcript)
+            with caplog.at_level(logging.INFO):
+                run = asyncio.create_task(pipeline.run())
+                try:
+                    await wait_until(lambda: "pipeline state -> PLAYING" in caplog.text)
+                    # still mid round-trip (latency_s=0.15): the OJN call hasn't
+                    # returned yet, so current_playback isn't set — this is
+                    # exactly the window that used to leak through as ungated.
+                    assert slow_ojn.calls_of("stream") == []
+                    assert controller.audio_busy is True
+                    pulled_before = capture.pulled
+                    await asyncio.sleep(0.05)
+                    assert capture.pulled > pulled_before  # kept draining, mid round-trip
+                    await wait_until(lambda: "REARMED" in caplog.text)
+                finally:
+                    run.cancel()
+                    await asyncio.gather(run, return_exceptions=True)
+            assert len(slow_ojn.calls_of("stream")) == 1  # the call did land, eventually
+            assert pipeline.frame_counts.get("playing", 0) > 0
+    finally:
+        if controller_task is not None:
+            controller_task.cancel()
+            await asyncio.gather(controller_task, return_exceptions=True)
+        await slow_ojn.stop()
+
+
 async def test_frame_counts_tracked_per_state():
     """Per-state consumed/discarded counters, as requested for hardware
     diagnostics — not just an opaque 'it drained' boolean. _drain_frames only

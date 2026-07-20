@@ -177,6 +177,29 @@ Hardware half — status on the real rabbit:
     jitter, independent of the root cause; (c) `AlsaCapture.frames()` now raises if called
     twice (single-consumer enforcement, was already true structurally but is now enforced).
     Needs a hardware re-test with the new logs to confirm resolved or to localize further.
+15. **Root cause of #14 found and fixed, via the new instrumentation (hardware round, July
+    2026, runtime 336cffb).** The new logs pinned it exactly: `PROCESSING (discarded=222)` then
+    straight to `PLAYING (discarded=0)` / `REARMED (discarded=0, flushed=3)` — the PLAYING
+    drain ran zero iterations. Root cause: `BodyController._audio_loop` pops the entry off
+    `_audio_pending` BEFORE `await adapter.play_audio(...)`, and only assigns
+    `_current_playback` AFTER that round-trip returns. During the round-trip itself
+    `_audio_pending` is already empty and `_current_playback` is still `None`, so `audio_busy`
+    read `False` and the half-duplex gate opened mid-turn. Fixed with an explicit
+    `_audio_inflight` flag, set the moment an entry is popped and cleared only once a playback
+    handle is assigned or the attempt fails; `audio_busy` now also checks it. Covered by
+    `test_audio_busy_true_during_play_audio_round_trip` (unit) and
+    `test_playing_drain_spans_slow_ojn_round_trip` (integration, `MockOjnServer(latency_s=...)`
+    forcing the round-trip open).
+    Also this round: the runtime didn't print "nabaztag runtime stopped" after several Ctrl-C
+    (piped through `tee`) — teardown steps now run under `asyncio.wait_for` (5s each, logged
+    and skipped on timeout rather than blocking the rest) and a second interrupt during
+    shutdown forces an immediate `os._exit(1)` rather than waiting indefinitely.
+    Latency at this hardware round: wake→STT final 3.87s, STT final→LLM final 4.01s (OpenAI
+    first-token ~3.3s of that), Deepgram TTS synth 2.90s, wake→audio-queued ~10.8s total.
+    Streaming the first LLM sentence would only save ~0.7s here (first-token→final is short);
+    the real cost centers are OpenAI's first-token latency and Deepgram synthesis time — a
+    faster/smaller OpenAI model is worth trying, `DEEPGRAM_TTS_GAIN_DB` volume is still low at
+    +3dB (try +6dB; the post-processing now chains a peak limiter so a higher gain can't clip).
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 
