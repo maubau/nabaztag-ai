@@ -103,11 +103,13 @@ class BodyTools:
                 "get_direction",
                 "Return the last known direction of the speaker in degrees (0-359), if any.",
                 {"type": "object", "properties": {}, "additionalProperties": False},
+                informational=True,
             ),
             ToolSpec(
                 "body_state",
                 "Return the rabbit's current ear/LED/playing state.",
                 {"type": "object", "properties": {}, "additionalProperties": False},
+                informational=True,
             ),
         ]
 

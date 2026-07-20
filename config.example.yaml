@@ -42,11 +42,19 @@ llm:
   # The model is configuration, never hardcoded.
   provider: openai
   model: gpt-5.4-mini
-  reasoning_effort: low     # low|medium|high (reasoning models)
-  # Replies are spoken — keep them short. Also a latency lever (hardware
-  # round, July 2026: perceived turn time ~8-13s): 220 tokens is still ample
-  # for the 1-2 sentence replies the prompt asks for, and caps the tail case.
-  max_output_tokens: 220
+  # none|low|medium|high (reasoning models). Latency round, July 2026: wake ->
+  # audio queued was ~14s on "low", with OpenAI first-token alone ~3.3-5s.
+  # OpenAI's own guidance is "none" as the latency baseline, "low" only if the
+  # task actually needs some reasoning — this rabbit's turns mostly don't.
+  # A/B before committing to a change: brain/scripts/llm-bench.py compares
+  # models/efforts on fixed prompts (timing + raw replies/tool calls, no
+  # auto-pick — judge quality yourself). Try model: gpt-5.4-nano too.
+  reasoning_effort: low
+  # Replies are spoken — keep them short. Also a latency lever: 150 tokens is
+  # still ample for the ONE short sentence the prompt asks for now, and caps
+  # the tail case (a reasoning model can otherwise burn the budget on hidden
+  # reasoning tokens before any visible text, especially at higher effort).
+  max_output_tokens: 150
   timeout_s: 20
   max_tool_rounds: 4        # cap tool-call rounds per turn (no infinite loops)
   max_history_turns: 20     # rolling conversation memory, kept locally

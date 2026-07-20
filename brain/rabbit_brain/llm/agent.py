@@ -112,6 +112,7 @@ class AgentLoop:
 
     async def _run_rounds(self, timings: TurnTimings) -> LLMResult:
         specs = self.tools.specs()
+        informational = {s.name for s in specs if s.informational}
 
         def on_delta(_delta: str) -> None:
             if timings.first_token is None:
@@ -132,6 +133,16 @@ class AgentLoop:
                 break
             results = tuple([await self.tools.execute(c) for c in result.tool_calls])
             self._history.append(ToolTurn(results))
+            # Skip the extra LLM round when this response ALREADY has final
+            # text and every tool it called is purely expressive (no return
+            # value the model needs) — the common "say X and gesture" case
+            # (hardware round, July 2026: this second round-trip was pure
+            # latency, ~4-5s, for a gesture nobody needed a reply about).
+            # Informational tools (get_direction, body_state) still force a
+            # follow-up round so the model can use their result.
+            needs_followup = any(c.name in informational for c in result.tool_calls)
+            if not needs_followup and result.text.strip():
+                break
         timings.final_text = time.monotonic()
         return result
 

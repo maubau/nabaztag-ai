@@ -124,6 +124,58 @@ async def test_multiple_tool_calls_in_one_turn():
     assert len(tool_turn.results) == 2
 
 
+async def test_expressive_tool_with_text_skips_followup_round():
+    """Hardware round, July 2026: a gesture the model didn't need a reply
+    about was costing a whole extra OpenAI round-trip (~4-5s). If the model
+    already gives final text alongside a purely expressive tool call
+    (gesture_ears/set_mood_lights/play_gesture), execute the tool and use
+    that text directly — no second call."""
+    ctrl = RecordingController()
+    llm = FakeLLM(
+        LLMResult(text="Ecco le orecchie!", tool_calls=[tool_call("gesture_ears", left=2, right=2)])
+    )
+    agent = make_agent(llm, FakeSpeaker(), controller=ctrl)
+    out = await agent.handle("muovi le orecchie")
+    assert out == "Ecco le orecchie!"
+    assert llm.calls == 1  # no follow-up round
+    cmds = [c for c, _ in ctrl.submitted]
+    assert any(isinstance(c, ChorCommand) for c in cmds)  # the gesture still ran
+    assert any(isinstance(m, ToolTurn) for m in agent.history)  # result still recorded
+
+
+async def test_informational_tool_still_forces_followup_round():
+    """get_direction/body_state need their result fed back — the model can't
+    answer without it, so the follow-up round must still happen even if the
+    model also produced some text in the same response."""
+    ctrl = RecordingController()
+    llm = FakeLLM(
+        LLMResult(text="Vediamo...", tool_calls=[tool_call("get_direction")]),
+        LLMResult(text="Sei a nord."),
+    )
+    agent = make_agent(llm, FakeSpeaker(), controller=ctrl)
+    out = await agent.handle("da dove ti parlo?")
+    assert out == "Sei a nord."
+    assert llm.calls == 2
+
+
+async def test_mixed_expressive_and_informational_forces_followup_round():
+    ctrl = RecordingController()
+    llm = FakeLLM(
+        LLMResult(
+            text="Un attimo...",
+            tool_calls=[
+                tool_call("gesture_ears", cid="a", left=1, right=1),
+                tool_call("get_direction", cid="b"),
+            ],
+        ),
+        LLMResult(text="Sei a nord, e ho mosso le orecchie."),
+    )
+    agent = make_agent(llm, FakeSpeaker(), controller=ctrl)
+    out = await agent.handle("dimmi da dove e muovi le orecchie")
+    assert out == "Sei a nord, e ho mosso le orecchie."
+    assert llm.calls == 2
+
+
 async def test_invalid_tool_call_recovers():
     ctrl = RecordingController()
     llm = FakeLLM(

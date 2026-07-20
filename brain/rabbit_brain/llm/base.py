@@ -15,11 +15,22 @@ from typing import Any, Protocol, runtime_checkable
 
 @dataclass(frozen=True)
 class ToolSpec:
-    """A callable the model may invoke. `parameters` is a JSON Schema object."""
+    """A callable the model may invoke. `parameters` is a JSON Schema object.
+
+    `informational`: True when the model NEEDS the tool's return value to
+    answer correctly (get_direction, body_state) — a follow-up LLM round is
+    required. False (default) for purely expressive/fire-and-forget actions
+    (gesture_ears, set_mood_lights, play_gesture): if the model already gave
+    final text in the SAME response as the tool call, AgentLoop skips the
+    extra round-trip entirely (hardware round, July 2026: wake->audio queued
+    ~14s, and a second OpenAI call for a gesture that needed no reply was one
+    of the avoidable costs).
+    """
 
     name: str
     description: str
     parameters: dict[str, Any]
+    informational: bool = False
 
 
 @dataclass(frozen=True)

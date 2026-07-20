@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -87,6 +88,8 @@ class DeepgramTTS:
         if self._session is None:
             self._session = aiohttp.ClientSession()
             self._own_session = True
+        t_request = time.monotonic()
+        t_headers = t_first_byte = t_last_byte = None
         async with self._session.post(
             self._api_base,
             params={"model": self.voice_for(language)},
@@ -94,14 +97,43 @@ class DeepgramTTS:
             json={"text": text},
             timeout=self._timeout,
         ) as resp:
+            t_headers = time.monotonic()
             if resp.status != 200:
                 raise RuntimeError(f"Deepgram TTS HTTP {resp.status}: {await resp.text()}")
-            data = await resp.read()
+            chunks = []
+            async for chunk in resp.content.iter_any():
+                if t_first_byte is None:
+                    t_first_byte = time.monotonic()
+                chunks.append(chunk)
+            data = b"".join(chunks)
+        t_last_byte = time.monotonic()
         path = self._audio_dir / f"{uuid.uuid4().hex}.mp3"
         path.write_bytes(data)
+        t_gain_start = time.monotonic()
         if self._gain_db:
             path = await self._apply_gain(path)
-        return TTSResult(path=path, duration_s=self._mp3_duration(path))
+        t_gain_ms = round((time.monotonic() - t_gain_start) * 1000)
+        duration_s = self._mp3_duration(path)
+
+        def ms(a: float | None, b: float | None) -> int | None:
+            return None if a is None or b is None else round((b - a) * 1000)
+
+        # Localizes where TTS latency actually goes — network/API, download,
+        # or our own ffmpeg post-processing (hardware round, July 2026: ~5s
+        # for "Deepgram TTS + submit" with no visibility into the split).
+        # Never logs text content, only its length.
+        log.info(
+            "deepgram tts timing: chars=%d request_to_headers_ms=%s headers_to_first_byte_ms=%s "
+            "first_to_last_byte_ms=%s total_http_ms=%s gain_ms=%d mp3_duration_s=%.2f",
+            len(text),
+            ms(t_request, t_headers),
+            ms(t_headers, t_first_byte),
+            ms(t_first_byte, t_last_byte),
+            ms(t_request, t_last_byte),
+            t_gain_ms,
+            duration_s,
+        )
+        return TTSResult(path=path, duration_s=duration_s)
 
     async def _apply_gain(self, path: Path) -> Path:
         boosted = path.with_suffix(".gain.mp3")

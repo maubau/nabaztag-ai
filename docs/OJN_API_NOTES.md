@@ -200,6 +200,31 @@ Hardware half — status on the real rabbit:
     the real cost centers are OpenAI's first-token latency and Deepgram synthesis time — a
     faster/smaller OpenAI model is worth trying, `DEEPGRAM_TTS_GAIN_DB` volume is still low at
     +3dB (try +6dB; the post-processing now chains a peak limiter so a higher gain can't clip).
+16. **Dedicated latency round opened (hardware round, July 2026, runtime 74aaa80): correctness
+    is done (#15), the target is EOS → first audio < 4s on simple conversational turns; last
+    measured wake→audio-queued ~14.3s.** Changes so far, targeted at the two named costs
+    (OpenAI first-token, a second OpenAI round-trip for tool calls the model didn't need a
+    reply for):
+    - `ToolSpec.informational` (get_direction/body_state=True; the three body-gesture tools
+      default False). `AgentLoop._run_rounds` now skips the follow-up LLM call when a round
+      already has final text AND every tool call in it is non-informational — the tool still
+      executes, the round-1 text is used directly. The system prompt now tells the model to
+      give the gesture + the reply in the SAME response instead of waiting on the gesture's
+      (empty) result.
+    - `llm.reasoning_effort` was already config-driven (not new); documented `none` as a valid
+      value and the latency rationale in config.example.yaml. `max_output_tokens` 220→150 and
+      the prompt now asks for ONE short sentence, not "1-2".
+    - `DeepgramTTS.synth` now logs a request→headers→first-byte→last-byte→gain breakdown
+      (chars and duration only, never text content) to localize whether TTS time is network,
+      download, or the ffmpeg gain/limiter pass.
+    - New `brain/scripts/llm-bench.py`: A/B harness (no real rabbit, a mock OJN server so tool
+      calls still execute) comparing model/reasoning_effort combos on fixed prompts — reports
+      timings and raw replies for a human to judge quality/language/tool-correctness; never
+      auto-picks a model. Needs `OPENAI_API_KEY` and real hardware-adjacent judgement, so the
+      actual gpt-5.4-mini vs gpt-5.4-nano vs effort comparison is a to-do for the next round,
+      not run from here.
+    Streaming the first LLM sentence into TTS before the full response completes was
+    considered again and still deferred (tool-call-vs-partial-speech risk, needs its own pass).
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 
