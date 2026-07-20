@@ -46,11 +46,12 @@ def make_llm_provider(config: dict[str, Any]) -> LLMProvider:
 
         return OpenAIProvider(
             model=llm.get("model", "gpt-5.4-mini"),
-            # "none": OpenAI's own latency baseline, and the candidate this
-            # rabbit's turns mostly don't need more than (hardware benchmark,
-            # July 2026: gpt-5.4-nano was markedly worse on this agent/tool
-            # loop despite being marketed as the fast option — mini stays).
-            reasoning_effort=llm.get("reasoning_effort", "none"),
+            # "low", decided by benchmark (July 2026, 3 runs/scenario, after
+            # the `express` tool removed the extra tool round): median
+            # final_text 1615ms vs "none"'s 2162ms, same quality/correctness.
+            # final_text is THE metric for this voice loop — Deepgram TTS only
+            # starts once the text is complete, so first-token wins are moot.
+            reasoning_effort=llm.get("reasoning_effort", "low"),
             max_output_tokens=llm.get("max_output_tokens", 150),
             timeout_s=llm.get("timeout_s", 20),
         )

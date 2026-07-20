@@ -46,11 +46,13 @@ llm:
   # mini's 2.2-3.1s, and it needed extra tool rounds more often, despite
   # being marketed as the fast option for simple tasks.
   model: gpt-5.4-mini
-  # none|low|medium|high (reasoning models). "none" is the current candidate
-  # (median final-text 2248ms vs low's 3129ms in the same benchmark) — still
-  # provisional, the none-vs-low comparison needs re-running now that the
-  # redundant tool round-trip is gone (see the `express` tool below).
-  reasoning_effort: none
+  # none|low|medium|high (reasoning models). "low" won the decisive A/B
+  # (July 2026, 3 runs/scenario, run AFTER the `express` tool removed the
+  # spurious extra tool round): median final_text 1615ms vs "none"'s 2162ms,
+  # equivalent quality and zero correctness violations. final_text is THE
+  # metric for this voice loop — Deepgram TTS only starts once the text is
+  # complete, so a faster first token buys nothing on its own.
+  reasoning_effort: low
   # Replies are spoken — keep them short. Also a latency lever: 150 tokens is
   # still ample for the ONE short sentence the prompt asks for now, and caps
   # the tail case (a reasoning model can otherwise burn the budget on hidden

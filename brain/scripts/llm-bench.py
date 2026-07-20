@@ -17,11 +17,21 @@ Needs OPENAI_API_KEY (never logged). Usage:
     OPENAI_API_KEY=... python brain/scripts/llm-bench.py \\
         --models gpt-5.4-mini,gpt-5.4-nano --efforts none,low --runs 3
 
-Real result, July 2026 (this benchmark's first run): gpt-5.4-nano ruled out
-for this agent/tool loop (median final-text 3.5-5.5s vs mini's 2.2-3.1s,
-plus extra tool rounds); the `express` tool (single-call speak+gesture) was
-added in response to `single-round-with-tools=0/3` at the time — the model
-was not reliably combining free text with a separate gesture tool call.
+Decided, July 2026 — read final_text, not first_output: Deepgram TTS only
+starts once the reply text is complete, so a faster first token buys nothing
+on its own.
+  - First run ruled out gpt-5.4-nano for this agent/tool loop (median
+    final_text 3.5-5.5s vs mini's 2.2-3.1s, plus extra tool rounds), and its
+    `single-round-with-tools=0/3` prompted the `express` tool (single-call
+    speak+gesture): the model was not reliably combining free text with a
+    separate gesture tool call.
+  - Decisive re-run, 3 runs/scenario, with `express` in place: gpt-5.4-mini
+    with reasoning_effort "low" (median final_text 1615ms) beat "none"
+    (2162ms) at equivalent quality and 0 correctness violations. That is the
+    shipped default.
+`single-round-with-tools` counts runs that used tools AND still took one
+call; it is NOT expected to be N/N, because a plain greeting may legitimately
+come back as text with no tool call at all (still one call — check `calls`).
 """
 
 from __future__ import annotations
@@ -69,6 +79,7 @@ class RunResult:
     text: str
     calls: int
     tool_rounds: int
+    to_first_output_ms: int | None
     to_first_token_ms: int | None
     to_final_text_ms: int | None
     rounds: list[RoundLog] = field(default_factory=list)
@@ -96,10 +107,12 @@ async def _one_run(
             provider = OpenAIProvider(model=model, reasoning_effort=effort)
             real_respond = provider.respond
 
-            async def counting_respond(system, history, tools, on_text_delta=None):
+            async def counting_respond(
+                system, history, tools, on_text_delta=None, on_output_delta=None
+            ):
                 nonlocal calls
                 calls += 1
-                res = await real_respond(system, history, tools, on_text_delta)
+                res = await real_respond(system, history, tools, on_text_delta, on_output_delta)
                 rounds.append(
                     RoundLog(
                         round=calls,
@@ -127,6 +140,7 @@ async def _one_run(
                     text=text,
                     calls=calls,
                     tool_rounds=t.get("tool_rounds", 0),
+                    to_first_output_ms=t.get("to_first_output_ms"),
                     to_first_token_ms=t.get("to_first_token_ms"),
                     to_final_text_ms=t.get("to_final_text_ms"),
                     rounds=rounds,
@@ -184,20 +198,24 @@ async def main(
                     print(
                         f"[{model}/{effort}] {prompt!r} -> {r.text!r} "
                         f"(calls={r.calls}, tool_rounds={r.tool_rounds}, "
+                        f"first_output={r.to_first_output_ms}ms, "
                         f"first_token={r.to_first_token_ms}ms, final={r.to_final_text_ms}ms)"
                         f"{flags}"
                     )
                     print(f"    {_fmt_rounds(r.rounds)}")
 
-    print("\n--- summary (median first-token / final-text latency per model+effort) ---")
+    # final_text is THE decision metric for this voice loop: Deepgram TTS
+    # can't start until the text is complete, so a faster first token buys
+    # nothing on its own (July 2026 — this is what picked effort "low").
+    print("\n--- summary (median latency per model+effort; DECIDE ON final_text) ---")
     for model in models:
         for effort in efforts:
             subset = [r for r in results if r.model == model and r.effort == effort]
-            ft = [r.to_first_token_ms for r in subset if r.to_first_token_ms is not None]
+            fo = [r.to_first_output_ms for r in subset if r.to_first_output_ms is not None]
             fin = [r.to_final_text_ms for r in subset if r.to_final_text_ms is not None]
             skipped = sum(1 for r in subset if r.calls == 1 and r.tool_rounds >= 1)
             print(
-                f"{model:16s} {effort:8s} first_token={_fmt_ms(ft):32s} "
+                f"{model:16s} {effort:8s} first_output={_fmt_ms(fo):32s} "
                 f"final_text={_fmt_ms(fin):32s} single-round-with-tools={skipped}/{len(subset)}"
             )
 

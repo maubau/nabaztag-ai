@@ -19,13 +19,17 @@ class FakeLLM:
         self.last_history = None
         self.last_tools = None
 
-    async def respond(self, system, history, tools, on_text_delta=None):
+    async def respond(self, system, history, tools, on_text_delta=None, on_output_delta=None):
         self.calls += 1
         self.last_history = list(history)
         self.last_tools = list(tools)
         if self._raises is not None:
             raise self._raises
         result = self._results.pop(0) if self._results else LLMResult(text="")
+        # a real provider signals first-output for tool arguments too, not
+        # just visible text (that's the whole point of on_output_delta)
+        if on_output_delta and (result.text or result.tool_calls):
+            on_output_delta()
         if on_text_delta and result.text:
             r = on_text_delta(result.text)
             if r is not None:
@@ -320,6 +324,21 @@ async def test_timings_recorded():
     assert t["to_request_ms"] is not None
     assert t["to_final_text_ms"] is not None
     assert t["to_audio_queued_ms"] is not None
+
+
+async def test_first_output_recorded_when_express_emits_no_visible_text():
+    """A turn answered through `express` streams only function-call argument
+    deltas — no visible text — so to_first_token_ms is legitimately None.
+    to_first_output_ms must still be populated, or the very turns we care
+    about most have no time-to-first-anything metric (hardware round, July
+    2026)."""
+    llm = FakeLLM(LLMResult(tool_calls=[tool_call("express", spoken_text="Ciao!")]))
+    agent = make_agent(llm, FakeSpeaker())
+    await agent.handle("ciao")
+    t = agent.last_timings.as_dict()
+    assert t["to_first_token_ms"] is None  # no visible text ever streamed
+    assert t["to_first_output_ms"] is not None
+    assert t["to_first_output_ms"] <= t["to_final_text_ms"]
 
 
 async def test_tts_checkpoints_break_down_audio_queued():

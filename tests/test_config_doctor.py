@@ -91,15 +91,17 @@ def test_custom_openai_model_is_not_touched():
 
 
 def test_stale_reasoning_effort_and_max_tokens_migrated():
+    # "none" came from a briefly-shipped example based on a confounded
+    # benchmark; the decisive A/B picked "low" (see config-doctor CHECKS)
     text = (
         "llm:\n  provider: openai\n  model: gpt-5.4-mini\n"
-        "  reasoning_effort: low\n  max_output_tokens: 220\n"
+        "  reasoning_effort: none\n  max_output_tokens: 220\n"
     )
     fixed, problems = doctor.diagnose(text, fix=True)
     joined = " ".join(problems)
     assert "llm.reasoning_effort" in joined and "llm.max_output_tokens" in joined
     cfg = yaml.safe_load(fixed)["llm"]
-    assert cfg["reasoning_effort"] == "none"
+    assert cfg["reasoning_effort"] == "low"
     assert cfg["max_output_tokens"] == 150
 
 
@@ -117,8 +119,14 @@ def test_deliberate_reasoning_effort_and_token_budget_not_touched():
     assert problems == []
 
 
+def test_current_reasoning_effort_not_flagged():
+    text = _BASELINE + "llm:\n  reasoning_effort: low\n  max_output_tokens: 150\n"
+    _fixed, problems = doctor.diagnose(text, fix=True)
+    assert problems == []
+
+
 def test_missing_reasoning_effort_and_max_tokens_is_fine():
-    # missing keys are fine — the code defaults already match (none, 150)
+    # missing keys are fine — the code defaults already match (low, 150)
     text = _BASELINE + "llm:\n  model: gpt-5.4-mini\n"
     _fixed, problems = doctor.diagnose(text, fix=True)
     assert problems == []

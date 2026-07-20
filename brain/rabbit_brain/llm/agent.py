@@ -41,11 +41,20 @@ class TurnTimings:
     tts_complete, all_submitted) — LLM-final vs TTS-synth vs OJN-submit were
     one opaque span before (hardware round, July 2026). The rabbit's actual
     GET is NOT observable here — cross-reference the Apache access log.
+
+    first_output vs first_token: `first_token` is the first VISIBLE text
+    delta, and is None for a turn answered through the `express` tool (the
+    reply travels in the function call's arguments, so no output_text.delta
+    ever fires). `first_output` covers both, so the model's real
+    time-to-first-anything stays measurable. Note that for THIS voice loop
+    final_text is the decision metric anyway — Deepgram TTS can't start until
+    the text is complete.
     """
 
     start: float
     request_sent: float | None = None
     first_token: float | None = None
+    first_output: float | None = None
     final_text: float | None = None
     audio_queued: float | None = None
     tool_rounds: int = 0
@@ -57,6 +66,7 @@ class TurnTimings:
 
         d: dict[str, int | None] = {
             "to_request_ms": ms(self.request_sent),
+            "to_first_output_ms": ms(self.first_output),
             "to_first_token_ms": ms(self.first_token),
             "to_final_text_ms": ms(self.final_text),
             "to_audio_queued_ms": ms(self.audio_queued),
@@ -118,11 +128,17 @@ class AgentLoop:
             if timings.first_token is None:
                 timings.first_token = time.monotonic()
 
+        def on_output() -> None:
+            if timings.first_output is None:
+                timings.first_output = time.monotonic()
+
         result = LLMResult()
         for round_i in range(self.config.max_tool_rounds + 1):
             if timings.request_sent is None:
                 timings.request_sent = time.monotonic()
-            result = await self.provider.respond(self.system_prompt, self._history, specs, on_delta)
+            result = await self.provider.respond(
+                self.system_prompt, self._history, specs, on_delta, on_output
+            )
             self._history.append(AssistantTurn(result.text, tuple(result.tool_calls)))
             if not result.tool_calls:
                 break

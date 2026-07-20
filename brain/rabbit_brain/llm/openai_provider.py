@@ -16,6 +16,7 @@ from .base import (
     LLMProvider,
     LLMResult,
     Message,
+    OutputDeltaCallback,
     TextDeltaCallback,
     ToolCall,
     ToolResult,
@@ -27,7 +28,11 @@ from .base import (
 log = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "gpt-5.4-mini"
-DEFAULT_MAX_OUTPUT_TOKENS = 300
+# Keep in step with config.example.yaml / make_llm_provider (150). Callers
+# that build a provider directly — brain/scripts/llm-bench.py — inherit this,
+# so a stale value here means the benchmark measures something the runtime
+# never runs.
+DEFAULT_MAX_OUTPUT_TOKENS = 150
 DEFAULT_TIMEOUT_S = 20.0
 
 
@@ -66,6 +71,7 @@ class OpenAIProvider(LLMProvider):
         history: Sequence[Message],
         tools: Sequence[ToolSpec],
         on_text_delta: TextDeltaCallback | None = None,
+        on_output_delta: OutputDeltaCallback | None = None,
     ) -> LLMResult:
         client = self._ensure_client()
         kwargs = {
@@ -81,7 +87,20 @@ class OpenAIProvider(LLMProvider):
 
         async with client.responses.stream(**kwargs) as stream:
             async for event in stream:
-                if getattr(event, "type", None) == "response.output_text.delta":
+                event_type = getattr(event, "type", None)
+                # A turn answered through `express` streams ONLY function-call
+                # argument deltas — no output_text.delta at all — so first
+                # OUTPUT and first visible TEXT are genuinely different events.
+                if (
+                    event_type
+                    in (
+                        "response.output_text.delta",
+                        "response.function_call_arguments.delta",
+                    )
+                    and on_output_delta is not None
+                ):
+                    on_output_delta()
+                if event_type == "response.output_text.delta":
                     delta = getattr(event, "delta", "")
                     if delta and on_text_delta is not None:
                         res = on_text_delta(delta)

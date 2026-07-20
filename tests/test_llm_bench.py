@@ -27,7 +27,7 @@ class FakeProvider:
         self.model = model
         self.reasoning_effort = reasoning_effort
 
-    async def respond(self, system, history, tools, on_text_delta=None):
+    async def respond(self, system, history, tools, on_text_delta=None, on_output_delta=None):
         return LLMResult(text=f"reply from {self.model}/{self.reasoning_effort}")
 
     async def aclose(self):
@@ -58,7 +58,7 @@ async def test_one_run_counts_a_follow_up_round(monkeypatch):
             super().__init__(model, reasoning_effort)
             self._n = 0
 
-        async def respond(self, system, history, tools, on_text_delta=None):
+        async def respond(self, system, history, tools, on_text_delta=None, on_output_delta=None):
             self._n += 1
             if self._n == 1:
                 return LLMResult(
@@ -83,7 +83,7 @@ async def test_violations_flag_wrong_call_count_and_empty_text(monkeypatch):
     assert "expected 2 call(s), got 1" in result.violations()
 
     class SilentProvider(FakeProvider):
-        async def respond(self, system, history, tools, on_text_delta=None):
+        async def respond(self, system, history, tools, on_text_delta=None, on_output_delta=None):
             return LLMResult(text="")
 
     monkeypatch.setattr(mod, "OpenAIProvider", SilentProvider)

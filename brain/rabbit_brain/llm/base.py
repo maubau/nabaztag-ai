@@ -78,6 +78,12 @@ class LLMResult:
 
 # Called with each text delta as it streams in (for first-sentence-fast TTS).
 TextDeltaCallback = Callable[[str], Awaitable[None] | None]
+# Called (no args) on the first streamed output of ANY kind — visible text OR
+# tool-call arguments. Needed because a turn answered through the `express`
+# tool emits no output_text.delta at all (the reply lives in the function
+# call's arguments), which left to_first_token_ms as None for exactly the
+# turns we most wanted to measure (hardware round, July 2026).
+OutputDeltaCallback = Callable[[], None]
 
 
 @runtime_checkable
@@ -88,7 +94,10 @@ class LLMProvider(Protocol):
         history: Sequence[Message],
         tools: Sequence[ToolSpec],
         on_text_delta: TextDeltaCallback | None = None,
+        on_output_delta: OutputDeltaCallback | None = None,
     ) -> LLMResult:
-        """Produce the next assistant turn from the history. Streams text via
-        on_text_delta if given; returns the full text and any tool calls."""
+        """Produce the next assistant turn from the history. Streams visible
+        text via on_text_delta if given, and signals the first output of any
+        kind (text or tool arguments) via on_output_delta; returns the full
+        text and any tool calls."""
         ...

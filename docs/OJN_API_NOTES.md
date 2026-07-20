@@ -248,6 +248,27 @@ Hardware half — status on the real rabbit:
     names + text length and flags two hard invariants (expected call count per prompt, spoken
     text never empty) instead of just latency numbers.
     Next: re-run the none-vs-low A/B now that `express` removes the confound, on hardware.
+18. **Decisive LLM A/B (July 2026, runtime 5d15ce2, 3 runs/scenario): gpt-5.4-mini +
+    `reasoning_effort: low`, 0 correctness violations.** mini/low median final_text 1615ms
+    (min 1203, max 3324) vs mini/none 2162ms (min 1045, max 2756) — low is ~547ms/25% faster on
+    the median. **final_text is THE metric for this voice loop**: Deepgram TTS cannot start
+    until the reply text is complete, so "none"'s faster first token buys nothing. This
+    REVERSES the provisional "none" from #17 (which came from the pre-`express`, confounded
+    run); config.example.yaml, `make_llm_provider`, `OpenAIProvider.DEFAULT_MAX_OUTPUT_TOKENS`
+    (was still 300 — llm-bench.py builds a provider directly, so it had been benchmarking a
+    token budget the runtime never used) and config-doctor were all realigned to low/150,
+    with the migration now running none→low.
+    `express` confirmed working on all three scenarios: plain greeting 1 call, greeting+ears
+    1 call, direction question 2 calls, spoken text never empty. `single-round-with-tools=5/9`
+    is correct, not a regression — a plain greeting can legitimately come back as text with no
+    tool call at all (still one call); the metric only counts runs that used tools.
+    Metric gap found and fixed: `to_first_token_ms` was None for every `express`-answered turn
+    (the reply is in the function call's arguments, so no `output_text.delta` ever fires). New
+    `to_first_output_ms` covers the first delta of ANY kind, text or tool arguments.
+    Personality: unprompted pet names ("tesoro", "piccolino", "piccola voce") read as affected
+    and repetitive — the system prompt now forbids terms of endearment outright.
+    Next: single-turn hardware run to measure the new OpenAI time and, above all, the residual
+    ~3-5s of Deepgram TTS (the per-phase timing log from #16 is already in place for that).
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 
