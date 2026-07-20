@@ -87,7 +87,12 @@ class AlsaCapture:
         channels: int = 6,
         selected_channel: int = 0,
         block_samples: int = DEFAULT_BLOCK_SAMPLES,
-        queue_blocks: int = 64,
+        # ~9.6 s of headroom at 32 ms/block (hardware round, July 2026: "capture
+        # queue full" fired repeatedly at the old 64-block/~2s buffer during
+        # agent+TTS+playback turns). Cheap (~6 KB/block raw 6ch) insurance
+        # against event-loop scheduling jitter while the pipeline's own drain
+        # (VoicePipeline._drain_frames/_drain_while_gated) is the real fix.
+        queue_blocks: int = 300,
     ):
         self._device = device
         self._sample_rate = sample_rate
@@ -96,6 +101,7 @@ class AlsaCapture:
         self._block_samples = block_samples
         self._queue_blocks = queue_blocks
         self._dropped = 0
+        self._started = False
 
     @property
     def sample_rate(self) -> int:
@@ -116,6 +122,16 @@ class AlsaCapture:
         return self._device
 
     async def frames(self) -> AsyncIterator[bytes]:
+        if self._started:
+            # Two live consumers would fight over the same ALSA device and
+            # each would starve the other's queue — always a bug, never a
+            # valid topology (only one process/pipeline may own the mic).
+            raise RuntimeError(
+                "AlsaCapture.frames() called twice — only one consumer may own "
+                "the microphone at a time"
+            )
+        self._started = True
+
         import sounddevice as sd  # optional dep: pip install 'rabbit-brain[audio]'
 
         loop = asyncio.get_running_loop()

@@ -248,6 +248,47 @@ async def test_mp3_server_storage_only_mode(tmp_path):
         await server.stop()
 
 
+async def test_speaker_reports_checkpoints_in_order(tmp_path):
+    server = Mp3Server(tmp_path, host="127.0.0.1", port=0)
+    await server.start()
+    try:
+        tts = FakeTTS(tmp_path)
+        controller = RecordingController()
+        speaker = Speaker(controller, tts, server)
+        seen = []
+        long_text = ("Questa è una frase piuttosto lunga sul coniglio. " * 4) + "Fine!"
+        await speaker.speak(long_text, on_checkpoint=seen.append)
+        assert seen == [
+            "tts_start",
+            "tts_first_chunk_ready",
+            "first_chunk_submitted",
+            "tts_complete",
+            "all_submitted",
+        ]
+    finally:
+        await server.stop()
+
+
+async def test_speaker_checkpoints_single_chunk(tmp_path):
+    server = Mp3Server(tmp_path, host="127.0.0.1", port=0)
+    await server.start()
+    try:
+        tts = FakeTTS(tmp_path)
+        controller = RecordingController()
+        speaker = Speaker(controller, tts, server)
+        seen = []
+        await speaker.speak("Ciao!", on_checkpoint=seen.append)
+        assert seen == [
+            "tts_start",
+            "tts_first_chunk_ready",
+            "first_chunk_submitted",
+            "tts_complete",
+            "all_submitted",
+        ]
+    finally:
+        await server.stop()
+
+
 async def test_speaker_routes_language_to_provider(tmp_path):
     server = Mp3Server(tmp_path, host="127.0.0.1", port=0)
     await server.start()
@@ -318,6 +359,116 @@ def test_make_tts_provider_deepgram_profile(tmp_path):
     assert isinstance(prov, DeepgramTTS)
     assert prov.voice_for("en") == "aura-2-orion-en"
     assert prov.voice_for("it") == "aura-2-livia-it"
+    assert prov._gain_db == 0.0  # off unless DEEPGRAM_TTS_GAIN_DB is set
+
+
+def test_make_tts_provider_deepgram_gain_from_env(tmp_path):
+    from rabbit_brain.tts import make_tts_provider
+
+    env = {"TTS_PROFILE": "deepgram", "DEEPGRAM_API_KEY": "k", "DEEPGRAM_TTS_GAIN_DB": "6"}
+    prov = make_tts_provider(tmp_path, env=env)
+    assert prov._gain_db == 6.0
+
+
+async def test_deepgram_tts_synth_skips_gain_when_zero(tmp_path, monkeypatch):
+    import asyncio
+
+    from rabbit_brain.tts.deepgram_tts import DeepgramTTS
+
+    async def boom(self, path):
+        raise AssertionError("ffmpeg must not run when gain_db is 0")
+
+    monkeypatch.setattr(DeepgramTTS, "_apply_gain", boom)
+    monkeypatch.setattr(DeepgramTTS, "_mp3_duration", staticmethod(lambda _p: 0.5))
+
+    from aiohttp import web
+
+    async def handler(_request: web.Request) -> web.Response:
+        return web.Response(body=b"fake-mp3", content_type="audio/mpeg")
+
+    app = web.Application()
+    app.router.add_post("/v1/speak", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        async with DeepgramTTS(
+            tmp_path, api_key="k", api_base=f"http://127.0.0.1:{port}/v1/speak", gain_db=0.0
+        ) as tts:
+            await tts.synth("Ciao")  # must not raise (would if _apply_gain ran)
+    finally:
+        await runner.cleanup()
+    await asyncio.sleep(0)  # let any stray task settle
+
+
+async def test_deepgram_tts_applies_gain_via_ffmpeg(tmp_path, monkeypatch):
+    import asyncio
+
+    from rabbit_brain.tts.deepgram_tts import DeepgramTTS
+
+    calls = []
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            (tmp_path / "x.gain.mp3").write_bytes(b"boosted")
+            return b"", b""
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    tts = DeepgramTTS(tmp_path, api_key="k", gain_db=6.0)
+    path = tmp_path / "x.mp3"
+    path.write_bytes(b"fake")
+    boosted = await tts._apply_gain(path)
+    assert boosted.name == "x.gain.mp3"
+    assert not path.exists()  # original replaced
+    assert "volume=6.0dB" in calls[0]
+
+
+async def test_deepgram_tts_gain_falls_back_on_ffmpeg_failure(tmp_path, monkeypatch):
+    import asyncio
+
+    from rabbit_brain.tts.deepgram_tts import DeepgramTTS
+
+    class FailingProc:
+        returncode = 1
+
+        async def communicate(self):
+            return b"", b"ffmpeg: error"
+
+    async def fake_exec(*args, **kwargs):
+        return FailingProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    tts = DeepgramTTS(tmp_path, api_key="k", gain_db=6.0)
+    path = tmp_path / "x.mp3"
+    path.write_bytes(b"fake")
+    result = await tts._apply_gain(path)
+    assert result == path  # unmodified file kept
+    assert path.exists()
+
+
+async def test_deepgram_tts_gain_falls_back_when_ffmpeg_missing(tmp_path, monkeypatch):
+    import asyncio
+
+    from rabbit_brain.tts.deepgram_tts import DeepgramTTS
+
+    async def fake_exec(*args, **kwargs):
+        raise FileNotFoundError("ffmpeg")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    tts = DeepgramTTS(tmp_path, api_key="k", gain_db=6.0)
+    path = tmp_path / "x.mp3"
+    path.write_bytes(b"fake")
+    result = await tts._apply_gain(path)
+    assert result == path
+    assert path.exists()
 
 
 def test_make_tts_provider_profiles(monkeypatch, tmp_path):

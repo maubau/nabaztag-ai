@@ -549,6 +549,89 @@ async def test_capture_drained_during_agent_processing():
         await asyncio.gather(run, return_exceptions=True)
 
 
+class PlayingGateController(FakeController):
+    """audio_busy becomes True as soon as a PlayAudioCommand is submitted, and
+    stays True for the next `gated_checks` reads — a real controller playing a
+    queued reply (submit -> _audio_pending -> current_playback -> guard)."""
+
+    def __init__(self, gated_checks: int):
+        super().__init__()
+        self._left = 0
+        self._gated_checks = gated_checks
+
+    async def submit(self, cmd, priority, deadline=None):
+        await super().submit(cmd, priority, deadline)
+        if isinstance(cmd, PlayAudioCommand):
+            self._left = self._gated_checks
+
+    @property
+    def audio_busy(self) -> bool:
+        if self._left > 0:
+            self._left -= 1
+            return True
+        return False
+
+
+async def test_playing_drain_and_state_transitions_logged(caplog):
+    """The PLAYING drain (not just PROCESSING) must keep consuming/discarding
+    capture frames, and every state transition must be logged (hardware
+    round, July 2026: drain worked during on_transcript but the real mic
+    still overflowed during/after playback)."""
+    import logging
+
+    controller = PlayingGateController(gated_checks=3)
+    wake = FakeWake(trigger_at=0)
+    capture = EndlessCapture([SILENCE, SPEECH, SPEECH, SPEECH] + [SILENCE] * 12)
+
+    async def on_transcript(text: str) -> None:
+        await controller.submit(
+            PlayAudioCommand(("http://192.168.66.1/brain-audio/x.mp3",), 0.2),
+            Priority.USER_SPEECH_SYNC,
+        )
+
+    pipeline = make_pipeline(capture, wake, controller, [], on_transcript=on_transcript)
+    with caplog.at_level(logging.INFO):
+        run = asyncio.create_task(pipeline.run())
+        try:
+            await wait_until(lambda: "REARMED" in caplog.text)
+        finally:
+            run.cancel()
+            await asyncio.gather(run, return_exceptions=True)
+    assert "pipeline state -> LISTENING" in caplog.text
+    assert "pipeline state -> PROCESSING" in caplog.text
+    assert "pipeline state -> PLAYING" in caplog.text
+    assert pipeline.frame_counts.get("playing", 0) >= 3
+
+
+async def test_frame_counts_tracked_per_state():
+    """Per-state consumed/discarded counters, as requested for hardware
+    diagnostics — not just an opaque 'it drained' boolean. _drain_frames only
+    tallies into frame_counts once its window closes, so release the agent
+    before checking (the counter isn't live-updated mid-drain)."""
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    capture = EndlessCapture([SILENCE, SPEECH, SPEECH, SPEECH] + [SILENCE] * 12)
+    controller = FakeController()
+    wake = FakeWake(trigger_at=0)
+
+    async def slow_on_transcript(text: str) -> None:
+        entered.set()
+        await release.wait()
+
+    pipeline = make_pipeline(capture, wake, controller, [], on_transcript=slow_on_transcript)
+    run = asyncio.create_task(pipeline.run())
+    try:
+        await wait_until(lambda: entered.is_set())
+        await asyncio.sleep(0.05)  # let some frames actually get discarded first
+        release.set()
+        await wait_until(lambda: pipeline.frame_counts.get("processing", 0) > 0)
+        assert pipeline.frame_counts.get("listening", 0) > 0
+    finally:
+        release.set()
+        run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
 async def test_gate_covers_queued_but_not_started_audio():
     # audio accepted by submit() but not yet in current_playback must gate the mic
     controller = FakeController()

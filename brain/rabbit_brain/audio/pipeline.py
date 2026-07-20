@@ -58,6 +58,14 @@ DEFAULT_WAKE_THRESHOLD = 0.5
 # wire (chor-interrupts-chor, probe #8). Roughly the ack's own duration.
 WAKE_ACK_RENDER_S = 0.5
 DEFAULT_DOA_TIMEOUT_S = 0.5  # a stalled DoA read must not freeze the feedback
+# Safety ceiling on the PLAYING drain: a runaway reply must not wedge the
+# pipeline forever if audio_busy ever gets stuck (hardware round, July 2026).
+PLAYING_DRAIN_TIMEOUT_S = 30.0
+# Bounded catch-up drain right before REARMED, in case anything is still
+# sitting in the queue at the PLAYING->REARMED boundary (scheduling jitter).
+# Small on purpose: on a live mic a frame is basically always "ready", so this
+# window is a deliberate fixed latency cost, not a backlog probe.
+FLUSH_TIMEOUT_S = 0.08
 
 _CLOSE = object()  # sentinel ending the STT chunk stream
 
@@ -144,6 +152,13 @@ class VoicePipeline:
         self.last_timings: WakeTimings | None = None  # last wake cycle, for diagnostics
         self.last_doa_deg: int | None = None  # last DoA angle, for get_direction() (§6.3)
         self.last_stt_language: str | None = None  # detected language of the last utterance
+        # Session-cumulative frame consumed/discarded counts per pipeline
+        # state, for hardware diagnostics (§6.2.7 capture-draining round).
+        self.frame_counts: dict[str, int] = {}
+
+    def _count(self, state: str, n: int) -> None:
+        if n:
+            self.frame_counts[state] = self.frame_counts.get(state, 0) + n
 
     # --- half-duplex gate (§6.2.7) --------------------------------------
 
@@ -170,11 +185,15 @@ class VoicePipeline:
                     return
                 if self._gated():
                     self._wake.reset()
+                    self._count("idle_discarded", 1)
                     continue
                 if self._wake.feed(frame) >= self._wake_threshold:
                     log.info("wake word detected")
                     await self._handle_wake(frames)
-                    self._wake.reset()
+                    # _handle_wake owns the reset: it must happen AFTER the
+                    # PLAYING drain + flush, not right when it returns to us
+                    # (which is the same instant, but the ordering is the
+                    # point — see the REARMED transition below).
         finally:
             await self.aclose()
 
@@ -188,6 +207,7 @@ class VoicePipeline:
 
     async def _handle_wake(self, frames: AsyncIterator[bytes]) -> None:
         timings = WakeTimings(wake=time.monotonic())
+        log.info("pipeline state -> LISTENING")
         self._controller.interrupt()
         if self._wake_beep is not None:
             # play on the rabbit at USER_SPEECH_SYNC so interrupt() won't drop
@@ -205,13 +225,18 @@ class VoicePipeline:
             end_of_speech.set()  # ensure the feedback stops on any exit path
             with contextlib.suppress(asyncio.CancelledError):
                 await feedback  # records scanner_stop_enqueued in its own finally
+        playing_dropped = 0
         if result is not None and result.text:
             self.last_stt_language = getattr(result, "language", None)
-            # ALSA must keep being consumed while the agent/TTS run, or the
-            # capture queue backs up ("capture queue full") and stale audio can
-            # fake a second wake. Drain and DISCARD mic frames for the whole
-            # processing window; the wake detector is reset afterwards, and the
-            # gate (audio_busy) keeps it silent through playback + guard.
+            # ALSA must keep being consumed for the ENTIRE processing+playback
+            # window, or the capture queue backs up ("capture queue full") and
+            # stale/echoed audio can fake a second wake (hardware round, July
+            # 2026: draining only during on_transcript wasn't enough — the
+            # capture blocked again during/after playback). One continuous
+            # drain chain, no seams: PROCESSING (LLM+TTS synth) -> PLAYING
+            # (queued/playing audio incl. the half-duplex guard) -> a bounded
+            # FLUSH -> REARMED (wake detector reset).
+            log.info("pipeline state -> PROCESSING")
             done = asyncio.Event()
 
             async def process() -> None:
@@ -221,14 +246,25 @@ class VoicePipeline:
                     done.set()
 
             proc = asyncio.create_task(process())
-            dropped = await self._drain_frames(frames, done)
+            processing_dropped = await self._drain_frames(frames, done, state="processing")
             await proc
-            if dropped:
-                log.debug("discarded %d stale mic frames during agent processing", dropped)
+
+            log.info("pipeline state -> PLAYING (processing discarded=%d)", processing_dropped)
+            playing_dropped = await self._drain_while_gated(frames, state="playing")
+
+        flushed = await self._flush_residual(frames)
+        self._wake.reset()
+        log.info(
+            "pipeline state -> REARMED (playing discarded=%d, flushed=%d)",
+            playing_dropped,
+            flushed,
+        )
         self.last_timings = timings
         log.info("wake cycle timings: %s", timings.as_dict())
 
-    async def _drain_frames(self, frames: AsyncIterator[bytes], until: asyncio.Event) -> int:
+    async def _drain_frames(
+        self, frames: AsyncIterator[bytes], until: asyncio.Event, state: str
+    ) -> int:
         """Consume and discard capture frames until `until` fires (returns the
         count). Keeps the ALSA queue empty while something else has the floor."""
         dropped = 0
@@ -238,6 +274,52 @@ class VoicePipeline:
             except StopAsyncIteration:
                 break
             dropped += 1
+        self._count(state, dropped)
+        return dropped
+
+    async def _drain_while_gated(
+        self, frames: AsyncIterator[bytes], state: str, timeout_s: float = PLAYING_DRAIN_TIMEOUT_S
+    ) -> int:
+        """Consume and discard frames while the half-duplex gate holds (queued
+        audio + current playback + guard — BodyController.audio_busy). Bounded
+        so a stuck audio_busy can never wedge the pipeline forever."""
+        dropped = 0
+        deadline = time.monotonic() + timeout_s
+        while self._gated():
+            if time.monotonic() > deadline:
+                log.warning("%s drain exceeded %.0fs, forcing rearm", state, timeout_s)
+                break
+            try:
+                await anext(frames)
+            except StopAsyncIteration:
+                break
+            dropped += 1
+        self._count(state, dropped)
+        return dropped
+
+    async def _flush_residual(
+        self, frames: AsyncIterator[bytes], timeout_s: float = FLUSH_TIMEOUT_S
+    ) -> int:
+        """Explicit bounded catch-up drain right before REARMED: whatever is
+        already sitting in the capture queue at this instant gets discarded
+        too, so no stale block survives into the next wake-listening window.
+
+        Deliberately does NOT wrap anext() in asyncio.wait_for: cancelling an
+        in-flight anext() on timeout throws CancelledError into the capture
+        async generator, which — since it doesn't catch it — closes the
+        generator for good (any later anext() on it then raises
+        StopAsyncIteration immediately, silently ending the whole pipeline).
+        The deadline is only checked BETWEEN pulls.
+        """
+        dropped = 0
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                await anext(frames)
+            except StopAsyncIteration:
+                break
+            dropped += 1
+        self._count("flush", dropped)
         return dropped
 
     # --- body feedback (single sequential task, choreography-only) ------
@@ -351,6 +433,7 @@ class VoicePipeline:
                     frame = await anext(frames)
                 except StopAsyncIteration:
                     break
+                self._count("listening", 1)
                 # half-duplex (§6.2.7): while the rabbit is playing — the wake
                 # beep or a prior TTS reply — drop mic frames so we don't hear
                 # ourselves (no AEC). Ties the beep's guard to the real playback

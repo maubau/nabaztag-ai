@@ -16,8 +16,30 @@
 #   NABAZTAG_MP3_BASE_URL=http://192.168.66.1/brain-audio
 #   NABAZTAG_MP3_SERVE_HTTP=0
 #
-# Apache (www-data) needs read access to the audio dir:
-#   chmod 755 __REPO_DIR__ __REPO_DIR__/www __REPO_DIR__/www/audio
+# PERMISSIONS (hardware-confirmed, July 2026): chmod alone on __REPO_DIR__
+# and www/audio is NOT enough and gives HTTP 403 — www-data also needs
+# TRAVERSAL (+x) on every parent directory up to the home dir, which chmod
+# 755 on the repo itself does not grant. Apache's own user (www-data) has no
+# group in common with the account the repo lives under, so a plain chmod/
+# chgrp dance means either loosening the whole home directory or an ACL.
+# ACL is the confirmed fix — grants www-data exactly +x on the path and +rX
+# on the audio tree, nothing else in the home directory:
+#   sudo setfacl -m u:www-data:--x /home/<user>
+#   sudo setfacl -m u:www-data:--x /home/<user>/nabaztag-ai
+#   sudo setfacl -R -m u:www-data:rX __REPO_DIR__/www
+#   sudo setfacl -R -d -m u:www-data:rX __REPO_DIR__/www/audio   # default ACL: new TTS files inherit it
+# (requires an ACL-capable filesystem — ext4/xfs default-mounted with acl
+# support on Ubuntu; `getfacl __REPO_DIR__/www/audio` to verify.)
+#
+# ALTERNATIVE for the eventual systemd deploy: move the audio dir out of the
+# home directory entirely so it never depends on home permissions at all —
+#   sudo install -d -o <user> -g www-data -m 2775 /var/lib/nabaztag/audio
+# then set NABAZTAG_AUDIO_DIR=/var/lib/nabaztag/audio in .env and repoint the
+# Alias/Directory below at it. setgid (2775) makes every file the runtime
+# writes inherit the www-data group automatically, no ACL needed. Not done by
+# default yet — the ACL fix above is what's hardware-confirmed working with
+# the current www/audio-under-repo layout; revisit when the systemd unit
+# (deploy/nabaztag-runtime.service) is actually enabled.
 
 Alias /brain-audio/ __REPO_DIR__/www/audio/
 <Directory __REPO_DIR__/www/audio/>

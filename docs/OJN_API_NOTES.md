@@ -149,8 +149,12 @@ Hardware half — status on the real rabbit:
     response the old HTTP/1.0 MTL client gets from aiohttp. Resolution: rabbit-facing audio
     is delivered by Apache via a dedicated alias (`ojn/apache/brain-audio.conf.example`,
     `Alias /brain-audio/ → www/audio/`); the brain's Mp3Server runs storage-only
-    (`NABAZTAG_MP3_SERVE_HTTP=0`, `NABAZTAG_MP3_BASE_URL=http://192.168.66.1/brain-audio`),
-    keeping the audio dir, retention purge, protected assets and URL building.
+    (`NABAZTAG_MP3_SERVE_HTTP=0`, `NABAZTAG_MP3_BASE_URL=http://192.168.66.1/brain-audio`).
+    Addendum (hardware round, July 2026): the alias alone 403s — `chmod` on the repo/audio dir
+    is not enough because www-data also needs +x traversal on every parent directory up to the
+    home dir. Fixed with a targeted ACL (`setfacl -m u:www-data:--x` on the home + repo dirs,
+    `setfacl -R -m u:www-data:rX` + a default ACL on `www/audio`); commands are in the conf
+    example. Confirmed end-to-end: Deepgram Aura → Apache → Nabaztag speaker, hardware.
 13. **OPEN — XMPP connection can wedge with a persistent Send-Q.** After a test session the
     rabbit's XMPP socket sat ESTAB with Send-Q≈846 stuck bytes: OJN kept answering CHORSENT
     but the rabbit no longer fetched `.chor` files. Restarting the OJN container did NOT make
@@ -158,6 +162,21 @@ Hardware half — status on the real rabbit:
     until reboot). Ideas: a health check watching `ss` for a non-draining Send-Q on :5222
     and/or the age of the last `.chor`/audio GET in the Apache log, alerting (or restarting
     OJN + prompting a power cycle); the bootcode's own reconnect behavior is out of our reach.
+14. **Capture draining held up through on_transcript but the real XVF3800 still logged
+    "capture queue full, dropping blocks" during/after playback (hardware round, July 2026,
+    runtime a4fd7f7).** Static review of the drain chain (LISTENING → PROCESSING → PLAYING →
+    REARMED, `VoicePipeline._handle_wake`) found no gap where the mic iterator goes
+    unconsumed — `_drain_frames`/the run() loop both call `anext()` every step — so the
+    residual stall (block=32ms, old queue=64 blocks/~2s buffer; hundreds of drops implies
+    several seconds of non-consumption) was not reproduced from the code alone. Response:
+    (a) the PROCESSING/PLAYING drain was consolidated into one continuous, instrumented chain
+    with an explicit bounded flush before rearm and per-state frame counters + transition logs
+    (`pipeline state -> LISTENING/PROCESSING/PLAYING/REARMED`), so the next hardware run pins
+    down exactly where any remaining stall sits; (b) `AlsaCapture`'s buffer was bumped
+    64→300 blocks (~2s→~9.6s, ~1.6 MB) as cheap insurance against event-loop scheduling
+    jitter, independent of the root cause; (c) `AlsaCapture.frames()` now raises if called
+    twice (single-consumer enforcement, was already true structurally but is now enforced).
+    Needs a hardware re-test with the new logs to confirm resolved or to localize further.
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 

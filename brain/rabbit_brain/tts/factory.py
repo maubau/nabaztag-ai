@@ -33,6 +33,7 @@ def make_tts_provider(
             api_key=env.get("DEEPGRAM_API_KEY"),  # None → provider reads env itself
             voice_it=env.get("DEEPGRAM_TTS_VOICE_IT", "aura-2-livia-it"),
             voice_en=env.get("DEEPGRAM_TTS_VOICE_EN", "aura-2-thalia-en"),
+            gain_db=float(env.get("DEEPGRAM_TTS_GAIN_DB", "0") or 0),
         )
     if profile == "elevenlabs":
         from .elevenlabs_tts import ElevenLabsTTS

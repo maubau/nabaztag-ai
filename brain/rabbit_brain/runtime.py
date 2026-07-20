@@ -83,6 +83,9 @@ def load_env_file(path: str | Path) -> int:
 
 
 def _capture_from_config(audio_cfg: dict) -> AlsaCapture:
+    kwargs = {}
+    if "capture_queue_blocks" in audio_cfg:
+        kwargs["queue_blocks"] = audio_cfg["capture_queue_blocks"]
     return AlsaCapture(
         device=audio_cfg.get(
             "capture_device_index", audio_cfg.get("capture_device", "hw:CARD=C16K6Ch,DEV=0")
@@ -90,6 +93,7 @@ def _capture_from_config(audio_cfg: dict) -> AlsaCapture:
         sample_rate=audio_cfg.get("sample_rate", 16_000),
         channels=audio_cfg.get("channels", 6),
         selected_channel=audio_cfg.get("selected_channel", 0),
+        **kwargs,
     )
 
 

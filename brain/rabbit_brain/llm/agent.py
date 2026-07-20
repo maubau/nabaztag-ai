@@ -34,7 +34,14 @@ class AgentConfig:
 class TurnTimings:
     """Monotonic diagnostics for one conversational turn, measured from the
     moment the transcript is ready (≈ STT final; the pipeline's WakeTimings
-    covers wake→STT). No request/response content is recorded."""
+    covers wake→STT). No request/response content is recorded.
+
+    tts_checkpoints breaks "transcript -> audio queued" into named markers
+    from Speaker.speak (tts_start, tts_first_chunk_ready, first_chunk_submitted,
+    tts_complete, all_submitted) — LLM-final vs TTS-synth vs OJN-submit were
+    one opaque span before (hardware round, July 2026). The rabbit's actual
+    GET is NOT observable here — cross-reference the Apache access log.
+    """
 
     start: float
     request_sent: float | None = None
@@ -42,18 +49,22 @@ class TurnTimings:
     final_text: float | None = None
     audio_queued: float | None = None
     tool_rounds: int = 0
+    tts_checkpoints: dict[str, float] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, int | None]:
         def ms(t: float | None) -> int | None:
             return None if t is None else round((t - self.start) * 1000)
 
-        return {
+        d: dict[str, int | None] = {
             "to_request_ms": ms(self.request_sent),
             "to_first_token_ms": ms(self.first_token),
             "to_final_text_ms": ms(self.final_text),
             "to_audio_queued_ms": ms(self.audio_queued),
             "tool_rounds": self.tool_rounds,
         }
+        for name, t in self.tts_checkpoints.items():
+            d[f"to_{name}_ms"] = ms(t)
+        return d
 
 
 @dataclass
@@ -83,7 +94,14 @@ class AgentLoop:
         text = result.text.strip()
         if text and self.speaker is not None:
             try:
-                await self.speaker.speak(text, Priority.USER_SPEECH_SYNC, language=language)
+                await self.speaker.speak(
+                    text,
+                    Priority.USER_SPEECH_SYNC,
+                    language=language,
+                    on_checkpoint=lambda name: timings.tts_checkpoints.setdefault(
+                        name, time.monotonic()
+                    ),
+                )
                 timings.audio_queued = time.monotonic()
             except Exception:
                 log.exception("TTS/playback failed; recovering")

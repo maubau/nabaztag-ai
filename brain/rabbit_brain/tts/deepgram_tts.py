@@ -6,10 +6,20 @@ from the STT's own detection (STTResult.language), routed through
 Speaker/AgentLoop — never guessed from the text. Output is MP3 with the real
 duration measured (mutagen), like the other providers. DEEPGRAM_API_KEY comes
 from the environment and is never logged.
+
+Optional gain (hardware round, July 2026: voice quality good, volume a touch
+low): Aura's /v1/speak has no volume/gain request parameter, so a configured
+gain_db is applied as a post-processing pass through ffmpeg (already a system
+dependency for the piper profile). Off by default (gain_db=0) — zero behavior
+change unless DEEPGRAM_TTS_GAIN_DB is set, and a failed/missing ffmpeg falls
+back to the unmodified file rather than breaking TTS.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -17,6 +27,8 @@ from pathlib import Path
 import aiohttp
 
 from .base import TTSResult
+
+log = logging.getLogger(__name__)
 
 API_BASE = "https://api.deepgram.com/v1/speak"
 DEFAULT_VOICE_IT = "aura-2-livia-it"
@@ -35,6 +47,7 @@ class DeepgramTTS:
         timeout_s: float = DEFAULT_TIMEOUT_S,
         api_base: str = API_BASE,
         session: aiohttp.ClientSession | None = None,
+        gain_db: float = 0.0,
     ):
         self._audio_dir = Path(audio_dir)
         self._audio_dir.mkdir(parents=True, exist_ok=True)
@@ -46,6 +59,7 @@ class DeepgramTTS:
         self._api_base = api_base
         self._session = session
         self._own_session = session is None
+        self._gain_db = gain_db
 
     def voice_for(self, language: str | None) -> str:
         """Voice by utterance language ("it"/"en", region tags tolerated)."""
@@ -83,7 +97,41 @@ class DeepgramTTS:
             data = await resp.read()
         path = self._audio_dir / f"{uuid.uuid4().hex}.mp3"
         path.write_bytes(data)
+        if self._gain_db:
+            path = await self._apply_gain(path)
         return TTSResult(path=path, duration_s=self._mp3_duration(path))
+
+    async def _apply_gain(self, path: Path) -> Path:
+        boosted = path.with_suffix(".gain.mp3")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                str(path),
+                "-filter:a",
+                f"volume={self._gain_db}dB",
+                "-codec:a",
+                "libmp3lame",
+                str(boosted),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+        except FileNotFoundError:
+            log.warning("DEEPGRAM_TTS_GAIN_DB set but ffmpeg is not installed; unboosted audio")
+            return path
+        if proc.returncode != 0:
+            log.warning(
+                "Deepgram TTS gain (ffmpeg) failed, using unboosted audio: %s",
+                stderr.decode(errors="replace")[:200],
+            )
+            return path
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(path)  # os, not Path.unlink — ASYNC240 flags blocking Path I/O
+        return boosted
 
     @staticmethod
     def _mp3_duration(path: Path) -> float:

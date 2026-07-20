@@ -2,7 +2,29 @@ import array
 import wave
 
 import pytest
-from rabbit_brain.audio.capture import WavCapture, extract_channel, resolve_input_device
+from rabbit_brain.audio.capture import (
+    AlsaCapture,
+    WavCapture,
+    extract_channel,
+    resolve_input_device,
+)
+
+
+def test_alsa_capture_default_queue_blocks_has_headroom():
+    # ~9.6s @ 32ms/block (hardware round, July 2026: the old 64-block/~2s
+    # buffer overflowed under real agent+TTS+playback turns).
+    assert AlsaCapture()._queue_blocks == 300
+
+
+async def test_alsa_capture_frames_rejects_a_second_consumer():
+    """Two live consumers would fight over the same ALSA device; the guard
+    fires before ever touching sounddevice (the check runs first in
+    frames())."""
+    capture = AlsaCapture()
+    capture._started = True  # simulate an already-running consumer
+    gen = capture.frames()
+    with pytest.raises(RuntimeError, match="only one consumer"):
+        await anext(gen)
 
 
 def make_multichannel_wav(path, channels=6, sample_rate=16_000, frames=2048):

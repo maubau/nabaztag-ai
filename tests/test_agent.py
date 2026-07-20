@@ -39,11 +39,14 @@ class FakeSpeaker:
         self.languages = []
         self._raises = raises
 
-    async def speak(self, text, priority=None, language=None):
+    async def speak(self, text, priority=None, language=None, on_checkpoint=None):
         if self._raises is not None:
             raise self._raises
         self.spoken.append(text)
         self.languages.append(language)
+        if on_checkpoint is not None:
+            for name in ("tts_start", "tts_first_chunk_ready", "tts_complete", "all_submitted"):
+                on_checkpoint(name)
         return 1.5
 
 
@@ -212,6 +215,18 @@ async def test_timings_recorded():
     assert t["to_request_ms"] is not None
     assert t["to_final_text_ms"] is not None
     assert t["to_audio_queued_ms"] is not None
+
+
+async def test_tts_checkpoints_break_down_audio_queued():
+    """LLM-final vs TTS-synth vs OJN-submit must be separable, not one opaque
+    'audio queued' span (hardware round, July 2026: 5.1-9.2s transcript ->
+    audio queued with no way to tell where the time went)."""
+    agent = make_agent(FakeLLM(LLMResult(text="ok")), FakeSpeaker())
+    await agent.handle("ciao")
+    t = agent.last_timings.as_dict()
+    for name in ("tts_start", "tts_first_chunk_ready", "tts_complete", "all_submitted"):
+        assert t[f"to_{name}_ms"] is not None
+    assert t["to_tts_start_ms"] <= t["to_all_submitted_ms"]
 
 
 async def test_agent_expression_never_hits_posleft_posright(controller, mock_ojn):
