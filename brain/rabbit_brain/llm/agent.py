@@ -9,6 +9,7 @@ for the next wake word; API keys and request content are never logged.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -59,6 +60,13 @@ class TurnTimings:
     audio_queued: float | None = None
     tool_rounds: int = 0
     tts_checkpoints: dict[str, float] = field(default_factory=dict)
+    # input-size diagnostics (latency Gate L2): how much schema we ship every
+    # turn, and what the provider says it cost. Counts only — no content.
+    tool_schema_count: int | None = None
+    tool_schema_chars: int | None = None
+    input_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    output_tokens: int | None = None
 
     def as_dict(self) -> dict[str, int | None]:
         def ms(t: float | None) -> int | None:
@@ -71,6 +79,11 @@ class TurnTimings:
             "to_final_text_ms": ms(self.final_text),
             "to_audio_queued_ms": ms(self.audio_queued),
             "tool_rounds": self.tool_rounds,
+            "tool_schema_count": self.tool_schema_count,
+            "tool_schema_chars": self.tool_schema_chars,
+            "input_tokens": self.input_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
+            "output_tokens": self.output_tokens,
         }
         for name, t in self.tts_checkpoints.items():
             d[f"to_{name}_ms"] = ms(t)
@@ -123,6 +136,10 @@ class AgentLoop:
     async def _run_rounds(self, timings: TurnTimings) -> LLMResult:
         specs = self.tools.specs()
         informational = {s.name for s in specs if s.informational}
+        timings.tool_schema_count = len(specs)
+        timings.tool_schema_chars = sum(
+            len(s.name) + len(s.description) + len(json.dumps(s.parameters)) for s in specs
+        )
 
         def on_delta(_delta: str) -> None:
             if timings.first_token is None:
@@ -139,6 +156,12 @@ class AgentLoop:
             result = await self.provider.respond(
                 self.system_prompt, self._history, specs, on_delta, on_output
             )
+            # summed across rounds: a turn that needs a follow-up round pays
+            # the input cost twice, which is exactly what Gate L2 is about
+            for attr in ("input_tokens", "cached_input_tokens", "output_tokens"):
+                value = getattr(result, attr)
+                if value is not None:
+                    setattr(timings, attr, (getattr(timings, attr) or 0) + value)
             self._history.append(AssistantTurn(result.text, tuple(result.tool_calls)))
             if not result.tool_calls:
                 break

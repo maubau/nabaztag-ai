@@ -12,7 +12,7 @@ import logging
 import time
 from collections.abc import AsyncIterator
 
-from .base import STTResult, drain
+from .base import EndOfTurnCallback, STTResult, drain
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +33,13 @@ class LocalWhisperSTT:
             self._model = WhisperModel(self._model_name, compute_type=self._compute_type)
         return self._model
 
-    async def transcribe(self, chunks: AsyncIterator[bytes], sample_rate: int) -> STTResult:
+    async def transcribe(
+        self,
+        chunks: AsyncIterator[bytes],
+        sample_rate: int,
+        on_end_of_turn: EndOfTurnCallback | None = None,
+    ) -> STTResult:
+        del on_end_of_turn  # buffered provider: the caller closes the stream
         pcm = await drain(chunks)
         audio_s = len(pcm) / 2 / sample_rate
         start = time.monotonic()

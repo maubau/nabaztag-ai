@@ -58,6 +58,14 @@ DEFAULT_WAKE_THRESHOLD = 0.5
 # wire (chor-interrupts-chor, probe #8). Roughly the ack's own duration.
 WAKE_ACK_RENDER_S = 0.5
 DEFAULT_DOA_TIMEOUT_S = 0.5  # a stalled DoA read must not freeze the feedback
+# Client-side ceiling on a provider-endpointed turn (Flux): if EndOfTurn never
+# arrives — silence after the wake word, or a wedged socket — abandon the turn
+# and re-arm cleanly rather than holding the pipeline open (latency Gate L1).
+DEFAULT_TURN_TIMEOUT_S = 15.0
+# How long the PROCESSING indicator may wait for playback to actually begin
+# after the reply was queued (OJN round-trip). Bounded so a lost/failed
+# playback can never leave the LEDs pulsing.
+PLAYBACK_START_TIMEOUT_S = 5.0
 # Safety ceiling on the PLAYING drain: a runaway reply must not wedge the
 # pipeline forever if audio_busy ever gets stuck (hardware round, July 2026).
 PLAYING_DRAIN_TIMEOUT_S = 30.0
@@ -87,22 +95,51 @@ class WakeTimings:
     end_of_speech: float | None = None
     stt_final: float | None = None
     scanner_stop_enqueued: float | None = None
+    # --- provider-side endpointing (Flux; None on the nova-3+Silero path) ---
+    # when Flux said the turn ended, and (diagnostics only, never acted on
+    # this round) when it first speculated it had
+    end_of_turn: float | None = None
+    eager_end_of_turn: float | None = None
+    # when the transcript was handed to the agent — closes the gap between
+    # "provider said the turn ended" and "the LLM request goes out"
+    llm_dispatched: float | None = None
+    # when we began feeding audio to the provider, so its own audio cursor
+    # can be placed on our wall clock
+    stream_start: float | None = None
+    # the provider's OWN audio cursor at end of speech (seconds into the
+    # stream): stream_start + audio_cursor_s ≈ the instant the user really
+    # stopped talking, which is what Gate L1's headline metric measures from.
+    audio_cursor_s: float | None = None
+    end_of_turn_confidence: float | None = None
+    language: str | None = None
 
-    def as_dict(self) -> dict[str, int | None]:
+    def as_dict(self) -> dict[str, int | float | str | None]:
         def ms(t: float | None) -> int | None:
             return None if t is None else round((t - self.wake) * 1000)
 
-        endpointing = (
+        def span(a: float | None, b: float | None) -> int | None:
+            return None if a is None or b is None else round((b - a) * 1000)
+
+        # The real Gate L1 number: from the user actually falling silent (the
+        # provider's own audio cursor, not our VAD's opinion) to EndOfTurn.
+        speech_end = (
             None
-            if self.stt_final is None or self.end_of_speech is None
-            else round((self.stt_final - self.end_of_speech) * 1000)
+            if self.stream_start is None or self.audio_cursor_s is None
+            else self.stream_start + self.audio_cursor_s
         )
         return {
             "wake_to_speech_ms": ms(self.speech_start),
             "wake_to_eos_ms": ms(self.end_of_speech),
             "wake_to_stt_final_ms": ms(self.stt_final),
             "wake_to_scanner_stop_enqueued_ms": ms(self.scanner_stop_enqueued),
-            "stt_endpointing_ms": endpointing,
+            "stt_endpointing_ms": span(self.end_of_speech, self.stt_final),
+            "wake_to_end_of_turn_ms": ms(self.end_of_turn),
+            "speech_end_to_end_of_turn_ms": span(speech_end, self.end_of_turn),
+            "eager_to_end_of_turn_ms": span(self.eager_end_of_turn, self.end_of_turn),
+            "end_of_turn_to_llm_ms": span(self.end_of_turn, self.llm_dispatched),
+            "last_speech_audio_cursor_s": self.audio_cursor_s,
+            "end_of_turn_confidence": self.end_of_turn_confidence,
+            "language": self.language,
         }
 
 
@@ -124,6 +161,7 @@ class VoicePipeline:
         ack_render_s: float = WAKE_ACK_RENDER_S,
         listening_cycle_s: float = LISTENING_CYCLE_S,
         doa_timeout_s: float = DEFAULT_DOA_TIMEOUT_S,
+        turn_timeout_s: float = DEFAULT_TURN_TIMEOUT_S,
     ):
         self._capture = capture
         self._wake = wake
@@ -146,6 +184,7 @@ class VoicePipeline:
         self._ack_render_s = ack_render_s
         self._listening_cycle_s = listening_cycle_s
         self._doa_timeout_s = doa_timeout_s
+        self._turn_timeout_s = turn_timeout_s
 
         self._feedback_tasks: set[asyncio.Task] = set()
         self.doa_reads = 0  # diagnostics/tests: periodic DoA reads during LISTENING
@@ -228,6 +267,8 @@ class VoicePipeline:
         playing_dropped = 0
         if result is not None and result.text:
             self.last_stt_language = getattr(result, "language", None)
+            timings.language = self.last_stt_language
+            timings.llm_dispatched = time.monotonic()  # EndOfTurn → LLM request
             # ALSA must keep being consumed for the ENTIRE processing+playback
             # window, or the capture queue backs up ("capture queue full") and
             # stale/echoed audio can fake a second wake (hardware round, July
@@ -386,6 +427,14 @@ class VoicePipeline:
             timings.scanner_stop_enqueued = time.monotonic()
 
     async def _process_transcript(self, text: str) -> None:
+        """Run the agent turn, optionally showing the PROCESSING indicator.
+
+        The indicator covers the whole "thinking" gap the user would otherwise
+        experience as dead air — from end-of-turn until the rabbit ACTUALLY
+        starts speaking, not merely until the audio was queued. on_transcript
+        returns once the MP3 is submitted; playback only begins after the OJN
+        round-trip, so we wait (bounded) for the controller to report it.
+        """
         if not self._processing_indicator:
             await self._on_transcript(text)
             return
@@ -404,18 +453,26 @@ class VoicePipeline:
         task = self._spawn(pulse(), self._feedback_tasks)
         try:
             await self._on_transcript(text)
+            await self._wait_for_playback_start()
         finally:
             stop.set()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
+    async def _wait_for_playback_start(self) -> None:
+        """Bounded wait until the reply is actually playing. Returns at once if
+        nothing was queued (a silent turn) — the indicator must not linger."""
+        if not self._gated():
+            return  # nothing queued or playing: nothing to wait for
+        deadline = time.monotonic() + PLAYBACK_START_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if self._controller.current_playback is not None:
+                return
+            await asyncio.sleep(0.02)
+
     # --- capture → VAD → STT (independent of the feedback task) ----------
 
-    async def _record_and_transcribe(
-        self, frames: AsyncIterator[bytes], end_of_speech: asyncio.Event, timings: WakeTimings
-    ) -> STTResult | None:
-        sr = self._capture.sample_rate
-        recorder = UtteranceRecorder(self._probe_factory(), sample_rate=sr, **self._recorder_kwargs)
+    def _open_chunk_stream(self) -> tuple[asyncio.Queue, AsyncIterator[bytes]]:
         queue: asyncio.Queue[bytes | object] = asyncio.Queue()
 
         async def chunk_stream() -> AsyncIterator[bytes]:
@@ -426,7 +483,92 @@ class VoicePipeline:
                 assert isinstance(item, bytes)
                 yield item
 
-        stt_task = asyncio.create_task(self._stt.transcribe(chunk_stream(), sr))
+        return queue, chunk_stream()
+
+    async def _record_and_transcribe(
+        self, frames: AsyncIterator[bytes], end_of_speech: asyncio.Event, timings: WakeTimings
+    ) -> STTResult | None:
+        """Dispatch on WHO decides the turn ended (stt/base.py):
+        provider-side (Flux) keeps the stream open until the provider says so;
+        client-side (nova-3 + Silero) closes it from the local VAD."""
+        if getattr(self._stt, "detects_end_of_turn", False):
+            return await self._record_provider_endpointed(frames, end_of_speech, timings)
+        return await self._record_vad_endpointed(frames, end_of_speech, timings)
+
+    async def _record_provider_endpointed(
+        self, frames: AsyncIterator[bytes], end_of_speech: asyncio.Event, timings: WakeTimings
+    ) -> STTResult | None:
+        """Deepgram Flux: no local silence window at all. Frames keep flowing
+        until the PROVIDER reports EndOfTurn; that callback stops the LISTENING
+        feedback immediately, so the LEDs track the real end of speech instead
+        of a 1600 ms local timeout (latency Gate L1)."""
+        sr = self._capture.sample_rate
+        queue, chunk_stream = self._open_chunk_stream()
+
+        def on_end_of_turn(_text: str) -> None:
+            now = time.monotonic()
+            timings.end_of_turn = now
+            timings.end_of_speech = now  # same instant on this path
+            end_of_speech.set()  # stop LISTENING right here, before the await
+
+        stt_task = asyncio.create_task(
+            self._stt.transcribe(chunk_stream, sr, on_end_of_turn=on_end_of_turn)
+        )
+        timings.stream_start = time.monotonic()
+        deadline = timings.stream_start + self._turn_timeout_s
+        try:
+            while not stt_task.done():
+                if time.monotonic() > deadline:
+                    log.warning(
+                        "no EndOfTurn within %.0fs, abandoning the turn", self._turn_timeout_s
+                    )
+                    stt_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await stt_task
+                    return None
+                try:
+                    frame = await anext(frames)
+                except StopAsyncIteration:
+                    break
+                self._count("listening", 1)
+                # half-duplex (§6.2.7) unchanged: never feed the provider audio
+                # of the rabbit's own voice.
+                if self._gated():
+                    continue
+                queue.put_nowait(frame)
+            queue.put_nowait(_CLOSE)
+            result = await stt_task
+            timings.stt_final = time.monotonic()
+            if timings.end_of_turn is None:  # closed without EndOfTurn
+                timings.end_of_turn = timings.stt_final
+                timings.end_of_speech = timings.stt_final
+            timings.audio_cursor_s = getattr(result, "audio_cursor_s", None)
+            timings.end_of_turn_confidence = getattr(result, "end_of_turn_confidence", None)
+            timings.eager_end_of_turn = self._eager_end_of_turn_at()
+            return result
+        except Exception:
+            stt_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stt_task
+            log.exception("utterance transcription failed")
+            return None
+        finally:
+            end_of_speech.set()
+
+    def _eager_end_of_turn_at(self) -> float | None:
+        """EagerEndOfTurn timestamp if the provider exposes one (diagnostics
+        only this round — nothing speculative is dispatched on it)."""
+        at = getattr(self._stt, "last_eager_end_of_turn_at", None)
+        return at if isinstance(at, int | float) else None
+
+    async def _record_vad_endpointed(
+        self, frames: AsyncIterator[bytes], end_of_speech: asyncio.Event, timings: WakeTimings
+    ) -> STTResult | None:
+        sr = self._capture.sample_rate
+        recorder = UtteranceRecorder(self._probe_factory(), sample_rate=sr, **self._recorder_kwargs)
+        queue, chunk_stream = self._open_chunk_stream()
+
+        stt_task = asyncio.create_task(self._stt.transcribe(chunk_stream, sr))
         try:
             while True:
                 try:

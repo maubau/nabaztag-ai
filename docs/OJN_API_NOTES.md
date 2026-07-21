@@ -270,6 +270,44 @@ Hardware half — status on the real rabbit:
     Next: single-turn hardware run to measure the new OpenAI time and, above all, the residual
     ~3-5s of Deepgram TTS (the per-phase timing log from #16 is already in place for that).
 
+19. **Latency gates L1/L2 shipped, awaiting hardware (July 2026, runtime 05b1e1a).** Target:
+    end of speech → first audio < 4s; last measured wake→audio-queued ~14.3s.
+    - **L1, Deepgram Flux (`stt_profile: flux`)**: recognition AND end-of-turn detection in one
+      pass, replacing the ~1875 ms fixed cost of the old path (1600 ms Silero silence + ~275 ms
+      nova-3 finalisation). This inverts who owns the turn: with nova-3 the pipeline's local VAD
+      CLOSED the chunk stream; with Flux the stream stays open and the provider calls back on
+      EndOfTurn while frames keep flowing. Providers advertise which model they use via
+      `detects_end_of_turn`, and `VoicePipeline` picks the matching loop
+      (`_record_provider_endpointed` vs `_record_vad_endpointed`). nova-3 + Silero is retained
+      as the `cloud` profile, not deleted. Only `EndOfTurn` is acted on; `EagerEndOfTurn` is
+      timestamped for diagnostics but never dispatched on (no speculative LLM this round).
+      Half-duplex and the drain chain are untouched. A client-side `turn_timeout_s` abandons the
+      turn and re-arms if EndOfTurn never arrives.
+      **OPEN — verify on hardware**: (a) the exact Flux V2 message schema; the parser is
+      deliberately tolerant (unknown types/events ignored, every field defaulted) so a mismatch
+      degrades to "no transcript" + the Whisper fallback rather than crashing the turn, but the
+      field names here are from the docs, not from the wire. (b) **Whether flux-general-multi
+      reports a detected language at all.** If it doesn't, `STTResult.language` stays None and
+      the TTS falls back to its configured (Italian) voice — English replies would be spoken by
+      the Italian voice. `_language_of` accepts several plausible shapes and never guesses from
+      the text (§6.2.6). This is the one functional regression risk in L1.
+    - **L2, smaller LLM input**: `express` subsumes gesture_ears/set_mood_lights/play_gesture,
+      so those three are no longer sent to the LLM (`VOICE_AGENT_TOOLS`) — the voice agent sees
+      only express/get_direction/body_state. They remain fully executable for MCP and for
+      replaying older histories. New per-turn diagnostics: `tool_schema_count`,
+      `tool_schema_chars`, and the provider's own `input_tokens` / `cached_input_tokens` /
+      `output_tokens` (summed across rounds, counts only — never content).
+    - **PROCESSING indicator** now spans the real dead-air gap: from end-of-turn until the
+      rabbit ACTUALLY starts speaking (`current_playback` set after the OJN round-trip), not
+      merely until the reply was queued. Bounded, and returns immediately when a turn queues no
+      audio. Still opt-in (`leds.processing_indicator`), worth enabling during latency tests.
+    - config-doctor gained an `stt_profile: cloud → flux` nudge. Doing so surfaced a latent bug:
+      `_rewrite_in_section` only ever handled NESTED keys, so a top-level scalar would have been
+      reported and then silently not rewritten by `--fix`; `_rewrite_top_level` fixes that.
+    - Not done, deliberately: **Gate L3** (progressive/streaming MP3) is a hardware PROBE first —
+      does the MTL decoder start playing before the HTTP response completes? No new TTS
+      architecture until that question is answered on the rabbit.
+
 Record answers here, then stamp the matrix rows hardware-confirmed.
 
 ### Build & deployment findings (Gate S1)

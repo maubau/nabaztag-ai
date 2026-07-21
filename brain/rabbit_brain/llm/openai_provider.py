@@ -166,7 +166,15 @@ def _from_final_response(final) -> LLMResult:
                     arguments=arguments,
                 )
             )
-    return LLMResult(text=text.strip(), tool_calls=tool_calls)
+    usage = getattr(final, "usage", None)
+    details = getattr(usage, "input_tokens_details", None)
+    return LLMResult(
+        text=text.strip(),
+        tool_calls=tool_calls,
+        input_tokens=getattr(usage, "input_tokens", None),
+        cached_input_tokens=getattr(details, "cached_tokens", None),
+        output_tokens=getattr(usage, "output_tokens", None),
+    )
 
 
 # re-exported so callers can build tool-result turns without importing base too

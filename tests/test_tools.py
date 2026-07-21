@@ -84,7 +84,7 @@ async def test_unknown_tool_reports_error():
 
 
 async def test_specs_are_valid_json_schema():
-    specs = BodyTools(RecordingController()).specs()
+    specs = BodyTools(RecordingController()).specs(include_all=True)
     names = {s.name for s in specs}
     assert names == {
         "express",
@@ -99,6 +99,32 @@ async def test_specs_are_valid_json_schema():
     for spec in specs:
         assert spec.parameters["type"] == "object"
         assert isinstance(spec.description, str) and spec.description
+
+
+async def test_voice_agent_sees_only_the_reduced_tool_set():
+    """Latency Gate L2: `express` subsumes the three single-purpose body
+    tools, so their schemas must not ride along on every LLM turn."""
+    tools = BodyTools(RecordingController())
+    assert {s.name for s in tools.specs()} == {"express", "get_direction", "body_state"}
+    # …but they stay executable (MCP, and histories recorded before this)
+    for name, args in (
+        ("gesture_ears", {"left": 2, "right": 2}),
+        ("set_mood_lights", {"mood": "happy"}),
+        ("play_gesture", {"preset": "nod"}),
+    ):
+        res = await tools.execute(ToolCall(call_id="c1", name=name, arguments=args))
+        assert not res.output.startswith("error"), name
+
+
+async def test_reduced_specs_are_materially_smaller():
+    import json as _json
+
+    tools = BodyTools(RecordingController())
+
+    def size(specs):
+        return sum(len(s.name) + len(s.description) + len(_json.dumps(s.parameters)) for s in specs)
+
+    assert size(tools.specs()) < size(tools.specs(include_all=True))
 
 
 async def test_express_speaks_and_gestures_in_one_call():

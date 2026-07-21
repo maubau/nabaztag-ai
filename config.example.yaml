@@ -1,10 +1,32 @@
 # Copy to config.yaml (gitignored) and fill in for your setup.
 
-# STT profile: "cloud" (Deepgram primary, OpenAI Whisper API fallback) or "local" (faster-whisper on CPU)
-stt_profile: cloud
+# STT profile:
+#   "flux"  — Deepgram Flux V2: the PROVIDER detects end of turn, so there is
+#             no local silence window at all. Replaces ~1875 ms of fixed cost
+#             (1600 ms Silero + ~275 ms nova-3 finalisation) with Flux's own
+#             EndOfTurn (latency Gate L1). Whisper API still backs it up.
+#   "cloud" — nova-3 + the local Silero VAD (client-side endpointing). Kept as
+#             the fallback profile; switch back here if Flux misbehaves.
+#   "local" — faster-whisper on the Bolt CPU.
+stt_profile: flux
+
+flux:
+  # Deepgram's multilingual Flux model (it/en).
+  model: flux-general-multi
+  # Confidence needed before Flux declares the turn over. Higher = more
+  # patient (fewer premature cuts, slower); lower = snappier, riskier.
+  # 0.7 is the starting point for hardware tuning.
+  eot_threshold: 0.7
+  # Server-side ceiling: end the turn after this much trailing silence even
+  # if the confidence never crosses the threshold.
+  eot_timeout_ms: 5000
+  # Client-side ceiling: if EndOfTurn never arrives at all (silence after the
+  # wake word, wedged socket), abandon the turn and re-arm cleanly.
+  turn_timeout_s: 15
 
 deepgram:
-  # Pinned but swappable without code changes (docs/ARCHITECTURE.md §6.2.4)
+  # Used by stt_profile: cloud (the fallback profile). Pinned but swappable
+  # without code changes (docs/ARCHITECTURE.md §6.2.4)
   model: nova-3
   # "multi" = automatic it/en code-switching, the desired bilingual behavior
   # (a phrase transcribed as English was in fact spoken in English). Optional
@@ -84,8 +106,11 @@ audio:
   sample_rate: 16000
   channels: 6
   selected_channel: 0
-  # Keep a natural mid-sentence pause open; 700 ms proved too eager on the
-  # real microphone and forced a new wake word after a brief hesitation.
+  # Local Silero end-of-speech window. Used ONLY by stt_profile: cloud/local —
+  # with stt_profile: flux the provider decides and this is not consulted at
+  # all (removing exactly this 1600 ms is the point of Gate L1). Keep a
+  # natural mid-sentence pause open; 700 ms proved too eager on the real
+  # microphone and forced a new wake word after a brief hesitation.
   vad_end_of_speech_ms: 1600
   half_duplex_guard_ms: 300
   # capture_queue_blocks: 300   # ~9.6s @ 32ms/block (default). Bump if
@@ -94,8 +119,12 @@ audio:
 
 leds:
   # LISTENING is a five-LED magenta breathing effect with counter-rotating
-  # ears. It stops at VAD end-of-speech. PROCESSING (pulsing orange while the
-  # agent thinks) is opt-in.
+  # ears. It stops at end of turn (Flux EndOfTurn, or VAD end-of-speech on the
+  # cloud/local profiles).
+  # PROCESSING (pulsing orange) covers the dead air after that: it runs from
+  # end-of-turn until the rabbit ACTUALLY starts speaking, not merely until
+  # the reply was queued. Opt-in, but worth turning on during latency tests —
+  # it makes the LLM/TTS phase visible instead of silent (latency Gate L1).
   processing_indicator: false
 
 wake_beep:

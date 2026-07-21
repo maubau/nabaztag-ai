@@ -70,10 +70,19 @@ Message = UserTurn | AssistantTurn | ToolTurn
 
 @dataclass
 class LLMResult:
-    """One assistant turn: free text plus any tool calls it requested."""
+    """One assistant turn: free text plus any tool calls it requested.
+
+    Token counts are diagnostics for the input-size work (latency Gate L2,
+    July 2026: the tool schemas ride along on every turn, so shrinking them
+    should show up as fewer input tokens). None when the provider doesn't
+    report usage. No request/response CONTENT is ever recorded here.
+    """
 
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
+    input_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    output_tokens: int | None = None
 
 
 # Called with each text delta as it streams in (for first-sentence-fast TTS).

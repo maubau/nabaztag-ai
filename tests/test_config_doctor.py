@@ -119,6 +119,24 @@ def test_deliberate_reasoning_effort_and_token_budget_not_touched():
     assert problems == []
 
 
+def test_stt_profile_cloud_is_nudged_to_flux():
+    # config.yaml is gitignored, so a Bolt config left on "cloud" would
+    # silently keep the ~1875 ms local window and Gate L1 would never engage
+    text = "stt_profile: cloud\n" + _BASELINE
+    fixed, problems = doctor.diagnose(text, fix=True)
+    assert any("stt_profile" in p for p in problems)
+    # top-level scalar keys have no section to scope to — the rewrite must
+    # still land (this path was previously report-only)
+    assert yaml.safe_load(fixed)["stt_profile"] == "flux"
+
+
+def test_stt_profile_flux_and_local_not_flagged():
+    for profile in ("flux", "local"):
+        text = f"stt_profile: {profile}\n" + _BASELINE
+        _fixed, problems = doctor.diagnose(text, fix=True)
+        assert not any("stt_profile" in p for p in problems), profile
+
+
 def test_current_reasoning_effort_not_flagged():
     text = _BASELINE + "llm:\n  reasoning_effort: low\n  max_output_tokens: 150\n"
     _fixed, problems = doctor.diagnose(text, fix=True)

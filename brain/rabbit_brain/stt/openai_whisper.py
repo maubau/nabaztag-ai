@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator
 
 import aiohttp
 
-from .base import STTResult, drain, pcm_to_wav
+from .base import EndOfTurnCallback, STTResult, drain, pcm_to_wav
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +33,13 @@ class WhisperApiSTT:
         self._api_base = api_base.rstrip("/")
         self._timeout = aiohttp.ClientTimeout(total=timeout_s)
 
-    async def transcribe(self, chunks: AsyncIterator[bytes], sample_rate: int) -> STTResult:
+    async def transcribe(
+        self,
+        chunks: AsyncIterator[bytes],
+        sample_rate: int,
+        on_end_of_turn: EndOfTurnCallback | None = None,
+    ) -> STTResult:
+        del on_end_of_turn  # buffered provider: the caller closes the stream
         wav = pcm_to_wav(await drain(chunks), sample_rate)
         form = aiohttp.FormData()
         form.add_field("file", wav, filename="utterance.wav", content_type="audio/wav")

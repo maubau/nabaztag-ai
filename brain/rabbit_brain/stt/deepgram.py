@@ -16,7 +16,7 @@ from collections.abc import AsyncIterator
 
 import aiohttp
 
-from .base import STTResult
+from .base import EndOfTurnCallback, STTResult
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +43,15 @@ class DeepgramSTT:
         self._ws_base = ws_base
         self._timeout_s = timeout_s
 
-    async def transcribe(self, chunks: AsyncIterator[bytes], sample_rate: int) -> STTResult:
+    async def transcribe(
+        self,
+        chunks: AsyncIterator[bytes],
+        sample_rate: int,
+        on_end_of_turn: EndOfTurnCallback | None = None,
+    ) -> STTResult:
+        # nova-3 does CLIENT-side endpointing: the caller's local VAD closes
+        # the stream, so there is no provider end-of-turn signal to report.
+        del on_end_of_turn
         params = {
             "model": self._model,
             "language": self._language,

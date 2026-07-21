@@ -81,6 +81,174 @@ async def test_deepgram_streams_pcm_and_joins_finals():
     assert seen_query["sample_rate"] == "16000"
 
 
+def flux_app(events, on_connect=None):
+    """Mock Flux V2: consumes audio, then emits the scripted TurnInfo events."""
+    seen = {"query": {}, "audio": bytearray()}
+
+    async def handler(request: web.Request) -> web.WebSocketResponse:
+        seen["query"].update(request.query)
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        if on_connect is not None:
+            await on_connect(ws)
+        async for msg in ws:
+            if msg.type == WSMsgType.BINARY:
+                seen["audio"].extend(msg.data)
+                if len(seen["audio"]) >= len(PCM):  # enough audio: end the turn
+                    break
+        for event in events:
+            await ws.send_json(event)
+        await ws.close()
+        return ws
+
+    app = web.Application()
+    app.router.add_get("/v2/listen", handler)
+    return app, seen
+
+
+async def test_flux_reports_end_of_turn_and_transcript():
+    from rabbit_brain.stt import FluxSTT
+
+    app, seen = flux_app(
+        [
+            {"type": "TurnInfo", "event": "StartOfTurn"},
+            {"type": "TurnInfo", "event": "Update", "transcript": "ciao"},
+            {
+                "type": "TurnInfo",
+                "event": "EndOfTurn",
+                "transcript": "ciao coniglio",
+                "audio_window_end": 1.25,
+                "end_of_turn_confidence": 0.93,
+                "language": "it",
+            },
+        ]
+    )
+    runner, port = await start_app(app)
+    ended: list[str] = []
+    try:
+        stt = FluxSTT(api_key="k", ws_base=f"ws://127.0.0.1:{port}/v2/listen")
+        result = await stt.transcribe(stream([PCM]), 16_000, on_end_of_turn=ended.append)
+    finally:
+        await runner.cleanup()
+    assert result.text == "ciao coniglio"
+    assert result.provider == "deepgram-flux"
+    assert result.language == "it"  # drives TTS voice routing
+    assert result.audio_cursor_s == 1.25
+    assert result.end_of_turn_confidence == 0.93
+    # the pipeline is told the turn ended, so LISTENING can stop immediately
+    assert ended == ["ciao coniglio"]
+    assert seen["query"]["model"] == "flux-general-multi"
+    assert seen["query"]["eot_threshold"] == "0.7"
+    assert seen["query"]["eot_timeout_ms"] == "5000"
+    assert seen["query"]["encoding"] == "linear16"
+    assert seen["query"]["sample_rate"] == "16000"
+
+
+async def test_flux_eager_end_of_turn_is_recorded_but_not_acted_on():
+    """Gate L1 ships EndOfTurn only: EagerEndOfTurn is timestamped for
+    diagnostics and must NOT end the turn (no speculative dispatch yet)."""
+    from rabbit_brain.stt import FluxSTT
+
+    app, _seen = flux_app(
+        [
+            {"type": "TurnInfo", "event": "EagerEndOfTurn", "transcript": "ciao con"},
+            {"type": "TurnInfo", "event": "TurnResumed"},
+            {"type": "TurnInfo", "event": "EndOfTurn", "transcript": "ciao coniglio"},
+        ]
+    )
+    runner, port = await start_app(app)
+    ended: list[str] = []
+    try:
+        stt = FluxSTT(api_key="k", ws_base=f"ws://127.0.0.1:{port}/v2/listen")
+        result = await stt.transcribe(stream([PCM]), 16_000, on_end_of_turn=ended.append)
+    finally:
+        await runner.cleanup()
+    assert ended == ["ciao coniglio"]  # exactly once, on the real EndOfTurn
+    assert result.text == "ciao coniglio"
+    assert stt.last_eager_end_of_turn_at is not None  # recorded for the log
+    assert "EagerEndOfTurn" in stt.last_turn_events
+
+
+async def test_flux_language_absent_stays_none():
+    # flux-general-multi's language reporting is not hardware-confirmed; when
+    # it says nothing we must NOT guess (TTS keeps its configured voice)
+    from rabbit_brain.stt import FluxSTT
+
+    app, _ = flux_app([{"type": "TurnInfo", "event": "EndOfTurn", "transcript": "ciao"}])
+    runner, port = await start_app(app)
+    try:
+        stt = FluxSTT(api_key="k", ws_base=f"ws://127.0.0.1:{port}/v2/listen")
+        result = await stt.transcribe(stream([PCM]), 16_000)
+    finally:
+        await runner.cleanup()
+    assert result.language is None
+
+
+async def test_flux_stream_closed_without_end_of_turn_returns_what_it_heard():
+    from rabbit_brain.stt import FluxSTT
+
+    app, _ = flux_app([{"type": "TurnInfo", "event": "Update", "transcript": "mezza frase"}])
+    runner, port = await start_app(app)
+    ended: list[str] = []
+    try:
+        stt = FluxSTT(api_key="k", ws_base=f"ws://127.0.0.1:{port}/v2/listen")
+        result = await stt.transcribe(stream([PCM]), 16_000, on_end_of_turn=ended.append)
+    finally:
+        await runner.cleanup()
+    assert result.text == "mezza frase"
+    assert ended == []  # no EndOfTurn was ever reported
+
+
+async def test_flux_tolerates_unknown_events_and_bad_json():
+    from rabbit_brain.stt import FluxSTT
+
+    async def send_garbage(ws):
+        await ws.send_str("not json at all")
+        await ws.send_json({"type": "SomethingNew", "event": "???"})
+
+    app, _ = flux_app(
+        [{"type": "TurnInfo", "event": "EndOfTurn", "transcript": "ok"}], on_connect=send_garbage
+    )
+    runner, port = await start_app(app)
+    try:
+        stt = FluxSTT(api_key="k", ws_base=f"ws://127.0.0.1:{port}/v2/listen")
+        result = await stt.transcribe(stream([PCM]), 16_000)
+    finally:
+        await runner.cleanup()
+    assert result.text == "ok"
+
+
+async def test_flux_declares_provider_side_endpointing():
+    from rabbit_brain.stt import DeepgramSTT, FluxSTT
+
+    assert FluxSTT(api_key="k").detects_end_of_turn is True
+    # nova-3 keeps client-side endpointing (pipeline's local VAD closes it)
+    assert getattr(DeepgramSTT(api_key="k"), "detects_end_of_turn", False) is False
+
+
+async def test_fallback_mirrors_primary_endpointing_and_signals_end_of_turn():
+    """With Flux in front the pipeline runs the provider-endpointed loop and
+    never closes the stream itself — so when Flux dies, the fallback's result
+    must still raise end-of-turn or the pipeline would wait out its timeout."""
+    from rabbit_brain.stt import FluxSTT
+
+    class DeadFlux(FluxSTT):
+        def __init__(self):
+            super().__init__(api_key="k")
+
+        async def transcribe(self, chunks, sample_rate, on_end_of_turn=None):
+            async for _ in chunks:  # consume a little, then die
+                break
+            raise RuntimeError("flux down")
+
+    stt = FallbackSTT(DeadFlux(), CapturingSTT())
+    assert stt.detects_end_of_turn is True
+    ended: list[str] = []
+    result = await stt.transcribe(stream([PCM, PCM]), 16_000, on_end_of_turn=ended.append)
+    assert result.text == "fallback ok"
+    assert ended == ["fallback ok"]  # the turn was closed for the pipeline
+
+
 async def test_whisper_api_posts_wav():
     got = {}
 
@@ -111,7 +279,7 @@ class FailingSTT:
     def __init__(self, after_chunks: int):
         self._after = after_chunks
 
-    async def transcribe(self, chunks, sample_rate):
+    async def transcribe(self, chunks, sample_rate, on_end_of_turn=None):
         n = 0
         async for _ in chunks:
             n += 1
@@ -124,7 +292,7 @@ class CapturingSTT:
     def __init__(self):
         self.pcm = b""
 
-    async def transcribe(self, chunks, sample_rate):
+    async def transcribe(self, chunks, sample_rate, on_end_of_turn=None):
         async for c in chunks:
             self.pcm += c
         return STTResult(text="fallback ok", provider="fake")

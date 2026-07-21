@@ -95,6 +95,17 @@ CHECKS: list[Check] = [
         required=False,
         is_stale=lambda v: v in (300, 220),
     ),
+    # Latency Gate L1 (July 2026): Flux does end-of-turn detection server-side,
+    # removing the ~1875 ms local silence window. A config still on "cloud" is
+    # not BROKEN — it's the documented fallback profile — so this is a nudge,
+    # not a migration: the fix rewrites it, but nothing else depends on it.
+    Check(
+        ("stt_profile",),
+        "flux",
+        "Flux detects end-of-turn server-side; 'cloud' keeps the ~1875 ms local window",
+        required=False,
+        is_stale=lambda v: v == "cloud",
+    ),
 ]
 
 
@@ -105,6 +116,18 @@ def _get(cfg: dict, path: tuple[str, ...]):
             return _MISSING, False
         node = node[key]
     return node, True
+
+
+def _rewrite_top_level(text: str, key: str, expected: object) -> str:
+    """Rewrite a top-level scalar key (e.g. `stt_profile:`), which has no
+    section to scope to and is never indented."""
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        m = re.match(rf"^({re.escape(key)}\s*:).*$", line.rstrip("\n"))
+        if m:
+            lines[i] = m.group(1) + f" {expected}" + ("\n" if line.endswith("\n") else "")
+            break
+    return "".join(lines)
 
 
 def _rewrite_in_section(text: str, section: str, leaf: str, expected: object) -> str:
@@ -143,7 +166,10 @@ def diagnose(text: str, fix: bool) -> tuple[str, list[str]]:
         if check.stale(value):
             problems.append(f"{dotted} is {value!r}, expected {check.expected!r} — {check.why}")
             if fix:
-                text = _rewrite_in_section(text, check.path[0], check.path[-1], check.expected)
+                if len(check.path) == 1:
+                    text = _rewrite_top_level(text, check.path[0], check.expected)
+                else:
+                    text = _rewrite_in_section(text, check.path[0], check.path[-1], check.expected)
     return text, problems
 
 

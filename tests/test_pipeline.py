@@ -689,6 +689,229 @@ async def test_frame_counts_tracked_per_state():
         await asyncio.gather(run, return_exceptions=True)
 
 
+class FakeFluxSTT:
+    """Provider-side endpointing: keeps consuming frames and declares the turn
+    over after `frames_before_eot` of them (never closes the stream itself)."""
+
+    detects_end_of_turn = True
+
+    def __init__(self, frames_before_eot=3, text="ciao coniglio", language="it", never_end=False):
+        self._frames_before_eot = frames_before_eot
+        self._text = text
+        self._language = language
+        self._never_end = never_end
+        self.frames_seen = 0
+        self.last_eager_end_of_turn_at = None
+
+    async def transcribe(self, chunks, sample_rate, on_end_of_turn=None):
+        async for _chunk in chunks:
+            self.frames_seen += 1
+            if not self._never_end and self.frames_seen >= self._frames_before_eot:
+                if on_end_of_turn is not None:
+                    on_end_of_turn(self._text)
+                return STTResult(
+                    text=self._text,
+                    provider="deepgram-flux",
+                    language=self._language,
+                    audio_cursor_s=0.5,
+                    end_of_turn_confidence=0.9,
+                )
+        return STTResult(text="", provider="deepgram-flux")
+
+
+async def test_flux_turn_ends_on_provider_signal_not_local_vad():
+    """Gate L1: with a provider-endpointing STT the pipeline must NOT wait for
+    the local silence window — the turn ends when the provider says so, and
+    the transcript goes straight to the agent."""
+    controller = FakeController()
+    stt = FakeFluxSTT(frames_before_eot=3)
+    transcripts = []
+    # all SPEECH: local Silero would never call end-of-speech here, so if the
+    # transcript arrives it can only be the provider's EndOfTurn that ended it
+    capture = EndlessCapture([SPEECH] * 30)
+    pipeline = make_pipeline(capture, FakeWake(trigger_at=0), controller, transcripts, stt=stt)
+    run = asyncio.create_task(pipeline.run())
+    try:
+        await wait_until(lambda: transcripts == ["ciao coniglio"])
+    finally:
+        run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+    assert pipeline.last_stt_language == "it"
+
+
+async def test_flux_end_of_turn_stops_listening_feedback(controller, mock_ojn):
+    """The LISTENING feedback must end on EndOfTurn — LEDs off is the last
+    thing on the wire, exactly as on the VAD path."""
+    stt = FakeFluxSTT(frames_before_eot=2)
+    transcripts = []
+    pipeline = make_pipeline(
+        EndlessCapture([SPEECH] * 30),
+        FakeWake(trigger_at=0),
+        controller,
+        transcripts,
+        stt=stt,
+        listening_cycle_s=0.01,
+    )
+    run = asyncio.create_task(pipeline.run())
+    try:
+        await wait_until(
+            lambda: (
+                build_leds_off_chor(ears_pose=(0, 0))
+                in [c.params["chor"] for c in mock_ojn.calls_of("chor")]
+            )
+        )
+    finally:
+        run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_flux_records_gate_l1_metrics():
+    controller = FakeController()
+    stt = FakeFluxSTT(frames_before_eot=2)
+    transcripts = []
+    pipeline = make_pipeline(
+        EndlessCapture([SPEECH] * 30), FakeWake(trigger_at=0), controller, transcripts, stt=stt
+    )
+    run = asyncio.create_task(pipeline.run())
+    try:
+        await wait_until(lambda: pipeline.last_timings is not None)
+    finally:
+        run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+    t = pipeline.last_timings.as_dict()
+    assert t["wake_to_end_of_turn_ms"] is not None
+    assert t["end_of_turn_to_llm_ms"] is not None  # EndOfTurn -> LLM request
+    assert t["speech_end_to_end_of_turn_ms"] is not None  # the headline number
+    assert t["last_speech_audio_cursor_s"] == 0.5
+    assert t["end_of_turn_confidence"] == 0.9
+    assert t["language"] == "it"
+
+
+async def test_flux_no_end_of_turn_times_out_and_rearms():
+    """A silent user (or a wedged socket) must not hold the pipeline open:
+    the turn is abandoned, and the wake detector is re-armed cleanly."""
+    controller = FakeController()
+    stt = FakeFluxSTT(never_end=True)
+    wake = FakeWake(trigger_at=0)
+    transcripts = []
+    pipeline = make_pipeline(
+        EndlessCapture([SPEECH] * 200),
+        wake,
+        controller,
+        transcripts,
+        stt=stt,
+        turn_timeout_s=0.05,
+    )
+    run = asyncio.create_task(pipeline.run())
+    try:
+        await wait_until(lambda: wake.resets > 0)  # re-armed after the timeout
+    finally:
+        run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+    assert transcripts == []  # nothing dispatched to the agent
+
+
+async def test_flux_short_pause_does_not_end_the_turn():
+    """A brief silence mid-sentence must not end the turn: on this path only
+    the provider decides, so silence frames just keep flowing to it."""
+    controller = FakeController()
+    # end only after 12 frames; the prelude has a silence gap in the middle
+    stt = FakeFluxSTT(frames_before_eot=12)
+    transcripts = []
+    capture = EndlessCapture([SPEECH] * 4 + [SILENCE] * 4 + [SPEECH] * 30)
+    pipeline = make_pipeline(capture, FakeWake(trigger_at=0), controller, transcripts, stt=stt)
+    run = asyncio.create_task(pipeline.run())
+    try:
+        await wait_until(lambda: transcripts == ["ciao coniglio"])
+    finally:
+        run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+    # the silence in the middle was fed to the provider like any other audio
+    assert stt.frames_seen >= 12
+
+
+async def test_processing_indicator_stays_lit_until_audio_actually_starts():
+    """The PROCESSING indicator covers the whole dead-air gap: it must not go
+    out when the reply is merely QUEUED (on_transcript returns), but when the
+    rabbit actually starts speaking."""
+    from rabbit_brain.body.chor import build_leds_off_chor as leds_off
+    from rabbit_brain.body.chor import build_processing_chor
+
+    controller = PlayingGateController(gated_checks=3)
+    started = asyncio.Event()
+
+    async def on_transcript(text: str) -> None:
+        await controller.submit(
+            PlayAudioCommand(("http://192.168.66.1/brain-audio/x.mp3",), 0.2),
+            Priority.USER_SPEECH_SYNC,
+        )
+        started.set()  # audio queued, but current_playback is still None
+
+    pipeline = make_pipeline(
+        EndlessCapture([SILENCE, SPEECH, SPEECH, SPEECH] + [SILENCE] * 12),
+        FakeWake(trigger_at=0),
+        controller,
+        [],
+        on_transcript=on_transcript,
+        processing_indicator=True,
+    )
+    run = asyncio.create_task(pipeline.run())
+    try:
+        await wait_until(lambda: started.is_set())
+        # queued but not playing: the indicator must still be running, i.e.
+        # the LEDs-off that ENDS it has not been submitted after the pulse
+        pulse = build_processing_chor()
+        assert pulse in chors(controller)
+        # now let playback actually start
+        controller.current_playback = FakePlayback(finished=False)
+        await wait_until(lambda: chors(controller)[-1] == leds_off())
+    finally:
+        run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_processing_indicator_does_not_linger_without_audio():
+    # a turn that queues no audio at all must not hold the indicator for the
+    # full playback-start timeout
+    from rabbit_brain.body.chor import build_leds_off_chor as leds_off
+
+    controller = FakeController()
+
+    async def on_transcript(text: str) -> None:
+        return  # silent turn: nothing queued
+
+    pipeline = make_pipeline(
+        EndlessCapture([SILENCE, SPEECH, SPEECH, SPEECH] + [SILENCE] * 12),
+        FakeWake(trigger_at=0),
+        controller,
+        [],
+        on_transcript=on_transcript,
+        processing_indicator=True,
+    )
+    run = asyncio.create_task(pipeline.run())
+    try:
+        await asyncio.wait_for(
+            wait_until(lambda: leds_off() in chors(controller)), 1.0
+        )  # well under PLAYBACK_START_TIMEOUT_S
+    finally:
+        run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_flux_half_duplex_gate_still_applies():
+    """Gate L1 must not weaken §6.2.7: while the rabbit speaks, its own audio
+    is never fed to the provider."""
+    controller = FakeController()
+    controller.audio_busy = True  # rabbit is speaking
+    controller.current_playback = None
+    stt = FakeFluxSTT(frames_before_eot=1)
+    wake = FakeWake(trigger_at=0)
+    pipeline = make_pipeline(FakeCapture([SPEECH] * 5), wake, controller, [], stt=stt)
+    await pipeline.run()
+    assert stt.frames_seen == 0  # nothing reached the provider
+    assert wake.feeds == 0
+
+
 async def test_gate_covers_queued_but_not_started_audio():
     # audio accepted by submit() but not yet in current_playback must gate the mic
     controller = FakeController()

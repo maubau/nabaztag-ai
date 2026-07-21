@@ -34,7 +34,7 @@ import yaml
 
 from .audio.capture import AlsaCapture
 from .audio.doa import make_doa
-from .audio.pipeline import VoicePipeline
+from .audio.pipeline import DEFAULT_TURN_TIMEOUT_S, VoicePipeline
 from .audio.vad import DEFAULT_END_OF_SPEECH_MS, SileroProbe
 from .audio.wake import OpenWakeWordDetector
 from .body.controller import BodyController
@@ -183,6 +183,7 @@ async def run(config_path: str, moods_path: str, system_prompt_path: str) -> Non
             },
             wake_beep=wake_beep,
             processing_indicator=config.get("leds", {}).get("processing_indicator", False),
+            turn_timeout_s=config.get("flux", {}).get("turn_timeout_s", DEFAULT_TURN_TIMEOUT_S),
         )
 
         async def watch_events() -> None:

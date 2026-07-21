@@ -47,6 +47,16 @@ class ToolError(ValueError):
     the model as a function_call_output, never crashes the turn."""
 
 
+# Tools whose schemas are sent to the VOICE agent's LLM every turn. The three
+# single-purpose body tools (gesture_ears/set_mood_lights/play_gesture) are
+# deliberately excluded: `express` already covers every speak+gesture case in
+# one call, so shipping them too only inflates the schema and the input-token
+# count on every single turn (latency Gate L2, July 2026). They stay fully
+# EXECUTABLE — execute()/_dispatch still handle them — for the MCP server and
+# for replaying histories recorded before this change.
+VOICE_AGENT_TOOLS = ("express", "get_direction", "body_state")
+
+
 class BodyTools:
     """Registry + validated executor for the agent's body tools."""
 
@@ -60,7 +70,16 @@ class BodyTools:
         self._get_direction = get_direction
         self._priority = priority
 
-    def specs(self) -> list[ToolSpec]:
+    def specs(self, include_all: bool = False) -> list[ToolSpec]:
+        """Schemas for the LLM. Defaults to the voice-agent subset
+        (VOICE_AGENT_TOOLS); include_all=True returns every executable tool,
+        for callers that want the full surface (e.g. tooling/inspection)."""
+        specs = self._all_specs()
+        if include_all:
+            return specs
+        return [s for s in specs if s.name in VOICE_AGENT_TOOLS]
+
+    def _all_specs(self) -> list[ToolSpec]:
         return [
             ToolSpec(
                 "express",
