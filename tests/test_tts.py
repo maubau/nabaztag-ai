@@ -346,6 +346,45 @@ async def test_deepgram_tts_voice_routing_and_request(tmp_path, monkeypatch):
     assert got[0]["text"] == "Ciao dal coniglio"
 
 
+async def test_elevenlabs_logs_chars_time_and_duration(tmp_path, monkeypatch, caplog):
+    """ElevenLabs must log the same chars/total-time/duration breakdown as
+    Deepgram, so the two are comparable in the latency benchmark (never the
+    text content)."""
+    import logging
+
+    from aiohttp import web
+    from rabbit_brain.tts.elevenlabs_tts import ElevenLabsTTS
+
+    async def handler(_request: web.Request) -> web.Response:
+        return web.Response(body=b"fake-mp3", content_type="audio/mpeg")
+
+    app = web.Application()
+    app.router.add_post("/v1/text-to-speech/{voice}", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+
+    duration_stub = type("I", (), {"info": type("X", (), {"length": 1.5})})()
+    monkeypatch.setattr("rabbit_brain.tts.elevenlabs_tts.MP3", lambda _p: duration_stub)
+    # API_BASE is read by name inside synth(), so patching the module attr routes
+    # the request to the local server
+    monkeypatch.setattr("rabbit_brain.tts.elevenlabs_tts.API_BASE", f"http://127.0.0.1:{port}/v1")
+    tts = ElevenLabsTTS(tmp_path, voice_id="v", api_key="k")
+    try:
+        with caplog.at_level(logging.INFO):
+            await tts.synth("Ciao dal coniglio")
+    finally:
+        await tts.close()
+        await runner.cleanup()
+    line = next(r.message for r in caplog.records if "elevenlabs tts timing" in r.message)
+    assert "chars=17" in line
+    assert "total_http_ms=" in line
+    assert "mp3_duration_s=1.50" in line
+    assert "Ciao dal coniglio" not in line  # never logs content
+
+
 def test_make_tts_provider_deepgram_profile(tmp_path):
     from rabbit_brain.tts import make_tts_provider
     from rabbit_brain.tts.deepgram_tts import DeepgramTTS

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -10,6 +12,8 @@ import aiohttp
 from mutagen.mp3 import MP3
 
 from .base import TTSResult
+
+log = logging.getLogger(__name__)
 
 API_BASE = "https://api.elevenlabs.io/v1"
 DEFAULT_MODEL = "eleven_multilingual_v2"
@@ -56,6 +60,7 @@ class ElevenLabsTTS:
             self._session = aiohttp.ClientSession()
             self._own_session = True
         url = f"{API_BASE}/text-to-speech/{self._voice_id}"
+        t_request = time.monotonic()
         async with self._session.post(
             url,
             params={"output_format": "mp3_44100_128"},
@@ -68,4 +73,13 @@ class ElevenLabsTTS:
             data = await resp.read()
         path = self._audio_dir / f"{uuid.uuid4().hex}.mp3"
         path.write_bytes(data)
-        return TTSResult(path=path, duration_s=MP3(path).info.length)
+        duration_s = MP3(path).info.length
+        # Comparable to DeepgramTTS.synth's timing line (latency round, July
+        # 2026): chars in, total HTTP time, MP3 length — never text content.
+        log.info(
+            "elevenlabs tts timing: chars=%d total_http_ms=%d mp3_duration_s=%.2f",
+            len(text),
+            round((time.monotonic() - t_request) * 1000),
+            duration_s,
+        )
+        return TTSResult(path=path, duration_s=duration_s)

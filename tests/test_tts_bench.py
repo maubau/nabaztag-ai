@@ -47,6 +47,8 @@ async def test_bench_profile_records_rows(monkeypatch, tmp_path):
     assert len(rows) == 4  # 2 sentences x 2 runs
     assert {r.language for r in rows} == {"it", "en"}
     assert all(r.audio_s == 1.0 and r.synth_ms >= 0 for r in rows)
+    # char count recorded per row (drives synth-time scaling)
+    assert {r.chars for r in rows} == {len("ciao"), len("hello")}
     assert made["provider"].calls[0] == ("ciao", "it")  # language forwarded
 
 
@@ -78,6 +80,47 @@ async def test_bench_profile_survives_synth_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(mod, "make_tts_provider", lambda audio_dir, env=None: Boom(audio_dir))
     rows = await mod._bench_profile("piper", [("it", "ciao")], runs=2, audio_dir=tmp_path)
     assert rows == []  # failure reported, harness keeps going
+
+
+async def test_output_dir_keeps_labelled_mp3s(monkeypatch, tmp_path):
+    mod = _load()
+    monkeypatch.setattr(
+        mod, "make_tts_provider", lambda audio_dir, env=None: FakeProvider(audio_dir)
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    out = tmp_path / "kept"
+    out.mkdir()
+    rows = await mod._bench_profile(
+        "deepgram", [("it", "Ciao mondo")], runs=2, audio_dir=work, output_dir=out
+    )
+    assert len(rows) == 2
+    kept = sorted(p.name for p in out.glob("*.mp3"))
+    # labelled by profile, language, a text slug, and the run index
+    assert kept == ["deepgram_it_ciao-mondo_0.mp3", "deepgram_it_ciao-mondo_1.mp3"]
+
+
+async def test_no_output_dir_keeps_nothing(monkeypatch, tmp_path):
+    mod = _load()
+    monkeypatch.setattr(
+        mod, "make_tts_provider", lambda audio_dir, env=None: FakeProvider(audio_dir)
+    )
+    out = tmp_path / "kept"
+    out.mkdir()
+    await mod._bench_profile(
+        "deepgram", [("it", "ciao")], runs=1, audio_dir=tmp_path, output_dir=None
+    )
+    assert list(out.glob("*.mp3")) == []  # nothing kept when output_dir is None
+
+
+def test_slug_is_filesystem_safe():
+    mod = _load()
+    # ASCII-only, dash-collapsed (the accented è is dropped — fine for a label)
+    slug = mod._slug("Ciao, com'è il tempo?")
+    assert slug == "ciao-com-il-tempo"
+    assert __import__("re").fullmatch(r"[a-z0-9-]+", slug)
+    assert mod._slug("") == "utt"  # never empty
+    assert len(mod._slug("x" * 100)) <= 32
 
 
 def test_median_handles_empty():

@@ -23,6 +23,14 @@ can run whichever subset is configured on the box.
     # the environment (same names the runtime reads; see .env.example) plus
     # PIPER_MODEL for the local voice, then:
     python brain/scripts/tts-bench.py --profiles deepgram,elevenlabs,piper --runs 3
+
+Timing alone can't settle voice QUALITY, nor even real latency — hardware
+showed ElevenLabs benched ~970ms but took ~3700ms median IN CONVERSATION, with
+markedly worse Italian and very low volume, so Aura stays the production TTS
+(July 2026). Pass --keep-audio (or --output-dir PATH) to retain a labelled MP3
+per synth so the quality judgement is reproducible from the files. Decide a
+provider on on-Nabaztag listening AND full-conversation latency, never on the
+synthetic RTF/synth number alone — this is a screening tool, not the verdict.
 """
 
 from __future__ import annotations
@@ -30,6 +38,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
+import shutil
 import statistics
 import tempfile
 import time
@@ -38,12 +48,19 @@ from pathlib import Path
 
 from rabbit_brain.tts import make_tts_provider
 
-# (language, sentence). Kept short and spoken-style, like real replies; one is
-# the length the prompt targets, one a touch longer to expose scaling.
+# (language, sentence). Length matters: the earlier ~45-char fragments made
+# the synthetic numbers (ElevenLabs 970 ms) badly under-predict the real
+# runtime (~3700 ms) — synth time scales with characters. These are ONE full
+# spoken sentence each, ~110-130 chars, the length the agent's replies
+# actually reach. The same texts are reused across every profile so you can
+# listen to voice A vs voice B on IDENTICAL content (--keep-audio).
+_IT_WEATHER = "Certo, domani lungo la costa il cielo resta sereno, con ventuno gradi e una leggera brezza che arriva da nord."  # noqa: E501
+_EN_WEATHER = "Sure, tomorrow the sky stays clear all along the coast, around twenty-one degrees with a light breeze from the north."  # noqa: E501
+_IT_CANT_SEE = "Mi dispiace, non riesco a vedere: ho solo un microfono, un altoparlante, le orecchie e le lucine, ma posso raccontarti qualcosa."  # noqa: E501
 DEFAULT_SENTENCES: list[tuple[str, str]] = [
-    ("it", "Certo, il sole domani splende su tutta la costa."),
-    ("en", "Sure, tomorrow looks bright and clear along the whole coast."),
-    ("it", "Ci sono ventuno gradi adesso, con una leggera brezza da nord."),
+    ("it", _IT_WEATHER),
+    ("en", _EN_WEATHER),
+    ("it", _IT_CANT_SEE),
 ]
 
 
@@ -51,12 +68,23 @@ DEFAULT_SENTENCES: list[tuple[str, str]] = [
 class Row:
     profile: str
     language: str
+    chars: int
     synth_ms: int
     audio_s: float
     rtf: float  # synth_time / audio_length; <1 is faster than real time
 
 
-async def _bench_profile(profile: str, sentences, runs: int, audio_dir: Path) -> list[Row]:
+def _slug(text: str, limit: int = 32) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:limit] or "utt"
+
+
+async def _bench_profile(
+    profile: str, sentences, runs: int, audio_dir: Path, output_dir: Path | None = None
+) -> list[Row]:
+    """Time synth() per sentence/run. When output_dir is set, a LABELLED copy
+    of each MP3 is kept there (profile_lang_slug_runN.mp3) so the qualitative
+    voice comparison is reproducible from the files — synthesis itself always
+    uses the throwaway working dir, so timing is unaffected."""
     env = {**os.environ, "TTS_PROFILE": profile, "NABAZTAG_AUDIO_DIR": str(audio_dir)}
     try:
         provider = make_tts_provider(audio_dir, env=env)
@@ -70,7 +98,7 @@ async def _bench_profile(profile: str, sentences, runs: int, audio_dir: Path) ->
     rows: list[Row] = []
     try:
         for language, text in sentences:
-            for _ in range(runs):
+            for run_i in range(runs):
                 start = time.monotonic()
                 try:
                     result = await provider.synth(text, language=language)
@@ -80,11 +108,16 @@ async def _bench_profile(profile: str, sentences, runs: int, audio_dir: Path) ->
                 synth_ms = round((time.monotonic() - start) * 1000)
                 audio_s = result.duration_s or 0.0
                 rtf = (synth_ms / 1000 / audio_s) if audio_s > 0 else float("nan")
-                rows.append(Row(profile, language, synth_ms, audio_s, rtf))
-                print(
-                    f"[{profile}/{language}] synth={synth_ms}ms audio={audio_s:.2f}s "
-                    f"rtf={rtf:.2f} -> {text!r}"
+                rows.append(Row(profile, language, len(text), synth_ms, audio_s, rtf))
+                line = (
+                    f"[{profile}/{language}] chars={len(text)} synth={synth_ms}ms "
+                    f"audio={audio_s:.2f}s rtf={rtf:.2f} -> {text!r}"
                 )
+                if output_dir is not None:
+                    kept = output_dir / f"{profile}_{language}_{_slug(text)}_{run_i}.mp3"
+                    shutil.copyfile(result.path, kept)
+                    line += f"  [kept {kept.name}]"
+                print(line)
     finally:
         close = getattr(provider, "close", None)
         if close is not None:
@@ -103,28 +136,49 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--profiles", default="deepgram,elevenlabs,piper")
     parser.add_argument("--runs", type=int, default=3, help="repeats per (profile, sentence)")
     parser.add_argument("--sentences", default=None, help="'lang<TAB>text' per line, in a file")
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="keep a labelled MP3 per synth here, so voice quality is reproducible from the files",
+    )
+    parser.add_argument(
+        "--keep-audio",
+        action="store_true",
+        help="keep MP3s in ./tts-bench-audio (shorthand for --output-dir tts-bench-audio)",
+    )
     return parser.parse_args()
 
 
-async def main(profiles: list[str], sentences, runs: int) -> None:
+async def main(profiles: list[str], sentences, runs: int, output_dir: Path | None = None) -> None:
     results: list[Row] = []
     with tempfile.TemporaryDirectory() as tmp:
         audio_dir = Path(tmp)
         for profile in profiles:
-            results.extend(await _bench_profile(profile, sentences, runs, audio_dir))
+            results.extend(
+                await _bench_profile(profile, sentences, runs, audio_dir, output_dir=output_dir)
+            )
 
-    print("\n--- summary (median synth time per profile; DECIDE ON synth_ms) ---")
+    print("\n--- summary (median synth time per profile) ---")
     for profile in profiles:
         subset = [r for r in results if r.profile == profile]
         if not subset:
             print(f"{profile:12s} no data")
             continue
+        chars = _median([r.chars for r in subset])
         synth = _median([r.synth_ms for r in subset])
         rtf = _median([r.rtf for r in subset if r.rtf == r.rtf])  # drop NaN
-        print(f"{profile:12s} synth_median={synth:.0f}ms  rtf_median={rtf:.2f}  n={len(subset)}")
+        print(
+            f"{profile:12s} chars_median={chars:.0f}  synth_median={synth:.0f}ms  "
+            f"rtf_median={rtf:.2f}  n={len(subset)}"
+        )
+    if output_dir is not None:
+        print(f"\nMP3s kept in {output_dir}/ — listen there to judge voice quality.")
     print(
-        "\nJudge voice QUALITY yourself; this only measures time. Remember the rabbit waits for "
-        "the complete file (Gate L3 rejected), so synth time is the floor on first-audio."
+        "\nThis measures SYNTHESIS TIME only, on a warm connection — it under-predicts the real "
+        "runtime (July 2026: ElevenLabs benched 970ms but took ~3700ms median in conversation) "
+        "and says nothing about voice quality or volume. Do NOT pick a provider on RTF or synth "
+        "time alone: decide with on-Nabaztag listening AND full-conversation latency. Piper in "
+        "particular is only worth adopting if it wins BOTH on the real rabbit."
     )
 
 
@@ -140,10 +194,17 @@ if __name__ == "__main__":
         sentence_specs = pairs
     else:
         sentence_specs = DEFAULT_SENTENCES
+    # --output-dir wins; --keep-audio is the shorthand default location
+    out_dir = Path(args.output_dir) if args.output_dir else None
+    if out_dir is None and args.keep_audio:
+        out_dir = Path("tts-bench-audio")
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)  # sync setup before the event loop
     asyncio.run(
         main(
             profiles=[p.strip() for p in args.profiles.split(",") if p.strip()],
             sentences=sentence_specs,
             runs=args.runs,
+            output_dir=out_dir,
         )
     )
