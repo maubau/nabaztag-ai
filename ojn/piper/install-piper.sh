@@ -22,7 +22,12 @@
 # put PIPER_URL_IT/PIPER_URL_EN in .env and benchmark:
 #   python brain/scripts/tts-bench.py --profiles deepgram,piper --keep-audio
 #
-# Pinned so a re-run reproduces the same environment. Idempotent where it can be.
+# REPRODUCIBILITY (be precise): this is ENGINE-VERSION pinned — the piper-tts
+# engine is fixed at $PIPER_VERSION. It is NOT a fully locked build: pip is
+# upgraded to latest, transitive deps are unconstrained, and the voice models
+# are fetched from HuggingFace main WITHOUT a digest. Good enough for the
+# latency probe; for a truly reproducible deploy add a pip constraints file and
+# model checksums. Idempotent where it can be.
 
 set -euo pipefail
 
@@ -35,6 +40,10 @@ VOICE_EN="${VOICE_EN:-en_US-sam-medium}"
 PORT_IT="${PORT_IT:-5001}"
 PORT_EN="${PORT_EN:-5002}"
 PY="$VENV_DIR/bin/python"
+# systemd units must NOT run as root. Default to the invoking (non-root) user;
+# override with PIPER_USER/PIPER_GROUP if the servers should run as someone else.
+PIPER_USER="${PIPER_USER:-${SUDO_USER:-$(id -un)}}"
+PIPER_GROUP="${PIPER_GROUP:-$(id -gn "$PIPER_USER" 2>/dev/null || echo "$PIPER_USER")}"
 
 log() { printf '\n== %s\n' "$*"; }
 
@@ -47,10 +56,12 @@ cmd_install() {
   "$PY" -m pip install "piper-tts[http]==$PIPER_VERSION"
 
   for voice in "$VOICE_IT" "$VOICE_EN"; do
-    if [ -f "$MODELS_DIR/$voice.onnx" ]; then
+    # A voice is usable only if BOTH the weights and their config exist; a
+    # half-download (one file) must be re-fetched, not skipped.
+    if [ -f "$MODELS_DIR/$voice.onnx" ] && [ -f "$MODELS_DIR/$voice.onnx.json" ]; then
       log "voice already present: $voice"
     else
-      log "downloading voice: $voice"
+      log "downloading voice: $voice (need both .onnx and .onnx.json)"
       # piper1-gpl ships a downloader; if this flag differs on your build,
       # download the .onnx + .onnx.json into $MODELS_DIR by hand.
       "$PY" -m piper.download_voices "$voice" --download-dir "$MODELS_DIR"
@@ -68,6 +79,10 @@ Description=Nabaztag Piper TTS ($1) on :$2
 After=network.target
 
 [Service]
+# Run as a non-privileged user (never root), consistent with PIPER_HOME.
+User=$PIPER_USER
+Group=$PIPER_GROUP
+NoNewPrivileges=true
 ExecStart=$PY -m piper.http_server --model $MODELS_DIR/$1.onnx --host 127.0.0.1 --port $2
 Restart=on-failure
 # Keep the model warm; the whole point is not reloading per utterance.
@@ -96,7 +111,9 @@ _serve_bg() {  # $1=voice $2=port -> echoes PID
 
 _wait_health() {  # $1=port
   for _ in $(seq 1 40); do
-    if curl -fsS "http://127.0.0.1:$1/" >/dev/null 2>&1; then return 0; fi
+    # Readiness probe: piper1-gpl serves synthesis at POST /, so GET / returns
+    # 405 — GET /voices is the endpoint that answers 200 once the model is warm.
+    if curl -fsS "http://127.0.0.1:$1/voices" >/dev/null 2>&1; then return 0; fi
     sleep 0.5
   done
   return 1
@@ -126,9 +143,13 @@ cmd_smoke() {
   log "smoke passed. Servers were transient; use 'units' for the persistent setup."
 }
 
-case "${1:-}" in
-  install) cmd_install ;;
-  units)   cmd_units ;;
-  smoke)   cmd_smoke ;;
-  *) echo "usage: $0 {install|units|smoke}" >&2; exit 2 ;;
-esac
+# Only dispatch when executed directly — sourcing (e.g. from tests that exercise
+# _wait_health against a mock server) must not trigger a subcommand.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  case "${1:-}" in
+    install) cmd_install ;;
+    units)   cmd_units ;;
+    smoke)   cmd_smoke ;;
+    *) echo "usage: $0 {install|units|smoke}" >&2; exit 2 ;;
+  esac
+fi
