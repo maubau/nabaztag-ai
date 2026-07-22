@@ -409,6 +409,130 @@ def test_make_tts_provider_deepgram_gain_from_env(tmp_path):
     assert prov._gain_db == 6.0
 
 
+def _wav_bytes(seconds: float = 0.5, rate: int = 22_050) -> bytes:
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"\x00\x00" * int(rate * seconds))
+    return buf.getvalue()
+
+
+def test_piper_routes_by_language():
+    from rabbit_brain.tts.piper_tts import PiperTTS
+
+    p = PiperTTS(Path("/tmp"), url_it="http://it:5001/", url_en="http://en:5002/")
+    assert p.url_for("it") == "http://it:5001"
+    assert p.url_for("en") == "http://en:5002"
+    assert p.url_for("en-US") == "http://en:5002"  # region tag tolerated
+    assert p.url_for(None) == "http://it:5001"  # default language
+
+
+async def test_piper_missing_language_server_raises():
+    # bilingual is the requirement: a language with no server must NOT silently
+    # reuse the other voice
+    from rabbit_brain.tts.piper_tts import PiperTTS
+
+    p = PiperTTS(Path("/tmp"), url_it="http://it:5001", url_en=None)
+    import pytest
+
+    with pytest.raises(RuntimeError, match="no Piper server"):
+        await p.synth("hello", language="en")
+
+
+async def test_piper_synth_hits_language_server_and_transcodes(tmp_path, monkeypatch):
+    from aiohttp import web
+    from rabbit_brain.tts.piper_tts import PiperTTS
+
+    seen = []
+
+    async def handler(request: web.Request) -> web.Response:
+        seen.append((request.path, (await request.json())["text"]))
+        return web.Response(body=_wav_bytes(0.5), content_type="audio/wav")
+
+    app = web.Application()
+    app.router.add_post("/", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+
+    # don't shell out to ffmpeg in CI; just write the mp3 stand-in
+    async def fake_transcode(self, wav, mp3_path):
+        Path(mp3_path).write_bytes(b"mp3")  # noqa: ASYNC240 — test stub, no real I/O contention
+
+    monkeypatch.setattr(PiperTTS, "_transcode", fake_transcode)
+    try:
+        async with PiperTTS(
+            tmp_path,
+            url_it=f"http://127.0.0.1:{port}",
+            url_en=f"http://127.0.0.1:{port}",
+        ) as p:
+            result = await p.synth("Ciao dal coniglio", language="it")
+    finally:
+        await runner.cleanup()
+    assert result.path.exists()
+    assert abs(result.duration_s - 0.5) < 0.01  # duration from the WAV
+    assert seen[0][1] == "Ciao dal coniglio"  # text reached the server
+
+
+async def test_piper_falls_back_on_error(tmp_path):
+    from rabbit_brain.tts.piper_tts import PiperTTS
+
+    class FakeFallback:
+        def __init__(self):
+            self.called = []
+
+        async def synth(self, text, language=None):
+            self.called.append((text, language))
+            path = tmp_path / "fb.mp3"
+            path.write_bytes(b"x")
+            return TTSResult(path=path, duration_s=1.0)
+
+    fb = FakeFallback()
+    # unreachable server → synth raises internally → fallback runs
+    p = PiperTTS(
+        tmp_path,
+        url_it="http://127.0.0.1:1/",
+        url_en="http://127.0.0.1:1/",
+        fallback=fb,
+        timeout_s=0.2,
+    )
+    result = await p.synth("Ciao", language="it")
+    assert result.duration_s == 1.0
+    assert fb.called == [("Ciao", "it")]  # language forwarded to the fallback
+    await p.close()
+
+
+def test_make_tts_provider_piper_builds_http_client_with_fallback(tmp_path):
+    from rabbit_brain.tts import make_tts_provider
+    from rabbit_brain.tts.piper_tts import PiperTTS
+
+    env = {
+        "TTS_PROFILE": "piper",
+        "PIPER_URL_IT": "http://127.0.0.1:5001",
+        "PIPER_URL_EN": "http://127.0.0.1:5002",
+        "DEEPGRAM_API_KEY": "k",  # → Deepgram fallback wired
+    }
+    prov = make_tts_provider(tmp_path, env=env)
+    assert isinstance(prov, PiperTTS)
+    assert prov.url_for("en") == "http://127.0.0.1:5002"
+    assert prov._fallback is not None  # degrades to Deepgram
+
+
+def test_make_tts_provider_piper_requires_both_urls(tmp_path):
+    import pytest
+    from rabbit_brain.tts import make_tts_provider
+
+    with pytest.raises(KeyError):  # missing PIPER_URL_EN → bench skips cleanly
+        make_tts_provider(tmp_path, env={"TTS_PROFILE": "piper", "PIPER_URL_IT": "http://x:1"})
+
+
 async def test_deepgram_tts_synth_skips_gain_when_zero(tmp_path, monkeypatch):
     import asyncio
 

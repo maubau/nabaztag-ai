@@ -352,6 +352,35 @@ Hardware half — status on the real rabbit:
     `brain/scripts/tts-bench.py`; (b) shorter spoken replies; (c) anticipatory synthesis of the
     first sentence ONLY where semantically safe (no later tool call could contradict it) — a
     design-heavy change, not started, needs its own pass.
+22. **TTS provider decision + Piper redesign (July 2026, hardware A/B).** Deepgram Aura STAYS the
+    production TTS. ElevenLabs A/B: synthetic bench 970ms but ~3700ms median IN the real
+    conversation (short fixed phrases mispredicted it — synth time scales with chars, so
+    tts-bench now uses full reply-length sentences and reports chars), Italian markedly worse and
+    very quiet, English better, no perceptible whole-conversation latency win → not promoted.
+    tts-bench gained --keep-audio/--output-dir (labelled MP3s per synth, same texts across
+    profiles for A/B listening) and a per-profile×LANGUAGE breakdown (it/en compared separately);
+    ElevenLabsTTS logs chars/time/duration like DeepgramTTS.
+    **Before Piper can even be benchmarked, it was redesigned** (the old provider was unfit):
+    - It used ONE `PIPER_MODEL` and dropped `language` → regressed the bilingual it/en
+      requirement. Now `PIPER_URL_IT`/`PIPER_URL_EN`, routed by the Flux-detected language; both
+      required (a missing language raises rather than silently reusing the other voice).
+    - It spawned the CLI per synth, reloading the model — Piper's own docs call that slow and
+      steer to the HTTP server for repeated use, so benchmarking the CLI would measure a
+      deliberately inefficient path. Now an HTTP CLIENT of a PERSISTENT local Piper server (one
+      warm server per language); WAV→MP3 via ffmpeg (rabbit streams MP3). Optional Deepgram
+      fallback on timeout/error.
+    - **Licence/provenance**: the Piper engine (OHF-Voice/piper1-gpl, release 1.4.2) is GPL-3.0.
+      It runs ONLY as an external localhost process — NO Piper code is imported, vendored, or
+      copied into this Apache-2.0 tree; the brain talks to it over HTTP exactly like Deepgram/
+      OpenAI (clean process boundary, not a derivative work). Candidate IT voice
+      it_IT-paola-medium (22.05 kHz, medium; CC0 training dataset); a licence-compatible EN voice
+      must still be chosen and documented before promotion.
+    - **OPEN — verify when the install script pins the server**: the exact Piper HTTP request/
+      response shape (`PiperTTS._request_wav` is the single place to adjust, same discipline as
+      the Flux schema note). Only AFTER the server/provider are settled: a reproducible, PINNED
+      Bolt install script (two warm servers + models). No manual PIPER_URL setup requested yet.
+    Piper is a CANDIDATE, not production: promote only if it wins BOTH latency AND on-Nabaztag
+    listening (per-language) — never on the synthetic RTF alone.
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 

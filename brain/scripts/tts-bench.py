@@ -158,19 +158,27 @@ async def main(profiles: list[str], sentences, runs: int, output_dir: Path | Non
                 await _bench_profile(profile, sentences, runs, audio_dir, output_dir=output_dir)
             )
 
-    print("\n--- summary (median synth time per profile) ---")
+    # Break down BY LANGUAGE, not just per profile: it and en can synthesize
+    # at very different speeds (different models/voices), and the it/en quality
+    # gap is exactly what sank ElevenLabs, so an aggregate would hide it.
+    print("\n--- summary (median synth time per profile × language) ---")
+    languages = sorted({r.language for r in results})
     for profile in profiles:
-        subset = [r for r in results if r.profile == profile]
-        if not subset:
+        prof_rows = [r for r in results if r.profile == profile]
+        if not prof_rows:
             print(f"{profile:12s} no data")
             continue
-        chars = _median([r.chars for r in subset])
-        synth = _median([r.synth_ms for r in subset])
-        rtf = _median([r.rtf for r in subset if r.rtf == r.rtf])  # drop NaN
-        print(
-            f"{profile:12s} chars_median={chars:.0f}  synth_median={synth:.0f}ms  "
-            f"rtf_median={rtf:.2f}  n={len(subset)}"
-        )
+        for language in languages:
+            subset = [r for r in prof_rows if r.language == language]
+            if not subset:
+                continue
+            chars = _median([r.chars for r in subset])
+            synth = _median([r.synth_ms for r in subset])
+            rtf = _median([r.rtf for r in subset if r.rtf == r.rtf])  # drop NaN
+            print(
+                f"{profile:12s} {language:3s} chars_median={chars:.0f}  "
+                f"synth_median={synth:.0f}ms  rtf_median={rtf:.2f}  n={len(subset)}"
+            )
     if output_dir is not None:
         print(f"\nMP3s kept in {output_dir}/ — listen there to judge voice quality.")
     print(

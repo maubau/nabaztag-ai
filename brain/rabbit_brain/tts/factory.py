@@ -47,10 +47,28 @@ def make_tts_provider(
     if profile == "piper":
         from .piper_tts import PiperTTS
 
+        # Bilingual by routing to a per-language PERSISTENT Piper server
+        # (PIPER_URL_IT/_EN); the CLI-per-utterance path was dropped as
+        # deliberately slow (see piper_tts.py). Piper is a candidate, not
+        # production, so it degrades to Deepgram on timeout/error when a
+        # DEEPGRAM_API_KEY is available.
+        fallback = None
+        if env.get("DEEPGRAM_API_KEY"):
+            from .deepgram_tts import DeepgramTTS
+
+            fallback = DeepgramTTS(
+                audio_dir,
+                api_key=env.get("DEEPGRAM_API_KEY"),
+                voice_it=env.get("DEEPGRAM_TTS_VOICE_IT", "aura-2-livia-it"),
+                voice_en=env.get("DEEPGRAM_TTS_VOICE_EN", "aura-2-thalia-en"),
+            )
+        # both required: the point is bilingual it/en (KeyError → the bench
+        # skips the profile cleanly, the runtime fails loudly at startup).
         return PiperTTS(
             audio_dir,
-            model_path=env["PIPER_MODEL"],
-            piper_bin=env.get("PIPER_BIN", "piper"),
+            url_it=env["PIPER_URL_IT"],
+            url_en=env["PIPER_URL_EN"],
+            fallback=fallback,
         )
     return None
 
