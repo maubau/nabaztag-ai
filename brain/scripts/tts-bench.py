@@ -26,8 +26,9 @@ Piper failure is recorded AS a failure; and as a second guard, any result whose
 own provider tag isn't the profile being benched is discarded, never counted.
 
     # on the Bolt, with the relevant provider credentials already exported in
-    # the environment (same names the runtime reads; see .env.example) plus
-    # PIPER_MODEL for the local voice, then:
+    # the environment (same names the runtime reads; see .env.example) — for the
+    # local voice PIPER_URL_IT/EN and, for the tuned run, PIPER_LENGTH_SCALE_IT/EN
+    # (the pace flows through the same factory the runtime uses), then:
     python brain/scripts/tts-bench.py --profiles deepgram,elevenlabs,piper --runs 3
 
 Timing alone can't settle voice QUALITY, nor even real latency — hardware

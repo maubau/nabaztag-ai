@@ -14,8 +14,14 @@
 #
 # VOICES (record each licence; honour attribution):
 #   IT  it_IT-paola-medium   22.05 kHz medium   CC0 dataset
-#   EN  en_US-sam-medium     22.05 kHz medium   Apache-2.0 dataset  (recommended)
-#       alternative en_GB-alba-medium (CC BY 4.0 — REQUIRES attribution)
+#   EN  en_GB-alba-medium    22.05 kHz medium   SELECTED on-Nabaztag (Sam was
+#       judged flat). Voice model is CC BY 4.0 → ATTRIBUTION REQUIRED:
+#       "en_GB-alba-medium" Piper voice, Alba dataset (University of Edinburgh),
+#       model card https://huggingface.co/rhasspy/piper-voices (en/en_GB/alba).
+#       en_US-sam-medium (Apache-2.0) is left installed as a comparison voice.
+#
+# PACE: the raw voices are too fast in Italian. PiperTTS sends length_scale per
+# language (IT=1.25, EN=1.0) via PIPER_LENGTH_SCALE_IT/EN; smoke exercises it.
 #
 # Does NOT touch TTS_PROFILE: production stays Deepgram. Piper is promoted only
 # after it wins latency AND on-Nabaztag listening. After `install` + servers up,
@@ -36,9 +42,12 @@ PIPER_HOME="${PIPER_HOME:-$HOME/.local/share/nabaztag-piper}"
 VENV_DIR="$PIPER_HOME/venv"
 MODELS_DIR="$PIPER_HOME/models"
 VOICE_IT="${VOICE_IT:-it_IT-paola-medium}"
-VOICE_EN="${VOICE_EN:-en_US-sam-medium}"
+VOICE_EN="${VOICE_EN:-en_GB-alba-medium}"     # selected over Sam on-Nabaztag; CC BY 4.0
 PORT_IT="${PORT_IT:-5001}"
 PORT_EN="${PORT_EN:-5002}"
+# Per-language pace sent by the smoke POST (matches PIPER_LENGTH_SCALE_IT/EN).
+LENGTH_SCALE_IT="${PIPER_LENGTH_SCALE_IT:-1.25}"
+LENGTH_SCALE_EN="${PIPER_LENGTH_SCALE_EN:-1.0}"
 PY="$VENV_DIR/bin/python"
 # systemd units must NOT run as root. Default to the invoking (non-root) user;
 # override with PIPER_USER/PIPER_GROUP if the servers should run as someone else.
@@ -68,7 +77,9 @@ cmd_install() {
     fi
   done
   log "installed. models in $MODELS_DIR"
-  echo "Then add to .env:  PIPER_URL_IT=http://127.0.0.1:$PORT_IT  PIPER_URL_EN=http://127.0.0.1:$PORT_EN"
+  echo "Then add to .env:"
+  echo "  PIPER_URL_IT=http://127.0.0.1:$PORT_IT   PIPER_URL_EN=http://127.0.0.1:$PORT_EN"
+  echo "  PIPER_LENGTH_SCALE_IT=$LENGTH_SCALE_IT   PIPER_LENGTH_SCALE_EN=$LENGTH_SCALE_EN   # tuned pace"
 }
 
 # Print a systemd unit for one voice server to stdout.
@@ -119,17 +130,17 @@ _wait_health() {  # $1=port
   return 1
 }
 
-_smoke_one() {  # $1=voice $2=port $3=text
-  log "smoke $1 on :$2"
+_smoke_one() {  # $1=voice $2=port $3=text $4=length_scale
+  log "smoke $1 on :$2 (length_scale=$4)"
   local pid; pid=$(_serve_bg "$1" "$2")
   trap 'kill '"$pid"' 2>/dev/null || true' RETURN
   if ! _wait_health "$2"; then
     echo "HEALTH CHECK FAILED (:$2) — see $PIPER_HOME/$1.log"; return 1
   fi
   local out="$PIPER_HOME/smoke-$1.wav"
-  # Confirmed API: POST JSON {"text": ...} → WAV body.
+  # Confirmed API: POST JSON {"text": ..., "length_scale": ...} → WAV body.
   curl -fsS -X POST "http://127.0.0.1:$2/" -H 'Content-Type: application/json' \
-    -d "{\"text\": \"$3\"}" -o "$out"
+    -d "{\"text\": \"$3\", \"length_scale\": $4}" -o "$out"
   if head -c 4 "$out" | grep -q RIFF; then
     echo "OK: $out ($(wc -c <"$out") bytes, RIFF/WAV)"
   else
@@ -138,8 +149,8 @@ _smoke_one() {  # $1=voice $2=port $3=text
 }
 
 cmd_smoke() {
-  _smoke_one "$VOICE_IT" "$PORT_IT" "Ciao, sono il coniglio."
-  _smoke_one "$VOICE_EN" "$PORT_EN" "Hello, I am the rabbit."
+  _smoke_one "$VOICE_IT" "$PORT_IT" "Ciao, sono il coniglio." "$LENGTH_SCALE_IT"
+  _smoke_one "$VOICE_EN" "$PORT_EN" "Hello, I am the rabbit." "$LENGTH_SCALE_EN"
   log "smoke passed. Servers were transient; use 'units' for the persistent setup."
 }
 

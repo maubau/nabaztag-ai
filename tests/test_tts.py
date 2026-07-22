@@ -432,6 +432,24 @@ def test_piper_routes_by_language():
     assert p.url_for(None) == "http://it:5001"  # default language
 
 
+def test_piper_length_scale_routes_by_language():
+    from rabbit_brain.tts.piper_tts import PiperTTS
+
+    p = PiperTTS(
+        Path("/tmp"),
+        url_it="http://it:5001",
+        url_en="http://en:5002",
+        length_scale_it=1.25,
+        length_scale_en=1.0,
+    )
+    assert p.length_scale_for("it") == 1.25
+    assert p.length_scale_for("en-GB") == 1.0  # region tag tolerated
+    assert p.length_scale_for(None) == 1.25  # default language
+    # unset → None so the server keeps its own default pace
+    bare = PiperTTS(Path("/tmp"), url_it="http://it:5001", url_en="http://en:5002")
+    assert bare.length_scale_for("it") is None
+
+
 async def test_piper_missing_language_server_raises():
     # bilingual is the requirement: a language with no server must NOT silently
     # reuse the other voice
@@ -480,6 +498,78 @@ async def test_piper_synth_hits_language_server_and_transcodes(tmp_path, monkeyp
     assert abs(result.duration_s - 0.5) < 0.01  # duration from the WAV
     assert result.provider == "piper"  # a real Piper result is tagged piper
     assert seen[0][1] == "Ciao dal coniglio"  # text reached the server
+
+
+async def test_piper_sends_per_language_length_scale_in_body(tmp_path, monkeypatch):
+    from aiohttp import web
+    from rabbit_brain.tts.piper_tts import PiperTTS
+
+    bodies = []
+
+    async def handler(request: web.Request) -> web.Response:
+        bodies.append(await request.json())
+        return web.Response(body=_wav_bytes(0.3), content_type="audio/wav")
+
+    app = web.Application()
+    app.router.add_post("/", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+
+    async def fake_transcode(self, wav, mp3_path):
+        Path(mp3_path).write_bytes(b"mp3")  # noqa: ASYNC240 — test stub, no real I/O contention
+
+    monkeypatch.setattr(PiperTTS, "_transcode", fake_transcode)
+    try:
+        async with PiperTTS(
+            tmp_path,
+            url_it=f"http://127.0.0.1:{port}",
+            url_en=f"http://127.0.0.1:{port}",
+            length_scale_it=1.25,
+            length_scale_en=1.0,
+        ) as p:
+            await p.synth("Ciao", language="it")
+            await p.synth("Hello", language="en")
+    finally:
+        await runner.cleanup()
+    assert bodies[0]["length_scale"] == 1.25  # IT paced per config
+    assert bodies[1]["length_scale"] == 1.0  # EN paced per config
+
+
+async def test_piper_omits_length_scale_when_unset(tmp_path, monkeypatch):
+    from aiohttp import web
+    from rabbit_brain.tts.piper_tts import PiperTTS
+
+    bodies = []
+
+    async def handler(request: web.Request) -> web.Response:
+        bodies.append(await request.json())
+        return web.Response(body=_wav_bytes(0.3), content_type="audio/wav")
+
+    app = web.Application()
+    app.router.add_post("/", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+
+    async def fake_transcode(self, wav, mp3_path):
+        Path(mp3_path).write_bytes(b"mp3")  # noqa: ASYNC240 — test stub, no real I/O contention
+
+    monkeypatch.setattr(PiperTTS, "_transcode", fake_transcode)
+    try:
+        async with PiperTTS(
+            tmp_path,
+            url_it=f"http://127.0.0.1:{port}",
+            url_en=f"http://127.0.0.1:{port}",
+        ) as p:
+            await p.synth("Ciao", language="it")
+    finally:
+        await runner.cleanup()
+    assert "length_scale" not in bodies[0]  # unset → server keeps its default
 
 
 async def test_piper_falls_back_on_error_keeping_the_fallback_tag(tmp_path):
@@ -560,6 +650,33 @@ def test_make_tts_provider_piper_requires_both_urls(tmp_path):
 
     with pytest.raises(KeyError):  # missing PIPER_URL_EN → bench skips cleanly
         make_tts_provider(tmp_path, env={"TTS_PROFILE": "piper", "PIPER_URL_IT": "http://x:1"})
+
+
+def test_make_tts_provider_piper_parses_length_scales(tmp_path):
+    from rabbit_brain.tts import make_tts_provider
+
+    prov = make_tts_provider(
+        tmp_path, env=_piper_env(PIPER_LENGTH_SCALE_IT="1.25", PIPER_LENGTH_SCALE_EN="1.0")
+    )
+    assert prov.length_scale_for("it") == 1.25
+    assert prov.length_scale_for("en") == 1.0
+
+
+def test_make_tts_provider_piper_length_scale_defaults_to_none(tmp_path):
+    from rabbit_brain.tts import make_tts_provider
+
+    prov = make_tts_provider(tmp_path, env=_piper_env())
+    assert prov.length_scale_for("it") is None  # unset → server default pace
+
+
+def test_make_tts_provider_piper_rejects_bad_length_scale(tmp_path):
+    import pytest
+    from rabbit_brain.tts import make_tts_provider
+
+    with pytest.raises(ValueError, match="must be > 0"):
+        make_tts_provider(tmp_path, env=_piper_env(PIPER_LENGTH_SCALE_IT="0"))
+    with pytest.raises(ValueError, match="positive float"):
+        make_tts_provider(tmp_path, env=_piper_env(PIPER_LENGTH_SCALE_EN="fast"))
 
 
 def test_tts_result_carries_provider_tag(tmp_path):

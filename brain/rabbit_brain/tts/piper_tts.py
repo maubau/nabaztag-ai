@@ -17,9 +17,15 @@ LICENCE / PROVENANCE (important — this brain is Apache-2.0):
     derivative work.
   - Voices (each has its own licence — record it, and honour attribution):
       IT: it_IT-paola-medium (22.05 kHz, medium; CC0 training dataset).
-      EN: en_US-sam-medium (22.05 kHz, medium; Apache-2.0 dataset) — the
-          recommended default. Alternative en_GB-alba-medium (CC BY 4.0)
-          REQUIRES attribution if used.
+      EN: en_GB-alba-medium (22.05 kHz, medium) — SELECTED on-Nabaztag over
+          en_US-sam-medium (which was judged flat/lifeless). Alba's voice model
+          is CC BY 4.0 and REQUIRES ATTRIBUTION: "en_GB-alba-medium" Piper voice,
+          trained on the Alba dataset (University of Edinburgh; see the model
+          card at https://huggingface.co/rhasspy/piper-voices, en/en_GB/alba).
+
+Per-language pace: the raw voices came out too fast in Italian, so synthesis
+takes an optional `length_scale` PER LANGUAGE (>1 slower, <1 faster), sent in
+the POST body. Hardware A/B (July 2026) picked IT=1.25 (Paola) and EN=1.0 (Alba).
 
 Production TTS stays Deepgram Aura; Piper is a candidate that must win BOTH
 latency and on-Nabaztag listening before it is promoted. This provider therefore
@@ -61,6 +67,8 @@ class PiperTTS:
         url_it: str | None = None,
         url_en: str | None = None,
         default_language: str = "it",
+        length_scale_it: float | None = None,
+        length_scale_en: float | None = None,
         ffmpeg_bin: str = "ffmpeg",
         timeout_s: float = DEFAULT_TIMEOUT_S,
         session: aiohttp.ClientSession | None = None,
@@ -70,6 +78,8 @@ class PiperTTS:
         self._audio_dir.mkdir(parents=True, exist_ok=True)
         self._url_it = url_it.rstrip("/") if url_it else None
         self._url_en = url_en.rstrip("/") if url_en else None
+        self._length_scale_it = length_scale_it
+        self._length_scale_en = length_scale_en
         self._default_language = default_language
         self._ffmpeg = ffmpeg_bin
         self._timeout = aiohttp.ClientTimeout(total=timeout_s)
@@ -89,6 +99,11 @@ class PiperTTS:
                 "(set PIPER_URL_IT / PIPER_URL_EN)"
             )
         return url
+
+    def length_scale_for(self, language: str | None) -> float | None:
+        """Per-language speaking pace (>1 slower). None → the server's default."""
+        lang = (language or self._default_language).lower()
+        return self._length_scale_en if lang.startswith("en") else self._length_scale_it
 
     async def __aenter__(self) -> PiperTTS:
         if self._session is None:
@@ -122,15 +137,18 @@ class PiperTTS:
             self._session = aiohttp.ClientSession()
             self._own_session = True
         url = self.url_for(language)
+        length_scale = self.length_scale_for(language)
         t_request = time.monotonic()
-        wav = await self._request_wav(url, text)
+        wav = await self._request_wav(url, text, length_scale)
         t_wav = time.monotonic()
         wav_duration = _wav_duration(wav)
         mp3_path = self._audio_dir / f"{uuid.uuid4().hex}.mp3"
         await self._transcode(wav, mp3_path)
         log.info(
-            "piper tts timing: lang=%s chars=%d server_ms=%d transcode_ms=%d duration_s=%.2f",
+            "piper tts timing: lang=%s length_scale=%s chars=%d "
+            "server_ms=%d transcode_ms=%d duration_s=%.2f",
             (language or self._default_language),
+            length_scale,
             len(text),
             round((t_wav - t_request) * 1000),
             round((time.monotonic() - t_wav) * 1000),
@@ -138,12 +156,16 @@ class PiperTTS:
         )
         return TTSResult(path=mp3_path, duration_s=wav_duration, provider="piper")
 
-    async def _request_wav(self, url: str, text: str) -> bytes:
+    async def _request_wav(self, url: str, text: str, length_scale: float | None = None) -> bytes:
         """POST {"text": ...} to the Piper server and return WAV bytes
         (confirmed against piper1-gpl 1.4.2 — see module docstring). Kept in
-        one place so the wire shape has a single home."""
+        one place so the wire shape has a single home. `length_scale`, when set,
+        rides along in the same body to pace the voice per language."""
         assert self._session is not None
-        async with self._session.post(url, json={"text": text}, timeout=self._timeout) as resp:
+        payload: dict[str, object] = {"text": text}
+        if length_scale is not None:
+            payload["length_scale"] = length_scale
+        async with self._session.post(url, json=payload, timeout=self._timeout) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"Piper HTTP {resp.status}: {(await resp.text())[:200]}")
             return await resp.read()

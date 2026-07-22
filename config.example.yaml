@@ -47,9 +47,11 @@ local_whisper:
 # TTS profile (informational — the runtime reads TTS_PROFILE from .env):
 # "deepgram" (Aura, voice routed by the STT-detected it/en language),
 # "elevenlabs" (one multilingual voice), or "piper" (local, bilingual via a
-# persistent Piper HTTP server per language — PIPER_URL_IT/_EN in .env; GPL-3.0
-# engine run as an external process, no code vendored; a candidate, not yet
-# promoted — must win latency AND on-rabbit listening first).
+# persistent Piper HTTP server per language — PIPER_URL_IT/_EN in .env, paced by
+# PIPER_LENGTH_SCALE_IT/_EN; GPL-3.0 engine run as an external process, no code
+# vendored; voices it_IT-paola-medium + en_GB-alba-medium (CC BY 4.0, attribution
+# required); a candidate, not yet promoted — must win latency AND on-rabbit
+# listening first).
 tts_profile: deepgram
 
 deepgram_tts:

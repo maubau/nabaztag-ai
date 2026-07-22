@@ -54,13 +54,33 @@ def make_tts_provider(
             fallback = _make_deepgram(audio_dir, env)
         # both required: the point is bilingual it/en (KeyError → the bench
         # skips the profile cleanly, the runtime fails loudly at startup).
+        # Per-language pace: the raw voices ran too fast in Italian; the tuned
+        # values (hardware A/B, July 2026) are IT=1.25, EN=1.0.
         return PiperTTS(
             audio_dir,
             url_it=env["PIPER_URL_IT"],
             url_en=env["PIPER_URL_EN"],
+            length_scale_it=_pos_float(env, "PIPER_LENGTH_SCALE_IT"),
+            length_scale_en=_pos_float(env, "PIPER_LENGTH_SCALE_EN"),
             fallback=fallback,
         )
     return None
+
+
+def _pos_float(env: dict[str, str], name: str) -> float | None:
+    """Parse an optional positive float from env. Unset/blank → None (use the
+    server default); anything non-numeric or ≤0 is a configuration error and
+    raises, rather than silently mis-pacing the voice."""
+    raw = env.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive float, got {raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be > 0, got {value}")
+    return value
 
 
 def _flag(env: dict[str, str], name: str, default: bool) -> bool:
