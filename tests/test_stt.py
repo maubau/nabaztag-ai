@@ -249,6 +249,72 @@ async def test_fallback_mirrors_primary_endpointing_and_signals_end_of_turn():
     assert ended == ["fallback ok"]  # the turn was closed for the pipeline
 
 
+async def test_flux_raises_schema_error_on_close_with_no_turninfo():
+    """Socket closes having sent only unrecognisable messages → schema
+    mismatch, raised so FallbackSTT can engage (the earlier tolerant path
+    silently returned empty and no fallback ran)."""
+    from rabbit_brain.stt.flux import FluxSchemaError
+
+    app, _ = flux_app(
+        [
+            {"type": "Metadata", "info": "x"},
+            {"type": "SomethingNew", "event": "???"},
+        ]
+    )
+    runner, port = await start_app(app)
+    try:
+        from rabbit_brain.stt import FluxSTT
+
+        stt = FluxSTT(api_key="k", ws_base=f"ws://127.0.0.1:{port}/v2/listen")
+        with pytest.raises(FluxSchemaError):
+            await stt.transcribe(stream([PCM]), 16_000)
+    finally:
+        await runner.cleanup()
+
+
+async def test_flux_raises_early_before_the_client_timeout():
+    """A wholesale schema mismatch must be caught by a handful of messages,
+    NOT by waiting out the (long) client timeout — otherwise the pipeline's
+    turn-timeout cancels the task first and no fallback ever runs."""
+    from rabbit_brain.stt import FluxSTT
+    from rabbit_brain.stt.flux import SCHEMA_MISMATCH_THRESHOLD, FluxSchemaError
+
+    async def flood(ws):
+        for _ in range(SCHEMA_MISMATCH_THRESHOLD + 5):
+            await ws.send_json({"type": "Wrong", "event": "nope"})
+
+    app, _ = flux_app(
+        [{"type": "TurnInfo", "event": "EndOfTurn", "transcript": "late"}], on_connect=flood
+    )
+    runner, port = await start_app(app)
+    try:
+        # a generous provider timeout: the schema guard must fire well before it
+        stt = FluxSTT(api_key="k", ws_base=f"ws://127.0.0.1:{port}/v2/listen", timeout_s=30)
+        with pytest.raises(FluxSchemaError):
+            await stt.transcribe(stream([PCM]), 16_000)
+    finally:
+        await runner.cleanup()
+
+
+async def test_flux_schema_error_falls_back_to_whisper():
+    """End-to-end: Flux schema mismatch → FallbackSTT replays buffered audio
+    to the (client-endpointing) fallback, and still signals end-of-turn."""
+    app, _ = flux_app([{"type": "Unknown"}])
+    runner, port = await start_app(app)
+    ended: list[str] = []
+    try:
+        from rabbit_brain.stt import FluxSTT
+
+        flux = FluxSTT(api_key="k", ws_base=f"ws://127.0.0.1:{port}/v2/listen")
+        stt = FallbackSTT(flux, CapturingSTT())
+        assert stt.detects_end_of_turn is True
+        result = await stt.transcribe(stream([PCM, PCM]), 16_000, on_end_of_turn=ended.append)
+    finally:
+        await runner.cleanup()
+    assert result.text == "fallback ok"
+    assert ended == ["fallback ok"]  # the pipeline's turn is closed, not abandoned
+
+
 async def test_whisper_api_posts_wav():
     got = {}
 

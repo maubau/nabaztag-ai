@@ -283,14 +283,19 @@ Hardware half — status on the real rabbit:
       timestamped for diagnostics but never dispatched on (no speculative LLM this round).
       Half-duplex and the drain chain are untouched. A client-side `turn_timeout_s` abandons the
       turn and re-arms if EndOfTurn never arrives.
-      **OPEN — verify on hardware**: (a) the exact Flux V2 message schema; the parser is
-      deliberately tolerant (unknown types/events ignored, every field defaulted) so a mismatch
-      degrades to "no transcript" + the Whisper fallback rather than crashing the turn, but the
-      field names here are from the docs, not from the wire. (b) **Whether flux-general-multi
-      reports a detected language at all.** If it doesn't, `STTResult.language` stays None and
-      the TTS falls back to its configured (Italian) voice — English replies would be spoken by
-      the Italian voice. `_language_of` accepts several plausible shapes and never guesses from
-      the text (§6.2.6). This is the one functional regression risk in L1.
+      **HARDWARE-CONFIRMED (July 2026, runtime 2487e04), three turns**:
+      speech_end→EndOfTurn 226/214/222 ms (vs the ~1875 ms it replaces); end_of_turn_confidence
+      0.89/0.73/0.78; audio cursor populated (3.04/5.52/4.96 s); language detected correctly
+      it/en/en; no timeout, no error. flux-general-multi DOES report language, so the L1
+      regression risk (English spoken in the Italian voice) did not materialise. The wire schema
+      matched the parser.
+      **Correction to the earlier "unknown schema → Whisper fallback" claim, which was NOT
+      actually guaranteed by the code** (spotted post-hardware): an all-unknown-events stream was
+      only ignored until the pipeline's turn-timeout cancelled the task — which abandons the turn
+      with NO fallback. Fixed: `FluxSTT` now raises `FluxSchemaError` when it recognises zero
+      TurnInfo (both on socket close and EARLY, after `SCHEMA_MISMATCH_THRESHOLD` unrecognised
+      messages, so it beats the timeout), and `FallbackSTT` catches it and replays the buffered
+      audio to Whisper, firing end-of-turn so the pipeline closes cleanly instead of stalling.
     - **L2, smaller LLM input**: `express` subsumes gesture_ears/set_mood_lights/play_gesture,
       so those three are no longer sent to the LLM (`VOICE_AGENT_TOOLS`) — the voice agent sees
       only express/get_direction/body_state. They remain fully executable for MCP and for
@@ -307,6 +312,25 @@ Hardware half — status on the real rabbit:
     - Not done, deliberately: **Gate L3** (progressive/streaming MP3) is a hardware PROBE first —
       does the MTL decoder start playing before the HTTP response completes? No new TTS
       architecture until that question is answered on the rabbit.
+20. **Gate L3 is now the main residual cost, and the probe to answer it is ready (July 2026,
+    runtime 2487e04).** Hardware timing pinned the bottleneck: Deepgram TTS total_http_ms
+    3923/4176/2780, of which request→headers 640-699 ms, headers→first-byte ≈ 0, and
+    first-byte→last-byte 2119-3476 ms. So the FIRST MP3 chunk is already in hand at ~0.7 s, but
+    `DeepgramTTS.synth()` accumulates every chunk, writes the whole file, applies the ffmpeg
+    gain, and only THEN queues a static URL — the multi-second first→last-byte window is dead
+    air the rabbit could in principle already be playing. Whether it CAN depends on one
+    unknown: does the MTL decoder play as bytes arrive, or buffer to EOF?
+    `brain/scripts/mp3-progressive-probe.py` (+ `ojn/apache/mp3-probe.conf.example`) answers it
+    without touching the production path: a localhost server dribbles a known MP3 out in small
+    `audio/mpeg` chunks over a controlled spread, logging connect/first-byte/last-byte, reached
+    through Apache (mandatory front, #12) via a reverse proxy and queued on the rabbit with
+    api_stream.jsp. Maurizio listens: sound at the first chunk → streaming works, build a
+    progressive path; sound only near last-byte → MTL buffers, keep the static file; no sound →
+    framing issue (the probe's own first/last-byte timestamps separate an Apache buffering
+    problem from an MTL one). **Do NOT change the production TTS path until the probe result is
+    in.** Target architecture IF it passes: random job URL → Apache reverse proxy → Deepgram
+    REST/WS stream → optional streaming ffmpeg gain+limiter → MTL, with the static path kept as
+    fallback.
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 

@@ -1,0 +1,37 @@
+# Gate L3 probe: reverse-proxy the progressive-MP3 probe server through Apache.
+#
+# Apache MUST stay in front of the rabbit: a direct aiohttp response to the
+# ancient HTTP/1.0 MTL client was 200 OK but silent (OJN_API_NOTES #12), while
+# the SAME bytes through Apache play. So the probe server binds localhost and
+# Apache proxies to it — the rabbit only ever talks to Apache on :80.
+#
+# This is a PROBE config, enabled by hand for a test session and disabled
+# after. It is NOT part of the production audio path (that stays the static
+# brain-audio alias).
+#
+# 1. Start the probe (adjust the MP3 path to a real, several-seconds clip):
+#      python brain/scripts/mp3-progressive-probe.py \
+#          --mp3 www/audio/some-known-clip.mp3 --spread 8 --port 8095
+# 2. Enable this config:
+#      sudo tee /etc/apache2/conf-available/mp3-probe.conf < ojn/apache/mp3-probe.conf.example
+#      sudo a2enmod proxy proxy_http
+#      sudo a2enconf mp3-probe && sudo systemctl reload apache2
+# 3. Queue it on the rabbit (VAPI api_stream.jsp, urlList by the alias):
+#      curl "http://127.0.0.1/ojn/FR/api_stream.jsp?sn=<sn>&token=<vapi>&urlList=http://192.168.66.1/mp3-probe/slow.mp3"
+#    then listen: does sound start right after the first chunk, only near the
+#    end (~spread seconds later), or never? (See the probe script's docstring.)
+# 4. When done: sudo a2disconf mp3-probe && sudo systemctl reload apache2
+#
+# Buffering caveat: mod_proxy_http streams the upstream body as it arrives, so
+# the rabbit should see bytes at the same cadence the probe emits them. If
+# audio never starts, rule Apache OUT before blaming MTL framing: the probe
+# logs its own first/last-byte timestamps — if those are spread out but the
+# rabbit still waits for the end, Apache buffered; if the probe's own timing is
+# already collapsed to one burst, the proxy buffered upstream of the rabbit.
+# `flushpackets=on` is only honoured by some proxy backends, not plain HTTP;
+# for HTTP the default streaming behaviour is what we want.
+
+ProxyRequests Off
+ProxyPreserveHost On
+ProxyPass        /mp3-probe/ http://127.0.0.1:8095/ retry=0
+ProxyPassReverse /mp3-probe/ http://127.0.0.1:8095/

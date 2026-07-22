@@ -11,10 +11,20 @@ transcript being usable. Flux is expected to land the same moment in the
 Protocol shape (VERIFY ON HARDWARE — see docs/OJN_API_NOTES.md): the socket
 carries JSON messages with a `type`; the interesting one is `TurnInfo`, whose
 `event` is one of `StartOfTurn`, `Update`, `EagerEndOfTurn`, `TurnResumed`,
-`EndOfTurn`. This parser is deliberately tolerant: unknown types/events are
-ignored rather than fatal, and every field is read with a default, so a schema
-that differs slightly from the above degrades to "no transcript" (and the
-FallbackSTT chain) instead of crashing the turn.
+`EndOfTurn`. Individual unknown types/events and stray non-JSON frames are
+ignored (a healthy stream mixes in Connected/Metadata), and every field is
+read with a default, so a schema that differs SLIGHTLY degrades gracefully.
+
+But a WHOLESALE schema mismatch (the server is clearly talking but we
+recognise no TurnInfo at all) is turned into a FluxSchemaError, both when the
+socket closes having produced no TurnInfo and, crucially, EARLY — after a
+handful of unrecognised messages — so it doesn't sit silent until the
+pipeline's turn-timeout cancels the task (which would abandon the turn with
+NO Whisper fallback). Raising lets FallbackSTT replay the buffered audio to
+Whisper. A real stream emits StartOfTurn on the first audio, so the early
+guard never trips on a healthy connection. (Hardware round, July 2026: the
+earlier "unknown schema → Whisper fallback" claim was not actually
+guaranteed by the code — this closes that gap.)
 
 This round uses ONLY `EndOfTurn`. `EagerEndOfTurn` is parsed and timestamped
 for diagnostics but never acted on — speculative LLM dispatch is explicitly
@@ -52,6 +62,19 @@ DEFAULT_EOT_TIMEOUT_MS = 5000
 # Hard client-side ceiling on one turn, so a silent or wedged socket can never
 # hold the pipeline open indefinitely.
 DEFAULT_TIMEOUT_S = 30.0
+# How many messages we may receive that parse but are NOT a recognised
+# TurnInfo, before we treat the stream as a wholesale schema mismatch and
+# raise (→ Whisper fallback) rather than waiting out the pipeline timeout.
+# A healthy stream sends a TurnInfo (StartOfTurn) on the first audio, well
+# inside this budget, so it never trips in practice.
+SCHEMA_MISMATCH_THRESHOLD = 12
+
+
+class FluxSchemaError(RuntimeError):
+    """The Flux socket produced messages but no recognisable TurnInfo — the
+    wire schema doesn't match what this parser expects. Raised so FallbackSTT
+    replays the buffered audio to Whisper instead of the turn being silently
+    abandoned at the pipeline timeout."""
 
 
 class FluxSTT:
@@ -121,6 +144,8 @@ class FluxSTT:
         self, ws: aiohttp.ClientWebSocketResponse, on_end_of_turn: EndOfTurnCallback | None
     ) -> STTResult:
         transcript = ""
+        recognized = 0  # TurnInfo messages we understood
+        unrecognized = 0  # parsed-but-not-TurnInfo, or non-JSON
         async for msg in ws:
             if msg.type != aiohttp.WSMsgType.TEXT:
                 break
@@ -128,9 +153,14 @@ class FluxSTT:
                 data = json.loads(msg.data)
             except json.JSONDecodeError:
                 log.warning("flux: non-JSON message ignored")
+                unrecognized += 1
+                self._raise_if_schema_mismatch(recognized, unrecognized)
                 continue
             if data.get("type") != "TurnInfo":
-                continue  # Connected / Metadata / anything new: not ours
+                unrecognized += 1  # Connected / Metadata / anything new
+                self._raise_if_schema_mismatch(recognized, unrecognized)
+                continue
+            recognized += 1
             event = data.get("event")
             self.last_turn_events.append(str(event))
             text = (data.get("transcript") or "").strip()
@@ -150,10 +180,25 @@ class FluxSTT:
                     audio_cursor_s=_float_or_none(data.get("audio_window_end")),
                     end_of_turn_confidence=_float_or_none(data.get("end_of_turn_confidence")),
                 )
-        # socket closed without an EndOfTurn: return whatever we heard so the
-        # caller can decide (empty text is treated as "no speech")
+        # Socket closed without an EndOfTurn. If we never recognised a single
+        # TurnInfo but the server WAS sending us messages, that's a schema
+        # mismatch → raise so the Whisper fallback runs (it has the audio).
+        if recognized == 0 and unrecognized > 0:
+            raise FluxSchemaError(
+                f"flux: {unrecognized} message(s), no recognisable TurnInfo (schema mismatch?)"
+            )
+        # Otherwise: a real but abruptly-ended turn (return what we heard), or
+        # a truly silent socket (empty text = no speech).
         log.info("flux: stream ended without EndOfTurn (events=%s)", self.last_turn_events)
         return STTResult(text=transcript, provider="deepgram-flux")
+
+    @staticmethod
+    def _raise_if_schema_mismatch(recognized: int, unrecognized: int) -> None:
+        if recognized == 0 and unrecognized >= SCHEMA_MISMATCH_THRESHOLD:
+            raise FluxSchemaError(
+                f"flux: {unrecognized} messages, no recognisable TurnInfo — "
+                "wire schema does not match (see stt/flux.py)"
+            )
 
 
 def _float_or_none(value: object) -> float | None:
