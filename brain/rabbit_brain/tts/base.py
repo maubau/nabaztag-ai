@@ -16,6 +16,11 @@ from typing import Protocol, runtime_checkable
 class TTSResult:
     path: Path
     duration_s: float
+    # which backend ACTUALLY produced this audio ("deepgram", "elevenlabs",
+    # "piper", …). Lets a caller tell a real result from a fallback — the
+    # tts-bench must never record a Deepgram-fallback clip under the "piper"
+    # label (latency round, July 2026). None where a provider doesn't set it.
+    provider: str | None = None
 
 
 @runtime_checkable

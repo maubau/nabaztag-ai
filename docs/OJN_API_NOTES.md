@@ -375,12 +375,26 @@ Hardware half — status on the real rabbit:
       OpenAI (clean process boundary, not a derivative work). Candidate IT voice
       it_IT-paola-medium (22.05 kHz, medium; CC0 training dataset); a licence-compatible EN voice
       must still be chosen and documented before promotion.
-    - **OPEN — verify when the install script pins the server**: the exact Piper HTTP request/
-      response shape (`PiperTTS._request_wav` is the single place to adjust, same discipline as
-      the Flux schema note). Only AFTER the server/provider are settled: a reproducible, PINNED
-      Bolt install script (two warm servers + models). No manual PIPER_URL setup requested yet.
+    - Piper HTTP request shape CONFIRMED against piper1-gpl 1.4.2 (review): POST JSON
+      {"text": text} → WAV body. `PiperTTS._request_wav` matches; the "verify" hedge is lifted.
+    - EN voice chosen: en_US-sam-medium (Apache-2.0 dataset, recommended); alternative
+      en_GB-alba-medium (CC BY 4.0 — requires attribution). IT stays it_IT-paola-medium (CC0).
+    - **Benchmark-contamination blocker fixed (review): on the Bolt DEEPGRAM_API_KEY is present,
+      so a failing Piper would return a Deepgram clip recorded under the "piper" label — could
+      promote Deepgram by accident.** Two guards: (a) `PIPER_FALLBACK_DEEPGRAM` env flag (default
+      on) that the factory honours; tts-bench forces it to `0`, so a Piper failure is recorded AS
+      a failure. (b) `TTSResult.provider` now carries the real backend; the fallback keeps ITS
+      OWN tag ("deepgram"), and tts-bench discards any row whose provider ≠ the profile benched.
+    - **Runtime fallback now inherits `DEEPGRAM_TTS_GAIN_DB`** (review): the factory builds the
+      Piper→Deepgram fallback through the same `_make_deepgram`, so a fallback utterance is not
+      suddenly quieter than the boosted production voice.
+    - **Pinned Bolt install script shipped**: `ojn/piper/install-piper.sh` {install|units|smoke}
+      — piper-tts[http]==1.4.2 in a SEPARATE venv (GPL boundary), the two voices, systemd unit
+      files (written, NOT auto-enabled — same caution as the runtime unit), and a health-check +
+      POST→WAV smoke. Does not touch TTS_PROFILE.
     Piper is a CANDIDATE, not production: promote only if it wins BOTH latency AND on-Nabaztag
-    listening (per-language) — never on the synthetic RTF alone.
+    listening (per-language) — never on the synthetic RTF alone. Next: run the server smoke, then
+    `tts-bench --profiles deepgram,piper --keep-audio` (fallback auto-disabled) and listen.
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 

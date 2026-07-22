@@ -82,4 +82,4 @@ class ElevenLabsTTS:
             round((time.monotonic() - t_request) * 1000),
             duration_s,
         )
-        return TTSResult(path=path, duration_s=duration_s)
+        return TTSResult(path=path, duration_s=duration_s, provider="elevenlabs")

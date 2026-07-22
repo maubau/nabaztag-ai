@@ -133,7 +133,7 @@ class DeepgramTTS:
             t_gain_ms,
             duration_s,
         )
-        return TTSResult(path=path, duration_s=duration_s)
+        return TTSResult(path=path, duration_s=duration_s, provider="deepgram")
 
     async def _apply_gain(self, path: Path) -> Path:
         boosted = path.with_suffix(".gain.mp3")

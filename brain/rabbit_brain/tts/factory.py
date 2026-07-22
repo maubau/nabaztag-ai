@@ -26,15 +26,7 @@ def make_tts_provider(
     env = env if env is not None else os.environ
     profile = env.get("TTS_PROFILE", "").lower()
     if profile == "deepgram":
-        from .deepgram_tts import DeepgramTTS
-
-        return DeepgramTTS(
-            audio_dir,
-            api_key=env.get("DEEPGRAM_API_KEY"),  # None → provider reads env itself
-            voice_it=env.get("DEEPGRAM_TTS_VOICE_IT", "aura-2-livia-it"),
-            voice_en=env.get("DEEPGRAM_TTS_VOICE_EN", "aura-2-thalia-en"),
-            gain_db=float(env.get("DEEPGRAM_TTS_GAIN_DB", "0") or 0),
-        )
+        return _make_deepgram(audio_dir, env)
     if profile == "elevenlabs":
         from .elevenlabs_tts import ElevenLabsTTS
 
@@ -50,18 +42,16 @@ def make_tts_provider(
         # Bilingual by routing to a per-language PERSISTENT Piper server
         # (PIPER_URL_IT/_EN); the CLI-per-utterance path was dropped as
         # deliberately slow (see piper_tts.py). Piper is a candidate, not
-        # production, so it degrades to Deepgram on timeout/error when a
-        # DEEPGRAM_API_KEY is available.
+        # production, so at RUNTIME it degrades to Deepgram on timeout/error.
+        # The fallback is built through the SAME _make_deepgram, so it inherits
+        # DEEPGRAM_TTS_GAIN_DB — otherwise a fallback utterance would suddenly
+        # be quieter than the boosted production voice (review, July 2026).
+        # PIPER_FALLBACK_DEEPGRAM=0 disables it entirely: the benchmark sets
+        # that automatically so a Piper failure is recorded as a FAILURE, never
+        # a silent Deepgram substitution under the "piper" label.
         fallback = None
-        if env.get("DEEPGRAM_API_KEY"):
-            from .deepgram_tts import DeepgramTTS
-
-            fallback = DeepgramTTS(
-                audio_dir,
-                api_key=env.get("DEEPGRAM_API_KEY"),
-                voice_it=env.get("DEEPGRAM_TTS_VOICE_IT", "aura-2-livia-it"),
-                voice_en=env.get("DEEPGRAM_TTS_VOICE_EN", "aura-2-thalia-en"),
-            )
+        if _flag(env, "PIPER_FALLBACK_DEEPGRAM", default=True) and env.get("DEEPGRAM_API_KEY"):
+            fallback = _make_deepgram(audio_dir, env)
         # both required: the point is bilingual it/en (KeyError → the bench
         # skips the profile cleanly, the runtime fails loudly at startup).
         return PiperTTS(
@@ -71,6 +61,25 @@ def make_tts_provider(
             fallback=fallback,
         )
     return None
+
+
+def _flag(env: dict[str, str], name: str, default: bool) -> bool:
+    raw = env.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _make_deepgram(audio_dir: str | Path, env: dict[str, str]):
+    from .deepgram_tts import DeepgramTTS
+
+    return DeepgramTTS(
+        audio_dir,
+        api_key=env.get("DEEPGRAM_API_KEY"),  # None → provider reads env itself
+        voice_it=env.get("DEEPGRAM_TTS_VOICE_IT", "aura-2-livia-it"),
+        voice_en=env.get("DEEPGRAM_TTS_VOICE_EN", "aura-2-thalia-en"),
+        gain_db=float(env.get("DEEPGRAM_TTS_GAIN_DB", "0") or 0),
+    )
 
 
 @dataclass

@@ -39,6 +39,7 @@ async def test_bench_profile_records_rows(monkeypatch, tmp_path):
     def fake_factory(audio_dir, env=None):
         p = FakeProvider(audio_dir)
         made["provider"] = p
+        made["env"] = env
         return p
 
     monkeypatch.setattr(mod, "make_tts_provider", fake_factory)
@@ -50,6 +51,45 @@ async def test_bench_profile_records_rows(monkeypatch, tmp_path):
     # char count recorded per row (drives synth-time scaling)
     assert {r.chars for r in rows} == {len("ciao"), len("hello")}
     assert made["provider"].calls[0] == ("ciao", "it")  # language forwarded
+    # the bench always disables the piper→deepgram fallback
+    assert made["env"]["PIPER_FALLBACK_DEEPGRAM"] == "0"
+
+
+async def test_bench_discards_fallback_leaked_result(monkeypatch, tmp_path):
+    """If a result comes back tagged as a different backend (a fallback leaking
+    through), it must be discarded — never counted under this profile."""
+    mod = _load()
+
+    class LeakyProvider(FakeProvider):
+        async def synth(self, text, language=None):
+            self.calls.append((text, language))
+            path = self.audio_dir / "leak.mp3"
+            path.write_bytes(b"x")
+            # asked for piper, got a deepgram (fallback) clip
+            return TTSResult(path=path, duration_s=1.0, provider="deepgram")
+
+    monkeypatch.setattr(
+        mod, "make_tts_provider", lambda audio_dir, env=None: LeakyProvider(audio_dir)
+    )
+    rows = await mod._bench_profile("piper", [("it", "ciao")], runs=3, audio_dir=tmp_path)
+    assert rows == []  # nothing credited to piper
+
+
+async def test_bench_counts_matching_provider_tag(monkeypatch, tmp_path):
+    mod = _load()
+
+    class TaggedProvider(FakeProvider):
+        async def synth(self, text, language=None):
+            self.calls.append((text, language))
+            path = self.audio_dir / f"utt{len(self.calls)}.mp3"
+            path.write_bytes(b"x")
+            return TTSResult(path=path, duration_s=1.0, provider="piper")
+
+    monkeypatch.setattr(
+        mod, "make_tts_provider", lambda audio_dir, env=None: TaggedProvider(audio_dir)
+    )
+    rows = await mod._bench_profile("piper", [("it", "ciao")], runs=2, audio_dir=tmp_path)
+    assert len(rows) == 2  # real piper results counted
 
 
 async def test_bench_profile_skips_when_key_missing(monkeypatch, tmp_path):

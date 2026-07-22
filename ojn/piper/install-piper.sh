@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# Reproducible, PINNED setup for the local Piper TTS candidate (latency work,
+# July 2026). Two persistent HTTP voice servers on localhost — Italian on 5001,
+# English on 5002 — that the brain's PiperTTS talks to over HTTP.
+#
+#   ./ojn/piper/install-piper.sh install   # venv + pinned piper + models
+#   ./ojn/piper/install-piper.sh units     # write systemd units (does NOT enable)
+#   ./ojn/piper/install-piper.sh smoke     # start transiently, health + POST→WAV, stop
+#
+# GPL BOUNDARY (important — the brain is Apache-2.0): Piper (OHF-Voice/piper1-gpl
+# 1.4.2, GPL-3.0) is installed in its OWN virtualenv, SEPARATE from the brain,
+# and only ever run as an external localhost process. No Piper code enters the
+# brain tree; the brain reaches it purely over HTTP, like Deepgram/OpenAI.
+#
+# VOICES (record each licence; honour attribution):
+#   IT  it_IT-paola-medium   22.05 kHz medium   CC0 dataset
+#   EN  en_US-sam-medium     22.05 kHz medium   Apache-2.0 dataset  (recommended)
+#       alternative en_GB-alba-medium (CC BY 4.0 — REQUIRES attribution)
+#
+# Does NOT touch TTS_PROFILE: production stays Deepgram. Piper is promoted only
+# after it wins latency AND on-Nabaztag listening. After `install` + servers up,
+# put PIPER_URL_IT/PIPER_URL_EN in .env and benchmark:
+#   python brain/scripts/tts-bench.py --profiles deepgram,piper --keep-audio
+#
+# Pinned so a re-run reproduces the same environment. Idempotent where it can be.
+
+set -euo pipefail
+
+PIPER_VERSION="${PIPER_VERSION:-1.4.2}"          # piper-tts[http]== this exact version
+PIPER_HOME="${PIPER_HOME:-$HOME/.local/share/nabaztag-piper}"
+VENV_DIR="$PIPER_HOME/venv"
+MODELS_DIR="$PIPER_HOME/models"
+VOICE_IT="${VOICE_IT:-it_IT-paola-medium}"
+VOICE_EN="${VOICE_EN:-en_US-sam-medium}"
+PORT_IT="${PORT_IT:-5001}"
+PORT_EN="${PORT_EN:-5002}"
+PY="$VENV_DIR/bin/python"
+
+log() { printf '\n== %s\n' "$*"; }
+
+cmd_install() {
+  log "Piper venv (isolated from the brain — GPL boundary): $VENV_DIR"
+  mkdir -p "$MODELS_DIR"
+  python3 -m venv "$VENV_DIR"
+  "$PY" -m pip install --upgrade pip >/dev/null
+  # PINNED: the HTTP-server extra of piper1-gpl at exactly $PIPER_VERSION.
+  "$PY" -m pip install "piper-tts[http]==$PIPER_VERSION"
+
+  for voice in "$VOICE_IT" "$VOICE_EN"; do
+    if [ -f "$MODELS_DIR/$voice.onnx" ]; then
+      log "voice already present: $voice"
+    else
+      log "downloading voice: $voice"
+      # piper1-gpl ships a downloader; if this flag differs on your build,
+      # download the .onnx + .onnx.json into $MODELS_DIR by hand.
+      "$PY" -m piper.download_voices "$voice" --download-dir "$MODELS_DIR"
+    fi
+  done
+  log "installed. models in $MODELS_DIR"
+  echo "Then add to .env:  PIPER_URL_IT=http://127.0.0.1:$PORT_IT  PIPER_URL_EN=http://127.0.0.1:$PORT_EN"
+}
+
+# Print a systemd unit for one voice server to stdout.
+_unit() {  # $1=voice $2=port
+  cat <<EOF
+[Unit]
+Description=Nabaztag Piper TTS ($1) on :$2
+After=network.target
+
+[Service]
+ExecStart=$PY -m piper.http_server --model $MODELS_DIR/$1.onnx --host 127.0.0.1 --port $2
+Restart=on-failure
+# Keep the model warm; the whole point is not reloading per utterance.
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+cmd_units() {
+  local out="$PIPER_HOME/systemd"
+  mkdir -p "$out"
+  _unit "$VOICE_IT" "$PORT_IT" > "$out/nabaztag-piper-it.service"
+  _unit "$VOICE_EN" "$PORT_EN" > "$out/nabaztag-piper-en.service"
+  log "wrote units to $out (NOT enabled — same caution as the runtime unit)"
+  echo "To enable them (persistent, warm on boot):"
+  echo "  sudo cp $out/nabaztag-piper-*.service /etc/systemd/system/"
+  echo "  sudo systemctl daemon-reload && sudo systemctl enable --now nabaztag-piper-it nabaztag-piper-en"
+}
+
+_serve_bg() {  # $1=voice $2=port -> echoes PID
+  "$PY" -m piper.http_server --model "$MODELS_DIR/$1.onnx" --host 127.0.0.1 --port "$2" \
+    >"$PIPER_HOME/$1.log" 2>&1 &
+  echo $!
+}
+
+_wait_health() {  # $1=port
+  for _ in $(seq 1 40); do
+    if curl -fsS "http://127.0.0.1:$1/" >/dev/null 2>&1; then return 0; fi
+    sleep 0.5
+  done
+  return 1
+}
+
+_smoke_one() {  # $1=voice $2=port $3=text
+  log "smoke $1 on :$2"
+  local pid; pid=$(_serve_bg "$1" "$2")
+  trap 'kill '"$pid"' 2>/dev/null || true' RETURN
+  if ! _wait_health "$2"; then
+    echo "HEALTH CHECK FAILED (:$2) — see $PIPER_HOME/$1.log"; return 1
+  fi
+  local out="$PIPER_HOME/smoke-$1.wav"
+  # Confirmed API: POST JSON {"text": ...} → WAV body.
+  curl -fsS -X POST "http://127.0.0.1:$2/" -H 'Content-Type: application/json' \
+    -d "{\"text\": \"$3\"}" -o "$out"
+  if head -c 4 "$out" | grep -q RIFF; then
+    echo "OK: $out ($(wc -c <"$out") bytes, RIFF/WAV)"
+  else
+    echo "UNEXPECTED: response is not WAV (see $out)"; return 1
+  fi
+}
+
+cmd_smoke() {
+  _smoke_one "$VOICE_IT" "$PORT_IT" "Ciao, sono il coniglio."
+  _smoke_one "$VOICE_EN" "$PORT_EN" "Hello, I am the rabbit."
+  log "smoke passed. Servers were transient; use 'units' for the persistent setup."
+}
+
+case "${1:-}" in
+  install) cmd_install ;;
+  units)   cmd_units ;;
+  smoke)   cmd_smoke ;;
+  *) echo "usage: $0 {install|units|smoke}" >&2; exit 2 ;;
+esac

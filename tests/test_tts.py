@@ -478,10 +478,11 @@ async def test_piper_synth_hits_language_server_and_transcodes(tmp_path, monkeyp
         await runner.cleanup()
     assert result.path.exists()
     assert abs(result.duration_s - 0.5) < 0.01  # duration from the WAV
+    assert result.provider == "piper"  # a real Piper result is tagged piper
     assert seen[0][1] == "Ciao dal coniglio"  # text reached the server
 
 
-async def test_piper_falls_back_on_error(tmp_path):
+async def test_piper_falls_back_on_error_keeping_the_fallback_tag(tmp_path):
     from rabbit_brain.tts.piper_tts import PiperTTS
 
     class FakeFallback:
@@ -492,7 +493,7 @@ async def test_piper_falls_back_on_error(tmp_path):
             self.called.append((text, language))
             path = tmp_path / "fb.mp3"
             path.write_bytes(b"x")
-            return TTSResult(path=path, duration_s=1.0)
+            return TTSResult(path=path, duration_s=1.0, provider="deepgram")
 
     fb = FakeFallback()
     # unreachable server → synth raises internally → fallback runs
@@ -506,23 +507,51 @@ async def test_piper_falls_back_on_error(tmp_path):
     result = await p.synth("Ciao", language="it")
     assert result.duration_s == 1.0
     assert fb.called == [("Ciao", "it")]  # language forwarded to the fallback
+    # crucial: the fallback clip is tagged "deepgram", NOT "piper", so a caller
+    # (tts-bench) can never credit it to Piper
+    assert result.provider == "deepgram"
     await p.close()
+
+
+def _piper_env(**extra):
+    return {
+        "TTS_PROFILE": "piper",
+        "PIPER_URL_IT": "http://127.0.0.1:5001",
+        "PIPER_URL_EN": "http://127.0.0.1:5002",
+        **extra,
+    }
 
 
 def test_make_tts_provider_piper_builds_http_client_with_fallback(tmp_path):
     from rabbit_brain.tts import make_tts_provider
     from rabbit_brain.tts.piper_tts import PiperTTS
 
-    env = {
-        "TTS_PROFILE": "piper",
-        "PIPER_URL_IT": "http://127.0.0.1:5001",
-        "PIPER_URL_EN": "http://127.0.0.1:5002",
-        "DEEPGRAM_API_KEY": "k",  # → Deepgram fallback wired
-    }
-    prov = make_tts_provider(tmp_path, env=env)
+    prov = make_tts_provider(tmp_path, env=_piper_env(DEEPGRAM_API_KEY="k"))
     assert isinstance(prov, PiperTTS)
     assert prov.url_for("en") == "http://127.0.0.1:5002"
-    assert prov._fallback is not None  # degrades to Deepgram
+    assert prov._fallback is not None  # degrades to Deepgram at runtime
+
+
+def test_make_tts_provider_piper_fallback_disabled_by_flag(tmp_path):
+    # the benchmark sets PIPER_FALLBACK_DEEPGRAM=0 so a Piper failure never
+    # comes back as a silent Deepgram clip
+    from rabbit_brain.tts import make_tts_provider
+
+    prov = make_tts_provider(
+        tmp_path, env=_piper_env(DEEPGRAM_API_KEY="k", PIPER_FALLBACK_DEEPGRAM="0")
+    )
+    assert prov._fallback is None
+
+
+def test_make_tts_provider_piper_fallback_inherits_gain(tmp_path):
+    # the Deepgram fallback must carry DEEPGRAM_TTS_GAIN_DB, or a fallback
+    # utterance would suddenly be quieter than the boosted production voice
+    from rabbit_brain.tts import make_tts_provider
+
+    prov = make_tts_provider(
+        tmp_path, env=_piper_env(DEEPGRAM_API_KEY="k", DEEPGRAM_TTS_GAIN_DB="6")
+    )
+    assert prov._fallback._gain_db == 6.0
 
 
 def test_make_tts_provider_piper_requires_both_urls(tmp_path):
@@ -531,6 +560,18 @@ def test_make_tts_provider_piper_requires_both_urls(tmp_path):
 
     with pytest.raises(KeyError):  # missing PIPER_URL_EN → bench skips cleanly
         make_tts_provider(tmp_path, env={"TTS_PROFILE": "piper", "PIPER_URL_IT": "http://x:1"})
+
+
+def test_tts_result_carries_provider_tag(tmp_path):
+    # each provider labels its result so a fallback can never be mistaken for
+    # the primary (tts-bench relies on this)
+    from rabbit_brain.tts.deepgram_tts import DeepgramTTS
+
+    r = TTSResult(path=tmp_path / "x.mp3", duration_s=1.0, provider="deepgram")
+    assert r.provider == "deepgram"
+    # the provider default is None (back-compat for fakes / older callers)
+    assert TTSResult(path=tmp_path / "y.mp3", duration_s=1.0).provider is None
+    assert DeepgramTTS  # imported for coverage of the module path
 
 
 async def test_deepgram_tts_synth_skips_gain_when_zero(tmp_path, monkeypatch):

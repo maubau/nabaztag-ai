@@ -19,6 +19,12 @@ factory the runtime uses (rabbit_brain.tts.make_tts_provider), one profile at a
 time; a profile whose keys/binaries are missing is skipped with a note, so you
 can run whichever subset is configured on the box.
 
+Piper's Deepgram fallback is FORCED OFF here (PIPER_FALLBACK_DEEPGRAM=0): on the
+Bolt a DEEPGRAM_API_KEY is present, so a failing Piper would otherwise return a
+Deepgram clip under the "piper" label and risk promoting Deepgram by accident. A
+Piper failure is recorded AS a failure; and as a second guard, any result whose
+own provider tag isn't the profile being benched is discarded, never counted.
+
     # on the Bolt, with the relevant provider credentials already exported in
     # the environment (same names the runtime reads; see .env.example) plus
     # PIPER_MODEL for the local voice, then:
@@ -86,6 +92,12 @@ async def _bench_profile(
     voice comparison is reproducible from the files — synthesis itself always
     uses the throwaway working dir, so timing is unaffected."""
     env = {**os.environ, "TTS_PROFILE": profile, "NABAZTAG_AUDIO_DIR": str(audio_dir)}
+    # NEVER let a provider silently fall back during a benchmark: on the Bolt a
+    # DEEPGRAM_API_KEY is present, so a failing Piper would otherwise return a
+    # Deepgram clip recorded under the "piper" label and could promote Deepgram
+    # by accident. Disable the piper→deepgram fallback here; a Piper failure
+    # must count AS a failure (review, July 2026).
+    env["PIPER_FALLBACK_DEEPGRAM"] = "0"
     try:
         provider = make_tts_provider(audio_dir, env=env)
     except KeyError as missing:
@@ -103,7 +115,17 @@ async def _bench_profile(
                 try:
                     result = await provider.synth(text, language=language)
                 except Exception as exc:  # missing binary/key surfaced at call time
-                    print(f"[{profile}/{language}] synth failed: {exc}")
+                    print(f"[{profile}/{language}] synth FAILED: {exc}")
+                    break
+                # Belt and suspenders to the fallback flag above: if a result
+                # ever comes back tagged as a DIFFERENT backend, it's a fallback
+                # leaking through — discard it, never credit it to this profile.
+                actual = result.provider
+                if actual is not None and actual != profile:
+                    print(
+                        f"[{profile}/{language}] DISCARDED: got a {actual!r} result "
+                        "(fallback leaked) — not counted"
+                    )
                     break
                 synth_ms = round((time.monotonic() - start) * 1000)
                 audio_s = result.duration_s or 0.0

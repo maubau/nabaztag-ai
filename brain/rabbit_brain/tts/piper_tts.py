@@ -15,19 +15,24 @@ LICENCE / PROVENANCE (important — this brain is Apache-2.0):
     vendored, or copied into this tree. The brain talks to it purely over HTTP,
     exactly as it does to Deepgram/OpenAI — a clean process boundary, not a
     derivative work.
-  - Candidate Italian voice: it_IT-paola-medium (22.05 kHz, medium; the voice's
-    training dataset is CC0). A licence-compatible English voice must be chosen
-    and documented alongside it before promotion (tracked in OJN_API_NOTES).
+  - Voices (each has its own licence — record it, and honour attribution):
+      IT: it_IT-paola-medium (22.05 kHz, medium; CC0 training dataset).
+      EN: en_US-sam-medium (22.05 kHz, medium; Apache-2.0 dataset) — the
+          recommended default. Alternative en_GB-alba-medium (CC BY 4.0)
+          REQUIRES attribution if used.
 
 Production TTS stays Deepgram Aura; Piper is a candidate that must win BOTH
 latency and on-Nabaztag listening before it is promoted. This provider therefore
 takes an optional `fallback` (Deepgram) used on timeout/error so the piper
-profile degrades gracefully rather than going silent.
+profile degrades gracefully rather than going silent. During BENCHMARKING the
+fallback is disabled (PIPER_FALLBACK_DEEPGRAM=0) so a Piper failure is never a
+silent Deepgram substitution — and the fallback's result keeps its own provider
+tag so a caller can tell them apart regardless.
 
-Server API assumption (VERIFY when the install script pins the server, like the
-Flux schema note): the Piper HTTP server accepts the utterance text and returns
-WAV audio; `_request_wav` is the single place to adjust the exact request shape.
-The rabbit streams MP3, so the WAV is transcoded with ffmpeg (already a dep).
+Server API (CONFIRMED against piper1-gpl 1.4.2's HTTP server, July 2026): POST
+JSON {"text": text} and the response body is WAV audio. `_request_wav` is the
+single place that shape lives. The rabbit streams MP3, so the WAV is transcoded
+with ffmpeg (already a dep).
 """
 
 from __future__ import annotations
@@ -107,6 +112,9 @@ class PiperTTS:
             if self._fallback is None:
                 raise
             log.warning("piper synth failed, falling back to the secondary TTS", exc_info=True)
+            # The fallback result keeps ITS OWN provider tag (e.g. "deepgram"),
+            # never "piper" — so a caller (tts-bench) can tell a fallback clip
+            # apart and never credit it to Piper.
             return await self._fallback.synth(text, language=language)
 
     async def _synth(self, text: str, language: str | None) -> TTSResult:
@@ -128,12 +136,12 @@ class PiperTTS:
             round((time.monotonic() - t_wav) * 1000),
             wav_duration,
         )
-        return TTSResult(path=mp3_path, duration_s=wav_duration)
+        return TTSResult(path=mp3_path, duration_s=wav_duration, provider="piper")
 
     async def _request_wav(self, url: str, text: str) -> bytes:
-        """POST the text to the Piper server and return WAV bytes. The exact
-        request shape is the one thing to confirm against the pinned server
-        (see module docstring); kept in one place for that reason."""
+        """POST {"text": ...} to the Piper server and return WAV bytes
+        (confirmed against piper1-gpl 1.4.2 — see module docstring). Kept in
+        one place so the wire shape has a single home."""
         assert self._session is not None
         async with self._session.post(url, json={"text": text}, timeout=self._timeout) as resp:
             if resp.status != 200:
