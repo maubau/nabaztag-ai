@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Gate L3 probe: does the MTL decoder play an MP3 BEFORE the HTTP response ends?
 
+VERDICT: HARDWARE-REJECTED (July 2026, OJN_API_NOTES #21). The MTL decoder
+buffers to EOF — audio started only AFTER a 7.8 s dribbled transfer completed,
+and tcpdump confirmed Apache delivered the body progressively (so it's the
+decoder, not the proxy). There is NO progressive TTS path; production keeps the
+complete MP3 served statically by Apache. This script is retained only to
+reproduce the probe if firmware/decoder assumptions ever change. Do not wire it
+into any live path.
+
 The whole question for progressive/streaming TTS is whether the Nabaztag's
 bootcode decoder starts playing as bytes arrive, or buffers the entire file
 first. DeepgramTTS.synth() currently accumulates every chunk, writes the whole

@@ -331,6 +331,27 @@ Hardware half — status on the real rabbit:
     in.** Target architecture IF it passes: random job URL → Apache reverse proxy → Deepgram
     REST/WS stream → optional streaming ffmpeg gain+limiter → MTL, with the static path kept as
     fallback.
+21. **Gate L3 HARDWARE-REJECTED (July 2026): the MTL decoder buffers to EOF — no progressive
+    TTS.** Probe results:
+    - Baseline `/fast.mp3` (31,341 bytes in one shot): GET 200, audio plays correctly.
+    - `/slow.mp3`, same file dribbled over 7.776 s: probe upstream first byte +0 ms, last byte
+      +3762 ms; audio heard at ~5305 ms — i.e. AFTER the transfer completed, not during.
+    - tcpdump confirmed Apache is NOT the culprit: Apache→rabbit was genuinely progressive
+      (data packets ~250 ms apart), and the final data packet + FIN (18:37:10.731) lined up with
+      the probe's own last byte. So Apache does not buffer the proxied body; the decoder does.
+    - `--spread 20 s`: no audio at all (likely a decoder timeout / insufficient throughput).
+    **Verdict: MTL substantially requires the complete file / EOF before it plays.** Do NOT build
+    a progressive TTS path; keep the complete MP3 served statically by Apache (the current
+    production path — unchanged, this gate never touched it). `brain/scripts/
+    mp3-progressive-probe.py` and `ojn/apache/mp3-probe.conf.example` are retained as
+    reproducibility tooling only, banner-marked hardware-rejected so they're never mistaken for a
+    live path (re-run only if firmware/decoder assumptions ever change).
+    **Latency work continues on the two remaining levers — both about producing the reply text
+    and its audio faster, since delivery can't be overlapped:** (a) LLM + TOTAL TTS synthesis
+    time — benchmark TTS providers/voices, cloud vs local (Piper has no network round-trip), via
+    `brain/scripts/tts-bench.py`; (b) shorter spoken replies; (c) anticipatory synthesis of the
+    first sentence ONLY where semantically safe (no later tool call could contradict it) — a
+    design-heavy change, not started, needs its own pass.
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 
