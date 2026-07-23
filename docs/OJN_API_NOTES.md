@@ -395,6 +395,29 @@ Hardware half — status on the real rabbit:
     Piper is a CANDIDATE, not production: promote only if it wins BOTH latency AND on-Nabaztag
     listening (per-language) — never on the synthetic RTF alone. Next: run the server smoke, then
     `tts-bench --profiles deepgram,piper --keep-audio` (fallback auto-disabled) and listen.
+    *(The EN voice choice above was superseded by #23: Sam → Alba.)*
+23. **Voice A/B verdict + PERFORMANCE WORK CLOSED for v1 (July 2026).** On-Nabaztag listening:
+    - **IT `it_IT-paola-medium`**: quality, pronunciation and volume all satisfactory — notably
+      fixing the low-volume complaint that dogged Aura. Default pace too fast; **`length_scale`
+      1.25** makes it the preferred Italian voice.
+    - **EN `en_US-sam-medium`: REJECTED** — correct pace but flat/lifeless, perceived as depressed
+      next to Deepgram.
+    - **EN `en_GB-alba-medium`: SELECTED**, `length_scale` 1.0, quality judged very good.
+      CC BY 4.0 → **attribution required**: "en_GB-alba-medium" Piper voice, Alba dataset
+      (University of Edinburgh), model card <https://huggingface.co/rhasspy/piper-voices>
+      (`en/en_GB/alba`). Sam is left installed as a comparison voice; remove only after promotion.
+    Implemented: per-language `length_scale` sent in the Piper POST body (omitted when unset so
+    the server keeps its default), `PIPER_LENGTH_SCALE_IT/_EN` parsed as validated positive floats.
+    **DECISION — current latency is ACCEPTED for v1 and the performance campaign is CLOSED.**
+    Flux (STT, ~220 ms speech-end→EndOfTurn) and Piper are fast enough; the residual variability is
+    dominated by the LLM and is accepted. Explicitly NOT to be built in this phase:
+    - speculative / anticipatory TTS (the "first sentence" idea from #21c) — dropped, not deferred
+      work anyone should pick up silently;
+    - progressive/streaming MP3 — already hardware-rejected in #21;
+    - further LLM benchmarking (gpt-5.4-mini + `reasoning_effort: low` stands, per the A/B).
+    Re-open only if a hardware/firmware assumption changes. **Work now moves to robustness, not
+    speed**: runtime hardening, systemd service + start-on-boot, recovery, and a custom "Nabaztag"
+    wake word (`hey_jarvis` was only ever a smoke-test placeholder).
 
 Record answers here, then stamp the matrix rows hardware-confirmed.
 
