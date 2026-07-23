@@ -1,16 +1,25 @@
-# Proposed systemd unit for the Nabaztag voice runtime on the Bolt.
-# Install (adjust User/paths to your setup):
+# systemd unit for the Nabaztag voice runtime on the Bolt.
+#
+# Install with deploy/install-runtime.sh (it templates User/paths and refuses
+# to proceed while the MCP server is enabled). Manual route:
 #   sudo cp deploy/nabaztag-runtime.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now nabaztag-runtime
 #   journalctl -u nabaztag-runtime -f
 #
-# Do NOT enable this together with the MCP server — both bind :8090/:8091 and
-# each creates its own BodyController (single-ownership rule, §8).
+# SINGLE OWNERSHIP (§8): do NOT enable this together with the MCP server — both
+# bind :8090/:8091 and each creates its own BodyController.
+
 [Unit]
-Description=Nabaztag voice runtime (wake -> STT -> OpenAI -> ElevenLabs -> rabbit)
+Description=Nabaztag voice runtime (wake -> Flux STT -> OpenAI -> Piper/Deepgram -> rabbit)
+# Flux STT and the LLM are cloud services: the network must really be up.
 After=network-online.target
 Wants=network-online.target
+# OJN is the only way to reach the rabbit; Piper is the production voice.
+# Wants=/After= deliberately, NEVER Requires=: a dead Piper must drop the
+# runtime to its Deepgram fallback, not take the whole rabbit down with it.
+After=nabaztag-ojn.service nabaztag-piper-it.service nabaztag-piper-en.service
+Wants=nabaztag-ojn.service nabaztag-piper-it.service nabaztag-piper-en.service
 
 [Service]
 Type=simple
@@ -19,10 +28,34 @@ WorkingDirectory=/home/maurizio/nabaztag-ai
 # Keys and config live in .env (gitignored); never put them in this unit.
 EnvironmentFile=/home/maurizio/nabaztag-ai/.env
 ExecStart=/home/maurizio/nabaztag-ai/.venv/bin/python -m rabbit_brain.runtime --config config.yaml
-Restart=on-failure
+
+# Recovery: always come back, including after a clean-but-unexpected exit.
+Restart=always
 RestartSec=3
-# The service needs USB (reSpeaker) and audio; run as a normal user in plugdev/audio.
+# ...but never hammer a genuinely broken install: 5 failures inside 60 s and
+# systemd parks the unit, so the journal shows one clear cause instead of an
+# endless loop. Clear with `systemctl reset-failed nabaztag-runtime`.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+# Let the pipeline close the OJN/STT sockets and turn the LEDs off.
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+# Needs USB (reSpeaker) and ALSA; runs as a normal user in those groups.
 SupplementaryGroups=plugdev audio
+
+# --- Hardening, deliberately MODERATE: the runtime needs USB, ALSA and a
+# writable audio dir, so the aggressive knobs (ProtectSystem=strict,
+# PrivateDevices=true, DevicePolicy=closed) are NOT used — they break the
+# microphone. Do not "tighten" these without re-testing capture on hardware. ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# TTS MP3s are written under the working dir; keep exactly that writable.
+ReadWritePaths=/home/maurizio/nabaztag-ai
 
 [Install]
 WantedBy=multi-user.target

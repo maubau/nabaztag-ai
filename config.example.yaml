@@ -44,15 +44,17 @@ local_whisper:
   model: small
   compute_type: int8
 
-# TTS profile (informational — the runtime reads TTS_PROFILE from .env):
-# "deepgram" (Aura, voice routed by the STT-detected it/en language),
-# "elevenlabs" (one multilingual voice), or "piper" (local, bilingual via a
-# persistent Piper HTTP server per language — PIPER_URL_IT/_EN in .env, paced by
-# PIPER_LENGTH_SCALE_IT/_EN; GPL-3.0 engine run as an external process, no code
-# vendored; voices it_IT-paola-medium + en_GB-alba-medium (CC BY 4.0, attribution
-# required); a candidate, not yet promoted — must win latency AND on-rabbit
-# listening first).
-tts_profile: deepgram
+# TTS profile (informational — the runtime reads TTS_PROFILE from .env).
+# PRODUCTION = "piper" since the July 2026 on-Nabaztag A/B: local, bilingual via
+# a persistent Piper HTTP server per language (PIPER_URL_IT/_EN in .env, paced by
+# PIPER_LENGTH_SCALE_IT/_EN). Voices it_IT-paola-medium @1.25 and
+# en_GB-alba-medium @1.0 (CC BY 4.0 — attribution required, see .env.example).
+# Piper fixed Aura's persistently low volume and both voices were preferred by
+# ear. The GPL-3.0 engine runs as an external localhost process; no code vendored.
+# Deepgram Aura stays the automatic FALLBACK (PIPER_FALLBACK_DEEPGRAM=1) and
+# still provides Flux STT. "elevenlabs" (one multilingual voice) was tried and
+# not promoted: poor Italian, very low volume.
+tts_profile: piper
 
 deepgram_tts:
   # voices per utterance language (env: DEEPGRAM_TTS_VOICE_IT/_EN)
@@ -128,9 +130,11 @@ leds:
   # cloud/local profiles).
   # PROCESSING (pulsing orange) covers the dead air after that: it runs from
   # end-of-turn until the rabbit ACTUALLY starts speaking, not merely until
-  # the reply was queued. Opt-in, but worth turning on during latency tests —
-  # it makes the LLM/TTS phase visible instead of silent (latency Gate L1).
-  processing_indicator: false
+  # the reply was queued.
+  # ON in production since July 2026: the performance campaign is closed and the
+  # residual LLM variability is accepted, so the honest move is to SHOW that
+  # wait rather than leave the rabbit looking dead during it.
+  processing_indicator: true
 
 wake_beep:
   # Short confirmation sound played ON THE RABBIT (so the user hears it from

@@ -106,6 +106,27 @@ CHECKS: list[Check] = [
         required=False,
         is_stale=lambda v: v == "cloud",
     ),
+    # Production voice (July 2026 on-Nabaztag A/B): Piper fixed Aura's low
+    # volume and both voices were preferred by ear. Deepgram stays the
+    # automatic fallback, so a config still on "deepgram" is not broken —
+    # a nudge, not a migration. NOTE: the runtime reads TTS_PROFILE from .env;
+    # this key is informational, so fixing it here does not switch the voice.
+    Check(
+        ("tts_profile",),
+        "piper",
+        "production TTS is now Piper (Paola@1.25 / Alba@1.0); Deepgram is the fallback",
+        required=False,
+        is_stale=lambda v: v == "deepgram",
+    ),
+    # The performance campaign is closed and the LLM wait is accepted, so show
+    # it rather than leaving the rabbit looking dead during it.
+    Check(
+        ("leds", "processing_indicator"),
+        True,
+        "latency is accepted for v1; make the LLM/TTS wait visible instead of silent",
+        required=False,
+        is_stale=lambda v: v is False,
+    ),
 ]
 
 

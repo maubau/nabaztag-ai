@@ -8,7 +8,12 @@ ojn/network/dnsmasq.conf
 # Generated audio & model weights
 www/audio/
 *.mp3
-models/
+# Weights stay out of git, but the PROVENANCE record must not: without it a
+# .onnx in models/wake/ is an unidentifiable binary. Re-include just those.
+models/*
+!models/wake/
+models/wake/*
+!models/wake/*.provenance.md
 *.bin
 *.onnx
 *.ct2
