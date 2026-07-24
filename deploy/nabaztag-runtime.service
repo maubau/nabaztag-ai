@@ -20,6 +20,13 @@ Wants=network-online.target
 # runtime to its Deepgram fallback, not take the whole rabbit down with it.
 After=nabaztag-ojn.service nabaztag-piper-it.service nabaztag-piper-en.service
 Wants=nabaztag-ojn.service nabaztag-piper-it.service nabaztag-piper-en.service
+# The start-rate limiter lives in [Unit], NOT [Service] — systemd ignores
+# StartLimitIntervalSec/StartLimitBurst if placed under [Service] ("Unknown key
+# name ... ignoring"). Paired with Restart=always below: 5 failed starts inside
+# 60 s and systemd parks the unit, so the journal shows one clear cause instead
+# of an endless loop. Clear with `systemctl reset-failed nabaztag-runtime`.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -30,13 +37,9 @@ EnvironmentFile=/home/maurizio/nabaztag-ai/.env
 ExecStart=/home/maurizio/nabaztag-ai/.venv/bin/python -m rabbit_brain.runtime --config config.yaml
 
 # Recovery: always come back, including after a clean-but-unexpected exit.
+# (The rate cap that keeps this from crash-looping is in [Unit] above.)
 Restart=always
 RestartSec=3
-# ...but never hammer a genuinely broken install: 5 failures inside 60 s and
-# systemd parks the unit, so the journal shows one clear cause instead of an
-# endless loop. Clear with `systemctl reset-failed nabaztag-runtime`.
-StartLimitIntervalSec=60
-StartLimitBurst=5
 # Let the pipeline close the OJN/STT sockets and turn the LEDs off.
 KillSignal=SIGINT
 TimeoutStopSec=20

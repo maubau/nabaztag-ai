@@ -14,6 +14,24 @@ import pytest
 
 SCRIPT = Path(__file__).parent.parent / "deploy" / "install-runtime.sh"
 UNIT = "nabaztag-runtime.service"
+UNIT_FILE = SCRIPT.parent / UNIT
+
+
+def _section_of_keys(unit_text: str) -> dict[str, str]:
+    """Map each directive key -> the [Section] it appears under, so we can assert
+    a key lives in the right section (systemd silently ignores misplaced keys)."""
+    section = None
+    placement: dict[str, str] = {}
+    for raw in unit_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line
+        elif "=" in line and section is not None:
+            placement[line.split("=", 1)[0]] = section
+    return placement
+
 
 requires_bash = pytest.mark.skipif(not shutil.which("bash"), reason="needs bash on PATH")
 
@@ -127,3 +145,31 @@ def test_render_unit_substitutes_user_and_paths(tmp_path):
     directives = [ln for ln in result.stdout.splitlines() if not ln.lstrip().startswith("#")]
     assert not any(ln.startswith("Requires=") for ln in directives)
     assert "Restart=always" in directives
+
+
+def test_start_limit_keys_live_in_unit_section():
+    # systemd hardware finding: StartLimitIntervalSec/StartLimitBurst under
+    # [Service] are silently dropped ("Unknown key name ... ignoring"), so the
+    # crash-loop cap never applies. They MUST be under [Unit].
+    placement = _section_of_keys(UNIT_FILE.read_text())
+    assert placement.get("StartLimitIntervalSec") == "[Unit]"
+    assert placement.get("StartLimitBurst") == "[Unit]"
+    # runtime knobs stay where they belong
+    assert placement.get("Restart") == "[Service]"
+    assert placement.get("ExecStart") == "[Service]"
+
+
+@requires_bash
+def test_render_preserves_start_limit_section(tmp_path):
+    # the sed templating must not move keys between sections
+    repo = _make_repo(tmp_path)
+    result = subprocess.run(
+        ["bash", "-c", f'source "{SCRIPT}"; _render_unit'],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={"PATH": "/usr/bin:/bin", "REPO_DIR": str(repo), "RUN_USER": "tester"},
+    )
+    placement = _section_of_keys(result.stdout)
+    assert placement.get("StartLimitIntervalSec") == "[Unit]"
+    assert placement.get("StartLimitBurst") == "[Unit]"
