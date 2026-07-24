@@ -111,6 +111,21 @@ def test_runs_training_in_a_pinned_python310_container():
     assert "docker run" in CODE
 
 
+def test_container_runs_as_host_uid_gid():
+    # root-owned files in the bind mount (git dubious-ownership, root venv) are
+    # avoided by mapping the host UID:GID — NOT by safe.directory
+    assert re.search(r'--user "\$\(id -u\):\$\(id -g\)"', CODE)
+    assert "safe.directory" not in CODE
+    # a writable HOME + USER/LOGNAME so the passwd-less UID doesn't break tools
+    assert re.search(r"-e \"HOME=", CODE)
+    assert "LOGNAME=" in CODE
+
+
+def test_setup_fails_fast_on_root_owned_files():
+    # after setup, nothing under the training dir may be root-owned
+    assert re.search(r'find "\$TRAIN_DIR" -uid 0', CODE)
+
+
 def test_does_not_use_the_nonexistent_data_cli():
     # the pinned openWakeWord has no `data.py --output_dir` CLI
     assert "data.py" not in CODE

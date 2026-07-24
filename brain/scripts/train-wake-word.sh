@@ -114,11 +114,23 @@ _build_image() {
 
 # Run a stage INSIDE the container, with the repo bind-mounted at its OWN host
 # path so every path in the config/venv is identical inside and out.
+#
+# --user maps the HOST UID:GID into the container: without it the container is
+# root, git flags the bind-mounted checkouts as "dubious ownership", and every
+# file it writes (the venv!) lands root-owned in the bind mount. We do NOT paper
+# over that with safe.directory. Because that UID has no /etc/passwd entry, we
+# also give it a writable HOME (in the bind mount) and USER/LOGNAME, so anything
+# that calls getpass.getuser()/expanduser() or wants a pip/HF cache still works.
 _in_container() {  # $@ = stage + args
   _build_image
+  local home="$TRAIN_DIR/home"
+  mkdir -p "$home"
   docker run --rm \
+    --user "$(id -u):$(id -g)" \
     -v "$REPO_DIR":"$REPO_DIR" -w "$REPO_DIR" \
     -e WAKE_IN_CONTAINER=1 -e "MODEL_NAME=$MODEL_NAME" \
+    -e "HOME=$home" -e USER=trainer -e LOGNAME=trainer \
+    -e "PIP_CACHE_DIR=$home/.cache/pip" -e "XDG_CACHE_HOME=$home/.cache" \
     "$IMAGE" bash "brain/scripts/train-wake-word.sh" "$@"
 }
 
@@ -134,8 +146,18 @@ _clone_pinned() {  # $1=repo $2=sha $3=dir
 cmd_setup() {
   # Recreate the venv from scratch: an earlier probe left a Python 3.12 venv
   # here, incompatible with this 3.10 container. Checkouts (plain git) are kept.
+  # Idempotent: if a prior root-owned venv can't be removed (an earlier run went
+  # in as root), say exactly how to repair it once rather than failing cryptically.
   log "training venv (Python 3.10, in-container; recreated): $VENV"
-  rm -rf "$VENV"
+  if [ -d "$VENV" ]; then
+    rm -rf "$VENV" 2>/dev/null || true
+    if [ -d "$VENV" ]; then
+      echo "cannot remove $VENV (likely root-owned by an earlier root container run)." >&2
+      echo "Repair ONCE on the host, then re-run setup:" >&2
+      echo "  sudo chown -R \$(id -un):\$(id -gn) $TRAIN_DIR" >&2
+      exit 1
+    fi
+  fi
   mkdir -p "$DATA"
   python3 -m venv "$VENV"
   "$PY" -m pip install --upgrade pip >/dev/null
@@ -179,6 +201,19 @@ PY
   mkdir -p "$GEN_DIR/models"
   if [ ! -s "$GEN_DIR/models/$VOICE_PT" ]; then
     curl -fSL "$VOICE_URL" -o "$GEN_DIR/models/$VOICE_PT"
+  fi
+
+  # Fail fast if anything landed root-owned: that would mean the container is NOT
+  # running as the host UID, and the next run would hit git's dubious-ownership
+  # wall again. With --user mapping this stays empty.
+  log "checking no root-owned files leaked into the bind mount"
+  local rooted
+  rooted="$(find "$TRAIN_DIR" -uid 0 -print -quit 2>/dev/null || true)"
+  if [ -n "$rooted" ]; then
+    echo "FAILED: root-owned files under $TRAIN_DIR (e.g. $rooted)." >&2
+    echo "The container is not running as the host UID. Repair once:" >&2
+    echo "  sudo chown -R \$(id -un):\$(id -gn) $TRAIN_DIR" >&2
+    exit 1
   fi
   log "setup done. NEXT: smoke (cheap end-to-end) BEFORE datasets."
 }
