@@ -32,8 +32,8 @@ POLICY = rr.Policy(
     give_up_hold_s=3600.0,
 )
 
-# The failure signature: disassociated + old HTTP + ghost XMPP socket.
-OUTAGE = rr.Signals(rabbit_associated=False, last_http_age_s=1000.0, xmpp_ghost_socket=True)
+# The failure signature: disassociated + old HTTP + a lingering XMPP socket.
+OUTAGE = rr.Signals(rabbit_associated=False, last_http_age_s=1000.0, xmpp_established_socket=True)
 
 
 def _decide(signals, state, now=10_000.0):
@@ -60,7 +60,7 @@ def test_disassociated_but_recent_http_does_not_restart():
     assert d.action is rr.Action.NONE
 
 
-def test_disassociated_without_ghost_socket_does_not_restart():
+def test_disassociated_without_lingering_socket_does_not_restart():
     # simply powered off with no lingering session → not our failure
     d = _decide(rr.Signals(False, 1000.0, False), rr.State())
     assert d.action is rr.Action.NONE
@@ -134,12 +134,12 @@ def test_parse_associated_matches_mac_case_insensitively():
     assert rr.parse_associated("", "aa:bb:cc:dd:ee:ff") is False
 
 
-def test_parse_xmpp_ghost_detects_port_5222_socket():
+def test_parse_xmpp_established_detects_port_5222_socket():
     ss = "ESTAB 0 846 192.168.66.1:5222 192.168.66.10:49152\n"
-    assert rr.parse_xmpp_ghost(ss, "192.168.66.10") is True
-    assert rr.parse_xmpp_ghost(ss, "192.168.66.99") is False  # different peer
-    assert rr.parse_xmpp_ghost(ss, None) is True  # any :5222 socket counts
-    assert rr.parse_xmpp_ghost("", None) is False
+    assert rr.parse_xmpp_established(ss, "192.168.66.10") is True
+    assert rr.parse_xmpp_established(ss, "192.168.66.99") is False  # different peer
+    assert rr.parse_xmpp_established(ss, None) is True  # any :5222 socket counts
+    assert rr.parse_xmpp_established("", None) is False
 
 
 def test_execute_only_acts_on_restart_action(monkeypatch):
@@ -172,6 +172,31 @@ def test_config_from_env_requires_valid_mac(monkeypatch):
     monkeypatch.setenv("RABBIT_MAC", "not-a-mac")
     with pytest.raises(SystemExit):
         rr._config_from_env()
+
+
+def test_load_env_file_keeps_only_recovery_keys():
+    # the shared .env carries API keys next to the recovery vars; loading it
+    # must NOT surface the keys (that's the whole reason not to use `sudo -E`)
+    text = (
+        "# comment\n"
+        "OPENAI_API_KEY=sk-secret\n"
+        "DEEPGRAM_API_KEY=dg-secret\n"
+        "RABBIT_MAC=aa:bb:cc:dd:ee:ff\n"
+        "RABBIT_IP=192.168.66.10\n"
+        'HOSTAPD_RESTART_CMD="sudo systemctl restart hostapd"\n'
+        "export AP_IFACE=wlp3s0\n"
+        "\n"
+        "RECOVERY_COOLDOWN_S=120\n"
+    )
+    got = rr.load_env_file(text)
+    assert got == {
+        "RABBIT_MAC": "aa:bb:cc:dd:ee:ff",
+        "RABBIT_IP": "192.168.66.10",
+        "HOSTAPD_RESTART_CMD": "sudo systemctl restart hostapd",  # quotes stripped
+        "AP_IFACE": "wlp3s0",  # `export ` prefix tolerated
+        "RECOVERY_COOLDOWN_S": "120",
+    }
+    assert "OPENAI_API_KEY" not in got and "DEEPGRAM_API_KEY" not in got
 
 
 def test_config_from_env_requires_rabbit_ip(monkeypatch):

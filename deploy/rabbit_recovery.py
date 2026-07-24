@@ -19,8 +19,8 @@ The whole design is "do the one narrow thing, and only when sure":
            Apache log line whose client is exactly RABBIT_IP, NOT the file
            mtime (any localhost/admin request would reset that and mask a
            silent rabbit);
-        3. a ghost XMPP socket lingers on :5222 (ESTAB, the stuck-Send-Q
-           remnant of the dropped session).
+        3. an XMPP socket lingers on :5222 (ESTAB) — a ghost, since the rabbit
+           is disassociated: the stuck-Send-Q remnant of the dropped session.
   * A cooldown after each restart (give the rabbit time to come back) and a
     per-outage restart cap with an hourly retry-hold stop it cycling when the
     rabbit is simply switched off — that case looks identical bar the fact that
@@ -30,7 +30,9 @@ The decision logic (`decide`) is a pure function of (signals, state, policy,
 now) so it can be exhaustively tested; the process only shells out to gather
 signals and to run the one restart command.
 
-    sudo python3 deploy/rabbit_recovery.py --once     # one tick, for testing
+    # one tick, for testing; --env-file loads ONLY the recovery vars (no need
+    # for `sudo -E`, which would needlessly hand root the API keys too):
+    sudo python3 deploy/rabbit_recovery.py --once --env-file .env
     sudo python3 deploy/rabbit_recovery.py            # daemon loop (the service)
 """
 
@@ -47,6 +49,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import Path
 
 log = logging.getLogger("rabbit-recovery")
 
@@ -76,7 +79,10 @@ class Signals:
     # can't be determined (no log, no rabbit line, unparseable time) → the
     # decision never treats that as "old", so it never restarts on a guess.
     last_http_age_s: float | None
-    xmpp_ghost_socket: bool  # an ESTAB :5222 socket lingering
+    # An ESTAB socket on :5222 is present. It only becomes a "ghost" once the
+    # rabbit is disassociated (a live rabbit legitimately holds one) — the name
+    # states the raw fact; `decide` supplies the disassociated context.
+    xmpp_established_socket: bool
 
 
 @dataclass(frozen=True)
@@ -112,12 +118,12 @@ def decide(signals: Signals, state: State, policy: Policy, now: float) -> Decisi
     http_old = (
         signals.last_http_age_s is not None and signals.last_http_age_s >= policy.http_stale_after_s
     )
-    if not (http_old and signals.xmpp_ghost_socket):
+    if not (http_old and signals.xmpp_established_socket):
         why = []
         if not http_old:
             why.append("recent/absent HTTP")
-        if not signals.xmpp_ghost_socket:
-            why.append("no ghost XMPP socket")
+        if not signals.xmpp_established_socket:
+            why.append("no lingering XMPP socket")
         return Decision(Action.NONE, f"disassociated but {', '.join(why)}", state)
 
     # The three signals coincide — this is the healable outage.
@@ -158,10 +164,10 @@ def parse_associated(station_dump: str, rabbit_mac: str) -> bool:
     return rabbit_mac.lower() in station_dump.lower()
 
 
-def parse_xmpp_ghost(ss_output: str, rabbit_ip: str | None) -> bool:
+def parse_xmpp_established(ss_output: str, rabbit_ip: str | None) -> bool:
     """True if an ESTAB socket on :5222 exists (to the rabbit, if its IP is
-    known). With the rabbit disassociated, any such socket is by definition a
-    ghost — the live session can't still be up."""
+    known). A live rabbit legitimately holds one; it is only a GHOST once the
+    rabbit is disassociated — that context is applied in `decide`, not here."""
     for line in ss_output.splitlines():
         if ":5222" not in line:
             continue
@@ -292,12 +298,12 @@ def gather_signals(cfg: Config, now: float) -> Signals:
     age = last_http_age(cfg.access_log, cfg.rabbit_ip, now)
 
     ss_out = _run(["ss", "-Htan", "state", "established", "( sport = :5222 or dport = :5222 )"])
-    ghost = False if ss_out is None else parse_xmpp_ghost(ss_out, cfg.rabbit_ip)
+    established = False if ss_out is None else parse_xmpp_established(ss_out, cfg.rabbit_ip)
 
     return Signals(
         rabbit_associated=associated,
         last_http_age_s=age,
-        xmpp_ghost_socket=ghost,
+        xmpp_established_socket=established,
     )
 
 
@@ -358,10 +364,10 @@ def run_loop(cfg: Config, policy: Policy, interval_s: float, once: bool) -> None
         level = logging.WARNING if decision.action is not Action.NONE else logging.INFO
         log.log(
             level,
-            "assoc=%s http_age=%s ghost=%s -> %s (%s)",
+            "assoc=%s http_age=%s xmpp_estab=%s -> %s (%s)",
             signals.rabbit_associated,
             None if signals.last_http_age_s is None else round(signals.last_http_age_s),
-            signals.xmpp_ghost_socket,
+            signals.xmpp_established_socket,
             decision.action.value,
             decision.reason,
         )
@@ -369,6 +375,45 @@ def run_loop(cfg: Config, policy: Policy, interval_s: float, once: bool) -> None
         if once:
             return
         time.sleep(interval_s)
+
+
+# The only .env keys this watchdog needs. Loading JUST these (instead of
+# `sudo -E`, which exports the whole shell environment) keeps the OpenAI /
+# Deepgram API keys out of the root process — it has no business seeing them.
+_RECOVERY_ENV_KEYS = frozenset(
+    {
+        "AP_IFACE",
+        "RABBIT_MAC",
+        "RABBIT_IP",
+        "OJN_ACCESS_LOG",
+        "HOSTAPD_RESTART_CMD",
+        "RECOVERY_HTTP_STALE_S",
+        "RECOVERY_COOLDOWN_S",
+        "RECOVERY_MAX_RESTARTS",
+        "RECOVERY_GIVE_UP_HOLD_S",
+    }
+)
+
+
+def load_env_file(text: str, allow: frozenset[str] = _RECOVERY_ENV_KEYS) -> dict[str, str]:
+    """Parse KEY=VALUE lines, returning ONLY the allow-listed recovery keys — so
+    an operator can point --env-file at the shared .env without leaking the API
+    keys next to them into this process. `export ` prefixes and surrounding
+    quotes are tolerated; comments and blanks ignored."""
+    out: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.removeprefix("export ").strip()
+        if key not in allow:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        out[key] = value
+    return out
 
 
 def main() -> int:
@@ -381,8 +426,18 @@ def main() -> int:
     parser.add_argument(
         "--interval", type=float, default=60.0, help="seconds between ticks (default 60)"
     )
+    parser.add_argument(
+        "--env-file",
+        metavar="PATH",
+        help="load ONLY the recovery vars from this .env (not the API keys); "
+        "the systemd unit uses EnvironmentFile instead",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if args.env_file:
+        # Do not clobber anything already set in the real environment.
+        for key, value in load_env_file(Path(args.env_file).read_text()).items():
+            os.environ.setdefault(key, value)
     run_loop(_config_from_env(), _policy_from_env(), args.interval, args.once)
     return 0
 
