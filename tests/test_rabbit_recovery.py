@@ -172,3 +172,94 @@ def test_config_from_env_requires_valid_mac(monkeypatch):
     monkeypatch.setenv("RABBIT_MAC", "not-a-mac")
     with pytest.raises(SystemExit):
         rr._config_from_env()
+
+
+def test_config_from_env_requires_rabbit_ip(monkeypatch):
+    # RABBIT_IP is mandatory: without it the HTTP-age signal can't be scoped
+    monkeypatch.setenv("RABBIT_MAC", "aa:bb:cc:dd:ee:ff")
+    monkeypatch.delenv("RABBIT_IP", raising=False)
+    with pytest.raises(SystemExit, match="RABBIT_IP"):
+        rr._config_from_env()
+    monkeypatch.setenv("RABBIT_IP", "192.168.66.10")
+    cfg = rr._config_from_env()
+    assert cfg.rabbit_ip == "192.168.66.10"
+
+
+# --- HTTP-age from the rabbit's own log lines (the blocker fix) ---
+
+RABBIT = "192.168.66.10"
+# Apache ojn_noquery format: %h %l %u %t "%m %U %H" %>s %b "%{User-Agent}i"
+_RABBIT_0452 = f'{RABBIT} - - [24/Jul/2026:04:52:13 +0000] "GET /vl/bc.jsp HTTP/1.1" 200 512 "-"'
+_LOCAL_0828 = '127.0.0.1 - - [24/Jul/2026:08:28:41 +0000] "GET /server-status HTTP/1.1" 200 90 "-"'
+# now = 24/Jul/2026 08:30:00 UTC
+NOW = rr.parse_apache_epoch("[24/Jul/2026:08:30:00 +0000]")
+
+
+def test_age_comes_from_rabbit_line_not_file_mtime(tmp_path):
+    # the real trap: rabbit last spoke at 04:52, but a localhost curl at 08:28
+    # rewrote the log. mtime is recent; the age MUST come from the 04:52 line.
+    log = tmp_path / "ojn-access.log"
+    log.write_text(_RABBIT_0452 + "\n" + _LOCAL_0828 + "\n")  # localhost line is newest
+    age = rr.last_http_age(str(log), RABBIT, NOW)
+    assert age == pytest.approx((8 * 3600 + 30 * 60) - (4 * 3600 + 52 * 60 + 13))  # ~12767s
+    assert age is not None and age > 12000  # decisively "old", unlike mtime (~79s)
+
+
+def test_age_uses_the_newest_rabbit_line():
+    older = f'{RABBIT} - - [24/Jul/2026:04:00:00 +0000] "GET /a HTTP/1.1" 200 1 "-"'
+    newer = f'{RABBIT} - - [24/Jul/2026:08:00:00 +0000] "GET /b HTTP/1.1" 200 1 "-"'
+    # newest-first scan: caller passes reversed(lines); the 08:00 wins
+    epoch = rr.last_rabbit_epoch([newer, older], RABBIT)
+    assert epoch == rr.parse_apache_epoch("[24/Jul/2026:08:00:00 +0000]")
+
+
+def test_missing_log_returns_none(tmp_path):
+    assert rr.last_http_age(str(tmp_path / "nope.log"), RABBIT, NOW) is None
+
+
+def test_no_rabbit_line_returns_none(tmp_path):
+    log = tmp_path / "ojn-access.log"
+    log.write_text(_LOCAL_0828 + "\n")  # only localhost traffic
+    assert rr.last_http_age(str(log), RABBIT, NOW) is None
+
+
+def test_malformed_timestamp_returns_none(tmp_path):
+    log = tmp_path / "ojn-access.log"
+    log.write_text(f'{RABBIT} - - [not-a-timestamp] "GET / HTTP/1.1" 200 1 "-"\n')
+    assert rr.last_http_age(str(log), RABBIT, NOW) is None
+
+
+def test_partial_ip_does_not_match(tmp_path):
+    # a client 192.168.66.100 must NOT satisfy a rabbit at 192.168.66.10
+    log = tmp_path / "ojn-access.log"
+    log.write_text('192.168.66.100 - - [24/Jul/2026:08:29:00 +0000] "GET / HTTP/1.1" 200 1 "-"\n')
+    assert rr.last_http_age(str(log), RABBIT, NOW) is None
+
+
+def test_falls_back_to_rotated_log(tmp_path):
+    # current log has no rabbit line; the rotated .1 does
+    log = tmp_path / "ojn-access.log"
+    log.write_text(_LOCAL_0828 + "\n")
+    (tmp_path / "ojn-access.log.1").write_text(_RABBIT_0452 + "\n")
+    age = rr.last_http_age(str(log), RABBIT, NOW)
+    assert age is not None and age > 12000
+
+
+def test_current_log_wins_over_rotated(tmp_path):
+    # a rabbit line in the current log is newer than one in .1 → use current
+    current = f'{RABBIT} - - [24/Jul/2026:08:00:00 +0000] "GET /new HTTP/1.1" 200 1 "-"'
+    (tmp_path / "ojn-access.log").write_text(current + "\n")
+    (tmp_path / "ojn-access.log.1").write_text(_RABBIT_0452 + "\n")
+    age = rr.last_http_age(str(tmp_path / "ojn-access.log"), RABBIT, NOW)
+    assert age == pytest.approx(30 * 60)  # 08:30 - 08:00 = 1800s, not the 04:52 line
+
+
+def test_bounded_tail_reads_only_the_end(tmp_path):
+    # a huge prefix of localhost noise, then one recent rabbit line at the end:
+    # a small max_bytes still finds the rabbit line without loading the prefix
+    log = tmp_path / "ojn-access.log"
+    noise = (_LOCAL_0828 + "\n") * 5000
+    rabbit = f'{RABBIT} - - [24/Jul/2026:08:29:00 +0000] "GET /z HTTP/1.1" 200 1 "-"\n'
+    log.write_text(noise + rabbit)
+    age = rr.last_http_age(str(log), RABBIT, NOW, max_bytes=4096)
+    assert age == pytest.approx(60.0)  # 08:30 - 08:29

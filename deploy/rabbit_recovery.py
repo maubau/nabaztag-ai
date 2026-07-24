@@ -15,7 +15,10 @@ The whole design is "do the one narrow thing, and only when sure":
   * Restarts only when THREE signals coincide, so a healthy or a merely-idle
     rabbit is never disturbed:
         1. the rabbit is NOT in `iw dev <iface> station dump` (disassociated);
-        2. the last rabbit HTTP request is old (Apache access-log mtime age);
+        2. the rabbit's OWN last HTTP request is old — read from the newest
+           Apache log line whose client is exactly RABBIT_IP, NOT the file
+           mtime (any localhost/admin request would reset that and mask a
+           silent rabbit);
         3. a ghost XMPP socket lingers on :5222 (ESTAB, the stuck-Send-Q
            remnant of the dropped session).
   * A cooldown after each restart (give the rabbit time to come back) and a
@@ -34,12 +37,15 @@ signals and to run the one restart command.
 from __future__ import annotations
 
 import argparse
+import gzip
 import logging
 import os
 import re
 import subprocess
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 log = logging.getLogger("rabbit-recovery")
@@ -66,7 +72,10 @@ class Signals:
     # None = "could not determine" (e.g. `iw` failed); the decision treats an
     # unknown association state as "do nothing", never as a reason to restart.
     rabbit_associated: bool | None
-    last_http_age_s: float | None  # None = no access log / never seen
+    # Age of the RABBIT's last HTTP request (from its own log lines). None =
+    # can't be determined (no log, no rabbit line, unparseable time) → the
+    # decision never treats that as "old", so it never restarts on a guess.
+    last_http_age_s: float | None
     xmpp_ghost_socket: bool  # an ESTAB :5222 socket lingering
 
 
@@ -161,6 +170,100 @@ def parse_xmpp_ghost(ss_output: str, rabbit_ip: str | None) -> bool:
     return False
 
 
+# Apache %t field, e.g. "[24/Jul/2026:04:52:13 +0000]". English month
+# abbreviations always (Apache does not localise them); we map them ourselves
+# rather than trust strptime's locale-dependent %b under the service.
+_MONTHS = {
+    m: i
+    for i, m in enumerate(
+        ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"),
+        start=1,
+    )
+}
+_TS_RE = re.compile(r"\[(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-]\d{4})\]")
+
+
+def parse_apache_epoch(line: str) -> float | None:
+    """Epoch seconds from an Apache %t timestamp in the line, or None if it has
+    no well-formed one (a malformed line must not be trusted)."""
+    m = _TS_RE.search(line)
+    if m is None:
+        return None
+    day, mon, year, hh, mm, ss, tz = m.groups()
+    month = _MONTHS.get(mon)
+    if month is None:
+        return None
+    sign = 1 if tz[0] == "+" else -1
+    offset = timedelta(minutes=sign * (int(tz[1:3]) * 60 + int(tz[3:5])))
+    try:
+        return datetime(
+            int(year), month, int(day), int(hh), int(mm), int(ss), tzinfo=timezone(offset)
+        ).timestamp()
+    except ValueError:
+        return None
+
+
+def last_rabbit_epoch(lines: Iterable[str], rabbit_ip: str) -> float | None:
+    """Newest timestamp among lines whose CLIENT (the first field, %h) is
+    EXACTLY rabbit_ip. `lines` must be newest-first; the first rabbit line with
+    a parseable timestamp wins. Matching the client is the whole point: the
+    log also carries localhost/admin requests, and those must not count as the
+    rabbit being alive."""
+    for line in lines:
+        parts = line.split(maxsplit=1)
+        if not parts or parts[0] != rabbit_ip:
+            continue
+        epoch = parse_apache_epoch(line)
+        if epoch is not None:
+            return epoch
+    return None
+
+
+def _tail_lines(path: str, max_bytes: int) -> list[str] | None:
+    """Read only the last max_bytes of a (growing) log — never load the whole
+    file. Drops the first, probably-truncated, line when we didn't start at 0."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            start = max(0, fh.tell() - max_bytes)
+            fh.seek(start)
+            data = fh.read()
+    except OSError:
+        return None
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    return lines[1:] if start > 0 and lines else lines
+
+
+def _gz_lines(path: str) -> list[str] | None:
+    try:
+        with gzip.open(path, "rt", errors="replace") as fh:
+            return fh.read().splitlines()
+    except OSError:
+        return None
+
+
+def last_http_age(
+    access_log: str, rabbit_ip: str, now: float, max_bytes: int = 65536
+) -> float | None:
+    """Seconds since the rabbit's own last request, from the Apache log line
+    whose client is exactly rabbit_ip — NOT the file mtime (a localhost request
+    would reset that and hide a silent rabbit). Reads a bounded tail of the
+    current log, then falls back to the rotated .1 / .1.gz (delaycompress leaves
+    .1 uncompressed). None if it can't be determined — missing log, no rabbit
+    line anywhere, or an unparseable timestamp — so the caller never acts on a
+    guess."""
+    for candidate in (access_log, access_log + ".1", access_log + ".1.gz"):
+        lines = (
+            _gz_lines(candidate) if candidate.endswith(".gz") else _tail_lines(candidate, max_bytes)
+        )
+        if not lines:
+            continue
+        epoch = last_rabbit_epoch(reversed(lines), rabbit_ip)
+        if epoch is not None:
+            return max(0.0, now - epoch)
+    return None
+
+
 def _run(cmd: list[str], timeout: float = 5.0) -> str | None:
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
@@ -177,7 +280,7 @@ def _run(cmd: list[str], timeout: float = 5.0) -> str | None:
 class Config:
     iface: str
     rabbit_mac: str
-    rabbit_ip: str | None
+    rabbit_ip: str  # REQUIRED for the watchdog — the rabbit's static-lease IP
     access_log: str
     hostapd_restart_cmd: list[str]
 
@@ -186,17 +289,14 @@ def gather_signals(cfg: Config, now: float) -> Signals:
     station = _run(["iw", "dev", cfg.iface, "station", "dump"])
     associated = None if station is None else parse_associated(station, cfg.rabbit_mac)
 
-    try:
-        last_http_age: float | None = now - os.path.getmtime(cfg.access_log)
-    except OSError:
-        last_http_age = None
+    age = last_http_age(cfg.access_log, cfg.rabbit_ip, now)
 
     ss_out = _run(["ss", "-Htan", "state", "established", "( sport = :5222 or dport = :5222 )"])
     ghost = False if ss_out is None else parse_xmpp_ghost(ss_out, cfg.rabbit_ip)
 
     return Signals(
         rabbit_associated=associated,
-        last_http_age_s=last_http_age,
+        last_http_age_s=age,
         xmpp_ghost_socket=ghost,
     )
 
@@ -219,11 +319,18 @@ def _config_from_env() -> Config:
     mac = os.environ.get("RABBIT_MAC", "")
     if not re.fullmatch(r"([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", mac):
         raise SystemExit("RABBIT_MAC must be set in the environment (00:11:22:33:44:55)")
+    # RABBIT_IP is REQUIRED: the HTTP-age signal is scoped to the rabbit's own
+    # log lines, so without its IP the watchdog cannot tell the rabbit's traffic
+    # from a localhost/admin request. The rabbit has a static lease, so this is
+    # always known.
+    ip = os.environ.get("RABBIT_IP", "")
+    if not re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", ip):
+        raise SystemExit("RABBIT_IP must be set for the watchdog (the rabbit's static-lease IP)")
     restart_cmd = os.environ.get("HOSTAPD_RESTART_CMD", "systemctl restart hostapd").split()
     return Config(
         iface=os.environ.get("AP_IFACE", "wlan1"),
         rabbit_mac=mac,
-        rabbit_ip=os.environ.get("RABBIT_IP") or None,
+        rabbit_ip=ip,
         access_log=os.environ.get("OJN_ACCESS_LOG", "/var/log/apache2/ojn-access.log"),
         hostapd_restart_cmd=restart_cmd,
     )
