@@ -56,6 +56,13 @@ def _ref(name: str) -> str:
     return m.group(1)
 
 
+def _default(name: str) -> str:
+    # unwrap a ${NAME:-default} assignment to its default value
+    raw = _ref(name)
+    m = re.fullmatch(r"\$\{[^:]+:-([^}]*)\}", raw)
+    return m.group(1) if m else raw
+
+
 def test_both_checkouts_are_pinned_to_full_shas():
     # not a branch/tag: master was both unpinned AND incompatible (it dropped
     # generate_samples.py). A 40-hex SHA is the only reproducible pin.
@@ -81,6 +88,27 @@ def test_is_onnx_only_no_tensorflow():
         assert not re.search(rf"pip install[^\n]*{re.escape(banned)}", TEXT), (
             f"{banned} must not be installed (ONNX-only)"
         )
+
+
+def test_torch_and_torchaudio_are_a_pinned_pair():
+    # two separate "latest" installs gave the Bolt torch 2.13 + torchaudio 2.11
+    # (a mismatch). They must be pinned to the SAME version.
+    assert _default("TORCH_VER") == _default("TORCHAUDIO_VER")
+    assert re.fullmatch(r"\d+\.\d+\.\d+", _default("TORCH_VER"))
+    # and installed together with an explicit ==, not bare package names
+    assert re.search(r'"torch==\$TORCH_VER" "torchaudio==\$TORCHAUDIO_VER"', TEXT)
+
+
+def test_runs_training_in_a_pinned_python310_container():
+    # piper-phonemize has no cp312 wheel → training must run in the 3.10 image
+    dockerfile = SCRIPT.parent / "wake-training" / "Dockerfile"
+    assert dockerfile.exists()
+    base = dockerfile.read_text()
+    # base image pinned to a specific 3.10.x tag, not floating "3.10"/"latest"
+    assert re.search(r"^FROM python:3\.10\.\d+-", base, re.MULTILINE)
+    # the script re-invokes itself inside the container
+    assert "WAKE_IN_CONTAINER=1" in CODE
+    assert "docker run" in CODE
 
 
 def test_does_not_use_the_nonexistent_data_cli():
@@ -127,6 +155,15 @@ def test_smoke_config_is_cheap():
     assert re.search(r"^steps: 2$", cfg, re.MULTILINE)
     # and it must not depend on the multi-GB ACAV feature file
     assert "ACAV100M" not in cfg
+
+
+@requires_bash
+def test_both_configs_augment_at_least_once():
+    # augmentation_rounds: 0 multiplies the clip lists to ZERO in train.py (Bolt
+    # probe) — every profile must be >= 1
+    for mode in ("smoke", "full"):
+        m = re.search(r"^augmentation_rounds: (\d+)$", _render(mode), re.MULTILINE)
+        assert m and int(m.group(1)) >= 1, f"{mode} augmentation_rounds must be >= 1"
 
 
 @requires_bash

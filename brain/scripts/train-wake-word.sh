@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
-# Train the custom "Nabaztag" wake-word model (openWakeWord), ONNX-ONLY.
+# Train the custom "Nabaztag" wake-word model (openWakeWord), ONNX-ONLY,
+# in a PINNED PYTHON 3.10 CONTAINER (build-time only; the runtime is untouched).
+#
+# WHY A CONTAINER (Bolt probe, July 2026): the pinned generator hard-requires
+# piper-phonemize==1.1.0, which has NO cp312 Linux wheel — the Bolt's runtime
+# Python. Rather than hack around a missing wheel, training runs in a Python
+# 3.10 image (brain/scripts/wake-training/Dockerfile) where the wheel exists.
+# The stages below run INSIDE that image (the script re-invokes itself there);
+# the venv/checkouts/corpora/ONNX live in the bind-mounted repo so they persist.
+# The Nabaztag runtime stays in its own 3.12 venv — this never touches it.
 #
 #   brain/scripts/train-wake-word.sh setup      # venv + pinned checkouts + voice
 #   brain/scripts/train-wake-word.sh smoke      # CHEAP end-to-end: few clips, 2
@@ -9,6 +18,7 @@
 #   brain/scripts/train-wake-word.sh config     # write the full training config
 #   brain/scripts/train-wake-word.sh train      # full run -> models/wake/*.onnx
 #   brain/scripts/train-wake-word.sh validate   # score real WAVs against the model
+#   brain/scripts/train-wake-word.sh build      # (re)build the training image
 #   brain/scripts/train-wake-word.sh provenance # (re)write the provenance record
 #   brain/scripts/train-wake-word.sh printconfig {smoke|full}   # config to stdout
 #
@@ -74,7 +84,43 @@ ACAV_FEATURES_URL="https://huggingface.co/datasets/davidscripka/openwakeword_fea
 
 MODEL_NAME="${MODEL_NAME:-nabaztag}"
 
+# Paired, VERIFIED torch/torchaudio (NOT two separate "latest" installs — that
+# gave the Bolt torch 2.13.0 + torchaudio 2.11.0, a mismatch). Same version
+# number is the torch↔torchaudio rule; 2.2.2 has cp310 CPU wheels.
+TORCH_VER="${TORCH_VER:-2.2.2}"
+TORCHAUDIO_VER="${TORCHAUDIO_VER:-2.2.2}"
+
+# Pinned Python 3.10 training image (see wake-training/Dockerfile).
+IMAGE="${WAKE_IMAGE:-nabaztag-wake-training:py310}"
+DOCKERFILE_DIR="$REPO_DIR/brain/scripts/wake-training"
+
 log() { printf '\n== %s\n' "$*"; }
+
+_require_docker() {
+  command -v docker >/dev/null 2>&1 || {
+    echo "docker is required for wake-word training (piper-phonemize has no" \
+         "cp312 wheel; training runs in a pinned Python 3.10 image)" >&2
+    exit 1
+  }
+}
+
+_build_image() {
+  _require_docker
+  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    log "building pinned training image $IMAGE (Python 3.10)"
+    docker build -t "$IMAGE" "$DOCKERFILE_DIR"
+  fi
+}
+
+# Run a stage INSIDE the container, with the repo bind-mounted at its OWN host
+# path so every path in the config/venv is identical inside and out.
+_in_container() {  # $@ = stage + args
+  _build_image
+  docker run --rm \
+    -v "$REPO_DIR":"$REPO_DIR" -w "$REPO_DIR" \
+    -e WAKE_IN_CONTAINER=1 -e "MODEL_NAME=$MODEL_NAME" \
+    "$IMAGE" bash "brain/scripts/train-wake-word.sh" "$@"
+}
 
 _clone_pinned() {  # $1=repo $2=sha $3=dir
   if [ ! -d "$3/.git" ]; then
@@ -86,7 +132,10 @@ _clone_pinned() {  # $1=repo $2=sha $3=dir
 }
 
 cmd_setup() {
-  log "training venv (separate from the brain — build-time tooling): $VENV"
+  # Recreate the venv from scratch: an earlier probe left a Python 3.12 venv
+  # here, incompatible with this 3.10 container. Checkouts (plain git) are kept.
+  log "training venv (Python 3.10, in-container; recreated): $VENV"
+  rm -rf "$VENV"
   mkdir -p "$DATA"
   python3 -m venv "$VENV"
   "$PY" -m pip install --upgrade pip >/dev/null
@@ -95,22 +144,36 @@ cmd_setup() {
   _clone_pinned "$OWW_REPO" "$OWW_REF" "$OWW_DIR"
   _clone_pinned "$GEN_REPO" "$GEN_REF" "$GEN_DIR"
 
+  log "torch/torchaudio $TORCH_VER (paired, CPU)"
+  "$PY" -m pip install --index-url https://download.pytorch.org/whl/cpu \
+    "torch==$TORCH_VER" "torchaudio==$TORCHAUDIO_VER"
+
   log "ONNX-only training deps (NO tensorflow / onnx_tf / tflite-runtime)"
-  # CPU torch (the Bolt has no CUDA); py3.12 wheels exist on the CPU index.
-  "$PY" -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
-  # The exact upstream training deps MINUS the TFLite-only trio. If one of these
-  # lacks a cp312 wheel (piper-phonemize and speechbrain 0.5.14 are the likely
-  # suspects), that is the FIRST thing the Bolt probe should report — fix the
-  # pin here, do not hand-install around it.
+  # The exact upstream training deps MINUS the TFLite-only trio, plus soundfile
+  # (the datasets stage decodes audio). piper-phonemize==1.1.0 resolves here
+  # because this is Python 3.10; on 3.12 it has no wheel (the whole reason for
+  # the container).
   "$PY" -m pip install \
-    piper-phonemize webrtcvad "mutagen==1.47.0" "torchinfo==1.8.0" \
+    "piper-phonemize==1.1.0" webrtcvad "mutagen==1.47.0" "torchinfo==1.8.0" \
     "torchmetrics==1.2.0" "speechbrain==0.5.14" "audiomentations==0.33.0" \
     "torch-audiomentations==0.11.0" "acoustics==0.2.6" "pronouncing==0.2.0" \
-    "datasets==2.14.6" "deep-phonemizer==0.0.19" onnx
+    "datasets==2.14.6" "deep-phonemizer==0.0.19" soundfile onnx
   # The generator's own deps (it has a real requirements.txt at v2.0.0).
   "$PY" -m pip install -r "$GEN_DIR/requirements.txt"
   # openWakeWord itself WITHOUT deps, so its tflite-runtime base dep is skipped.
   "$PY" -m pip install --no-deps -e "$OWW_DIR"
+
+  log "verifying imports (fail fast if a wheel/pin is wrong)"
+  # The three that matter: piper_phonemize (the cp312 blocker), the generator's
+  # top-level generate_samples module train.py imports, and openwakeword itself.
+  "$PY" - "$GEN_DIR" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import piper_phonemize  # noqa: F401 — the piece with no cp312 wheel
+import openwakeword  # noqa: F401
+import generate_samples  # noqa: F401 — top-level module train.py imports
+print("imports OK: piper_phonemize, openwakeword, generate_samples")
+PY
 
   log "voice model for clip generation"
   mkdir -p "$GEN_DIR/models"
@@ -209,7 +272,10 @@ _write_config() {  # $1=mode $2=out
   local target n_samples n_val tts_bs aug_rounds rir bg bg_dup fdf bnpc steps out_dir
   if [ "$mode" = "smoke" ]; then
     target='["nabaztag"]'
-    n_samples=20; n_val=10; tts_bs=10; aug_rounds=0
+    # augmentation_rounds MUST be >= 1: train.py multiplies the clip lists by it,
+    # so 0 yields ZERO clips and the run collapses (Bolt probe). Empty rir/bg is
+    # fine (augmentation just passes clips through).
+    n_samples=20; n_val=10; tts_bs=10; aug_rounds=1
     rir='[]'; bg='[]'; bg_dup='[]'
     out_dir="$TRAIN_DIR/$MODEL_NAME-smoke"
     # reuse the small validation set as the negative feature source
@@ -330,15 +396,31 @@ EOF
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  case "${1:-}" in
-    setup)       cmd_setup ;;
-    smoke)       cmd_smoke ;;
-    datasets)    cmd_datasets ;;
-    config)      cmd_config ;;
-    train)       cmd_train ;;
-    validate)    shift; cmd_validate "$@" ;;
+  stage="${1:-}"
+  case "$stage" in
+    # Pure/host-safe stages (just write files/text) — no container needed.
+    build)       _build_image ;;
     provenance)  cmd_provenance ;;
     printconfig) shift; cmd_printconfig "$@" ;;
-    *) echo "usage: $0 {setup|smoke|datasets|config|train|validate|provenance|printconfig}" >&2; exit 2 ;;
+    # Compute stages: run INSIDE the pinned 3.10 image, unless we ARE the
+    # in-container invocation (WAKE_IN_CONTAINER=1), in which case do the work.
+    setup | smoke | datasets | config | train | validate)
+      if [ "${WAKE_IN_CONTAINER:-0}" = "1" ]; then
+        case "$stage" in
+          setup)    cmd_setup ;;
+          smoke)    cmd_smoke ;;
+          datasets) cmd_datasets ;;
+          config)   cmd_config ;;
+          train)    cmd_train ;;
+          validate) shift; cmd_validate "$@" ;;
+        esac
+      else
+        _in_container "$@"
+      fi
+      ;;
+    *)
+      echo "usage: $0 {setup|smoke|datasets|config|train|validate|build|provenance|printconfig}" >&2
+      exit 2
+      ;;
   esac
 fi
