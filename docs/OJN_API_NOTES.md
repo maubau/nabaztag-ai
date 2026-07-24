@@ -155,13 +155,25 @@ Hardware half — status on the real rabbit:
     home dir. Fixed with a targeted ACL (`setfacl -m u:www-data:--x` on the home + repo dirs,
     `setfacl -R -m u:www-data:rX` + a default ACL on `www/audio`); commands are in the conf
     example. Confirmed end-to-end: Deepgram Aura → Apache → Nabaztag speaker, hardware.
-13. **OPEN — XMPP connection can wedge with a persistent Send-Q.** After a test session the
-    rabbit's XMPP socket sat ESTAB with Send-Q≈846 stuck bytes: OJN kept answering CHORSENT
-    but the rabbit no longer fetched `.chor` files. Restarting the OJN container did NOT make
-    the rabbit reconnect; only a physical power-cycle of the Nabaztag recovered it (LEDs red
-    until reboot). Ideas: a health check watching `ss` for a non-draining Send-Q on :5222
-    and/or the age of the last `.chor`/audio GET in the Apache log, alerting (or restarting
-    OJN + prompting a power cycle); the bootcode's own reconnect behavior is out of our reach.
+13. **RESOLVED — it was NOT an unrecoverable XMPP wedge; it is a Wi-Fi disassociation that the
+    BOLT can self-heal by restarting hostapd (July 2026).** The earlier read (physical
+    power-cycle required, OJN restart useless) was WRONG about the cause. Re-diagnosed after a
+    week of silence: `hostapd` was still `active` and `iw` still reported `type AP`, but the
+    `nabaztag-legacy` SSID was no longer visible and the interface counters were frozen. The
+    rabbit had been disassociated for inactivity; what remained were GHOST XMPP sockets (ESTAB,
+    stuck Send-Q) and a STALE neighbour entry — those are symptoms, not the cause. A physical
+    power-cycle of the rabbit produced NO Wi-Fi attempt at all and four red LEDs (it had no AP
+    to join). `sudo systemctl restart hostapd` restored the SSID immediately: within ~2 s the
+    rabbit authenticated + associated, fetched `/vl/bc.jsp`, requested `/vl/locate.jsp`, and
+    opened a fresh XMPP; signal -28 dBm, tx failed 0.
+    **Recovery (implemented — `deploy/rabbit_recovery.py` + `nabaztag-recovery.service`):
+    restart ONLY hostapd, and only when three signals COINCIDE** — rabbit not in the station
+    dump (disassociated), last rabbit HTTP older than a threshold (Apache access-log mtime), and
+    a ghost XMPP socket on :5222. A cooldown after each restart (wait for re-association) plus a
+    per-outage restart cap with an hourly retry-hold stop it cycling when the rabbit is simply
+    powered off. **NEVER auto-restart OJN or the whole Bolt** (the old idea) — those don't fix
+    this and OJN restart was already shown useless. The bootcode's own reconnect behaviour is
+    out of our reach, but it doesn't need to be in it: fixing the AP is enough.
 14. **Capture draining held up through on_transcript but the real XVF3800 still logged
     "capture queue full, dropping blocks" during/after playback (hardware round, July 2026,
     runtime a4fd7f7).** Static review of the drain chain (LISTENING → PROCESSING → PLAYING →

@@ -1,0 +1,42 @@
+# systemd unit for the Bolt-side Wi-Fi recovery watchdog (OJN_API_NOTES #13).
+#
+# Restarts ONLY hostapd, and only when the rabbit is disassociated AND its last
+# HTTP is old AND a ghost XMPP socket lingers — the signature of the "SSID
+# silently stopped advertising" failure. It NEVER restarts OJN or the Bolt.
+#
+# Install (adjust User/paths):
+#   sudo cp deploy/nabaztag-recovery.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now nabaztag-recovery
+#   journalctl -u nabaztag-recovery -f
+#
+# It restarts hostapd via `systemctl`, which needs privilege. Either run as root
+# (below), or run as your normal user and grant EXACTLY that one command in
+# sudoers, then set HOSTAPD_RESTART_CMD=sudo systemctl restart hostapd:
+#   <user> ALL=(root) NOPASSWD: /usr/bin/systemctl restart hostapd
+
+[Unit]
+Description=Nabaztag Wi-Fi recovery watchdog (restart hostapd on rabbit disassociation)
+After=hostapd.service
+Wants=hostapd.service
+
+[Service]
+Type=simple
+# Reads RABBIT_MAC / AP_IFACE (and optional RABBIT_IP, thresholds) from .env.
+EnvironmentFile=/home/maurizio/nabaztag-ai/.env
+WorkingDirectory=/home/maurizio/nabaztag-ai
+ExecStart=/usr/bin/python3 /home/maurizio/nabaztag-ai/deploy/rabbit_recovery.py --interval 60
+Restart=always
+RestartSec=10
+
+# Runs as root only so it can `systemctl restart hostapd`; it shells out to
+# exactly iw / ss / systemctl and nothing else. Narrow the blast radius anyway.
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# It writes nothing — no ReadWritePaths needed.
+
+[Install]
+WantedBy=multi-user.target
