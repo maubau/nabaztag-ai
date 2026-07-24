@@ -1,30 +1,48 @@
 #!/usr/bin/env bash
-# Train the custom "Nabaztag" wake-word model (openWakeWord synthetic pipeline).
+# Train the custom "Nabaztag" wake-word model (openWakeWord), ONNX-ONLY.
 #
-#   brain/scripts/train-wake-word.sh setup      # pinned training venv + checkouts
-#   brain/scripts/train-wake-word.sh datasets   # background noise + RIR corpora
-#   brain/scripts/train-wake-word.sh config     # write the training config
-#   brain/scripts/train-wake-word.sh train      # generate clips + augment + train
-#   brain/scripts/train-wake-word.sh validate   # load the ONNX, score real audio
+#   brain/scripts/train-wake-word.sh setup      # venv + pinned checkouts + voice
+#   brain/scripts/train-wake-word.sh smoke      # CHEAP end-to-end: few clips, 2
+#                                               #   steps, ONNX export. Run FIRST.
+#   brain/scripts/train-wake-word.sh datasets   # the multi-GB corpora (only after
+#                                               #   smoke passes on the Bolt)
+#   brain/scripts/train-wake-word.sh config     # write the full training config
+#   brain/scripts/train-wake-word.sh train      # full run -> models/wake/*.onnx
+#   brain/scripts/train-wake-word.sh validate   # score real WAVs against the model
 #   brain/scripts/train-wake-word.sh provenance # (re)write the provenance record
+#   brain/scripts/train-wake-word.sh printconfig {smoke|full}   # config to stdout
 #
-# WHY A SCRIPT AND NOT THE NOTEBOOK: the upstream path is a Colab notebook. A
-# notebook is not reproducible on the Bolt and leaves no record of WHAT produced
-# the weights. Everything here is pinned and every stage is re-runnable.
+# WHY THIS SHAPE (a first Bolt probe of the naive version failed — every guess it
+# made was wrong; these are the corrected, VERIFIED facts against the pins below):
+#   * openWakeWord 0.6.0 and the generator are an ATOMIC PAIR, both pinned to a
+#     SHA. train.py does `from generate_samples import generate_samples`, which
+#     needs the generator's TOP-LEVEL generate_samples.py. rhasspy's generator
+#     has that at the v2.0.0 tag but NOT on master (3.2.0 moved it into a
+#     package) — so master is not just unpinned, it is INCOMPATIBLE. Verified:
+#     v2.0.0 (195e3bd9) ships generate_samples.py AND requirements.txt.
+#   * ONNX-ONLY on Python 3.12. openWakeWord's base deps drag in tflite-runtime
+#     (no cp312 wheel) and its `full` extra pins tensorflow-cpu==2.8.1 (no cp312
+#     wheel) — both only needed for the TFLite conversion we do NOT want (the
+#     runtime uses onnxruntime). So: explicit training deps, openWakeWord with
+#     --no-deps, and NO tensorflow/onnx_tf. train.py exports the .onnx BEFORE it
+#     calls convert_onnx_to_tflite (verified, lines ~559-560), and TF is imported
+#     lazily INSIDE that call — so without TF the .onnx lands and only the final
+#     TFLite step raises. `_train_onnx_only` tolerates exactly that tail error,
+#     and only if the .onnx actually exists.
+#   * `tts_language` is read by NOTHING in train.py — the naive config's bilingual
+#     claim was fiction. True it/en coverage needs generating clips with an
+#     Italian piper voice too (a second pass); the generator's v2.0.0 release
+#     ships only en_US-libritts_r. Tracked as a follow-up; this trains on the
+#     English voice with a couple of spellings, honestly labelled.
+#   * There is no `data.py --output_dir` CLI; corpora come from the HF/GitHub
+#     URLs in `datasets` below (taken from the pinned notebook).
 #
-# !! FLAGS NOT YET HARDWARE-VERIFIED !!  The stage flags below follow
-# openWakeWord's documented train.py entry point, but this script has NEVER been
-# executed end-to-end (it needs Linux + the multi-GB corpora). Treat the first
-# run as a probe: if a flag differs in the pinned checkout, fix it HERE and
-# report back, exactly as we did for Piper's --download-dir. Do not paper over a
-# mismatch by hand-running steps — the point is that the recipe stays in git.
-#
-# BOUNDARY / LICENCES: openWakeWord is Apache-2.0 (dscripka/openWakeWord) and the
-# sample generator is a BUILD-TIME tool — neither is imported by the brain, and
-# nothing is vendored into this tree. The trained .onnx is OUR artifact; its
-# provenance (phrase, versions, corpora, date) is recorded next to it. Confirm
-# each corpus's licence before redistributing any model trained on it: we ship
-# the RECIPE in git and keep the weights out (models/wake/ is gitignored).
+# BOUNDARY / LICENCES: openWakeWord is Apache-2.0 (dscripka/openWakeWord); the
+# generator is a BUILD-TIME tool. Neither is imported by the brain and nothing is
+# vendored. The trained .onnx is OURS; provenance (phrase, SHAs, corpora, date)
+# is recorded next to it. Confirm each corpus's licence before redistributing a
+# model trained on it. Weights stay out of git (models/wake/ is gitignored); the
+# .provenance.md is kept.
 #
 # The runtime only ever loads the resulting models/wake/nabaztag.onnx.
 
@@ -36,110 +54,228 @@ WAKE_DIR="${WAKE_DIR:-$REPO_DIR/models/wake}"
 TRAIN_DIR="${TRAIN_DIR:-$WAKE_DIR/.training}"
 VENV="$TRAIN_DIR/venv"
 PY="$VENV/bin/python"
+DATA="$TRAIN_DIR/data"
+OWW_DIR="$TRAIN_DIR/openWakeWord"
+GEN_DIR="$TRAIN_DIR/piper-sample-generator"
 
-# PINNED. Bump deliberately, never silently — a different commit is a different
-# model, and the provenance record must say which one made the weights.
+# ATOMIC PAIR — both pinned to a SHA (never a branch/tag). Bump deliberately:
+# a different commit is a different model and must be re-recorded in provenance.
 OWW_REPO="https://github.com/dscripka/openWakeWord"
-OWW_REF="${OWW_REF:-v0.6.0}"
-SAMPLE_GEN_REPO="https://github.com/rhasspy/piper-sample-generator"
-SAMPLE_GEN_REF="${SAMPLE_GEN_REF:-master}"   # pin to a commit sha once verified
+OWW_REF="c8ef6912c5feccf1037b852d9bc6c7ed644135ba"          # tag v0.6.0
+GEN_REPO="https://github.com/rhasspy/piper-sample-generator"
+GEN_REF="195e3bd967d54589c2137c9de2b22ad526ba6b6f"          # tag v2.0.0 (has generate_samples.py)
+
+VOICE_PT="en_US-libritts_r-medium.pt"
+VOICE_URL="$GEN_REPO/releases/download/v2.0.0/$VOICE_PT"
+# The one modest feature file: negatives for the smoke AND the false-positive
+# validation set for the full run (the multi-GB ACAV file is `datasets`-only).
+VAL_FEATURES_URL="https://huggingface.co/datasets/davidscripka/openwakeword_features/resolve/main/validation_set_features.npy"
+ACAV_FEATURES_URL="https://huggingface.co/datasets/davidscripka/openwakeword_features/resolve/main/openwakeword_features_ACAV100M_2000_hrs_16bit.npy"
 
 MODEL_NAME="${MODEL_NAME:-nabaztag}"
-# The rabbit is bilingual, and Italian and English speakers say the name
-# differently. Train on BOTH so an English "Nabaztag" is not a miss.
-WAKE_PHRASES=("nabaztag" "na bazz tag" "nabaztagh")
 
 log() { printf '\n== %s\n' "$*"; }
 
+_clone_pinned() {  # $1=repo $2=sha $3=dir
+  if [ ! -d "$3/.git" ]; then
+    git clone "$1" "$3"
+  fi
+  git -C "$3" fetch --quiet origin "$2" 2>/dev/null || git -C "$3" fetch --quiet origin
+  git -C "$3" checkout --quiet "$2"
+  echo "   $3 @ $(git -C "$3" rev-parse HEAD)"
+}
+
 cmd_setup() {
   log "training venv (separate from the brain — build-time tooling): $VENV"
-  mkdir -p "$TRAIN_DIR"
+  mkdir -p "$DATA"
   python3 -m venv "$VENV"
   "$PY" -m pip install --upgrade pip >/dev/null
 
-  if [ ! -d "$TRAIN_DIR/openWakeWord" ]; then
-    git clone --depth 1 --branch "$OWW_REF" "$OWW_REPO" "$TRAIN_DIR/openWakeWord"
+  log "pinned checkouts (atomic pair)"
+  _clone_pinned "$OWW_REPO" "$OWW_REF" "$OWW_DIR"
+  _clone_pinned "$GEN_REPO" "$GEN_REF" "$GEN_DIR"
+
+  log "ONNX-only training deps (NO tensorflow / onnx_tf / tflite-runtime)"
+  # CPU torch (the Bolt has no CUDA); py3.12 wheels exist on the CPU index.
+  "$PY" -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+  # The exact upstream training deps MINUS the TFLite-only trio. If one of these
+  # lacks a cp312 wheel (piper-phonemize and speechbrain 0.5.14 are the likely
+  # suspects), that is the FIRST thing the Bolt probe should report — fix the
+  # pin here, do not hand-install around it.
+  "$PY" -m pip install \
+    piper-phonemize webrtcvad "mutagen==1.47.0" "torchinfo==1.8.0" \
+    "torchmetrics==1.2.0" "speechbrain==0.5.14" "audiomentations==0.33.0" \
+    "torch-audiomentations==0.11.0" "acoustics==0.2.6" "pronouncing==0.2.0" \
+    "datasets==2.14.6" "deep-phonemizer==0.0.19" onnx
+  # The generator's own deps (it has a real requirements.txt at v2.0.0).
+  "$PY" -m pip install -r "$GEN_DIR/requirements.txt"
+  # openWakeWord itself WITHOUT deps, so its tflite-runtime base dep is skipped.
+  "$PY" -m pip install --no-deps -e "$OWW_DIR"
+
+  log "voice model for clip generation"
+  mkdir -p "$GEN_DIR/models"
+  if [ ! -s "$GEN_DIR/models/$VOICE_PT" ]; then
+    curl -fSL "$VOICE_URL" -o "$GEN_DIR/models/$VOICE_PT"
   fi
-  if [ ! -d "$TRAIN_DIR/piper-sample-generator" ]; then
-    git clone --depth 1 --branch "$SAMPLE_GEN_REF" "$SAMPLE_GEN_REPO" \
-      "$TRAIN_DIR/piper-sample-generator"
+  log "setup done. NEXT: smoke (cheap end-to-end) BEFORE datasets."
+}
+
+# Run the 3-step pipeline ONNX-only: tolerate the final TFLite failure iff the
+# .onnx was actually produced (train.py writes ONNX before it touches TFLite).
+_train_onnx_only() {  # $1=config $2=expected_onnx
+  "$PY" "$OWW_DIR/openwakeword/train.py" --training_config "$1" --generate_clips
+  "$PY" "$OWW_DIR/openwakeword/train.py" --training_config "$1" --augment_clips
+  set +e
+  "$PY" "$OWW_DIR/openwakeword/train.py" --training_config "$1" --train_model
+  local rc=$?
+  set -e
+  if [ ! -s "$2" ]; then
+    echo "FAILED: no ONNX at $2 (train.py exit $rc) — real error, see log above" >&2
+    return 1
   fi
-  "$PY" -m pip install -e "$TRAIN_DIR/openWakeWord[training]"
-  "$PY" -m pip install -r "$TRAIN_DIR/piper-sample-generator/requirements.txt"
-  log "setup done. Next: datasets"
+  [ "$rc" -eq 0 ] || echo "   (train.py exit $rc AFTER the ONNX export — TFLite step skipped, expected)"
+}
+
+_fetch_validation_features() {
+  if [ ! -s "$DATA/validation_set_features.npy" ]; then
+    log "downloading validation feature set (negatives for the smoke)"
+    curl -fSL "$VAL_FEATURES_URL" -o "$DATA/validation_set_features.npy"
+  fi
+}
+
+cmd_smoke() {
+  [ -x "$PY" ] || { echo "run 'setup' first" >&2; exit 1; }
+  _fetch_validation_features
+  local cfg="$TRAIN_DIR/$MODEL_NAME-smoke.yaml"
+  _write_config smoke "$cfg"
+  log "SMOKE: few clips, 2 steps, ONNX export (proves the path before the corpora)"
+  local onnx="$TRAIN_DIR/$MODEL_NAME-smoke/$MODEL_NAME.onnx"
+  _train_onnx_only "$cfg" "$onnx"
+  log "SMOKE PASSED: $onnx ($(wc -c <"$onnx") bytes). Now: datasets, then config, then train."
 }
 
 cmd_datasets() {
-  # Negative/background audio and room impulse responses are what stop the model
-  # firing at the TV. Sizes are multi-GB; this stage is the slow one.
-  log "fetching background + RIR corpora into $TRAIN_DIR/data"
-  mkdir -p "$TRAIN_DIR/data"
-  "$PY" "$TRAIN_DIR/openWakeWord/openwakeword/data.py" --output_dir "$TRAIN_DIR/data" \
-    || cat <<'EOF'
-
-The bundled fetcher did not run. Download manually into $TRAIN_DIR/data:
-  - a background-noise corpus (AudioSet subset / FMA),
-  - the MIT room-impulse-response set,
-  - openWakeWord's precomputed negative features.
-Record what you used in the provenance file; licences differ per corpus.
-EOF
+  [ -x "$PY" ] || { echo "run 'setup' first" >&2; exit 1; }
+  _fetch_validation_features
+  log "downloading the FULL corpora (multi-GB — only worth it once smoke passes)"
+  if [ ! -s "$DATA/openwakeword_features_ACAV100M_2000_hrs_16bit.npy" ]; then
+    log "ACAV100M negative features (~multi-GB)"
+    curl -fSL "$ACAV_FEATURES_URL" \
+      -o "$DATA/openwakeword_features_ACAV100M_2000_hrs_16bit.npy"
+  fi
+  log "MIT RIRs + a background-audio shard (via the datasets library)"
+  "$PY" - "$DATA" <<'PY'
+import sys, os, soundfile as sf, datasets
+data = sys.argv[1]
+rir = os.path.join(data, "mit_rirs"); os.makedirs(rir, exist_ok=True)
+ds = datasets.load_dataset("davidscripka/MIT_environmental_impulse_responses",
+                           split="train", streaming=True)
+for i, row in enumerate(ds):
+    sf.write(os.path.join(rir, f"rir_{i}.wav"), row["audio"]["array"], row["audio"]["sampling_rate"])
+print(f"wrote {i+1} RIR wavs")
+bg = os.path.join(data, "background_clips"); os.makedirs(bg, exist_ok=True)
+fma = datasets.load_dataset("rudraml/fma", name="small", split="train", streaming=True)
+for i, row in zip(range(200), fma):  # a shard is plenty for augmentation
+    a = row["audio"]
+    sf.write(os.path.join(bg, f"bg_{i}.wav"), a["array"], a["sampling_rate"])
+print(f"wrote {i+1} background wavs")
+PY
+  log "datasets done."
 }
 
 cmd_config() {
   local cfg="$TRAIN_DIR/$MODEL_NAME.yaml"
-  log "writing $cfg"
-  {
-    echo "# Generated by brain/scripts/train-wake-word.sh — edit there, not here."
-    echo "model_name: $MODEL_NAME"
-    echo "target_phrase:"
-    for phrase in "${WAKE_PHRASES[@]}"; do echo "  - \"$phrase\""; done
-    cat <<EOF
-# Clip counts: the defaults in the upstream notebook. Raise n_samples if the
-# validation stage shows misses on the real microphone.
-n_samples: 30000
-n_samples_val: 2000
-output_dir: $TRAIN_DIR/$MODEL_NAME
-piper_sample_generator_path: $TRAIN_DIR/piper-sample-generator
-background_paths:
-  - $TRAIN_DIR/data
-rir_paths:
-  - $TRAIN_DIR/data/mit_rirs
-# Bilingual: the rabbit answers to it and en speakers alike.
-tts_language: [it, en]
-EOF
-  } > "$cfg"
-  echo "config written; review it before training"
+  _write_config full "$cfg"
+  log "wrote $cfg — review it before 'train'"
 }
 
 cmd_train() {
   local cfg="$TRAIN_DIR/$MODEL_NAME.yaml"
   [ -f "$cfg" ] || { echo "no config — run 'config' first" >&2; exit 1; }
-  log "training $MODEL_NAME (long: synthetic clips, augmentation, then the model)"
-  "$PY" "$TRAIN_DIR/openWakeWord/openwakeword/train.py" \
-    --training_config "$cfg" --generate_clips --augment_clips --train_model
-  local produced="$TRAIN_DIR/$MODEL_NAME/$MODEL_NAME.onnx"
-  [ -f "$produced" ] || { echo "training produced no $produced" >&2; exit 1; }
+  log "FULL training (long: 30k clips, augmentation, $MODEL_NAME)"
+  local onnx="$TRAIN_DIR/$MODEL_NAME/$MODEL_NAME.onnx"
+  _train_onnx_only "$cfg" "$onnx"
   mkdir -p "$WAKE_DIR"
-  cp "$produced" "$WAKE_DIR/$MODEL_NAME.onnx"
+  cp "$onnx" "$WAKE_DIR/$MODEL_NAME.onnx"
   cmd_provenance
   log "model at $WAKE_DIR/$MODEL_NAME.onnx"
-  echo "Point config.yaml at it:  wake:\n    models: [models/wake/$MODEL_NAME.onnx]"
+  printf 'Point config.yaml at it:\n  wake:\n    models: [models/wake/%s.onnx]\n' "$MODEL_NAME"
+}
+
+# Write a COMPLETE training config (every key from openWakeWord's
+# examples/custom_model.yml). $1 = smoke|full, $2 = output path or '-' (stdout).
+_write_config() {  # $1=mode $2=out
+  local mode="$1" out="$2"
+  local target n_samples n_val tts_bs aug_rounds rir bg bg_dup fdf bnpc steps out_dir
+  if [ "$mode" = "smoke" ]; then
+    target='["nabaztag"]'
+    n_samples=20; n_val=10; tts_bs=10; aug_rounds=0
+    rir='[]'; bg='[]'; bg_dup='[]'
+    out_dir="$TRAIN_DIR/$MODEL_NAME-smoke"
+    # reuse the small validation set as the negative feature source
+    fdf="{\"validation\": \"$DATA/validation_set_features.npy\"}"
+    bnpc='{"validation": 16, "adversarial_negative": 10, "positive": 10}'
+    steps=2
+  else
+    # NOTE: English voice only for now; a couple of spellings nudge pronunciation.
+    # True it/en coverage = a second generation pass with an Italian piper voice
+    # (follow-up; the v2.0.0 release ships only en_US-libritts_r).
+    target='["nabaztag", "na bazz tag"]'
+    n_samples=30000; n_val=2000; tts_bs=50; aug_rounds=1
+    rir="[\"$DATA/mit_rirs\"]"; bg="[\"$DATA/background_clips\"]"; bg_dup='[1]'
+    out_dir="$TRAIN_DIR/$MODEL_NAME"
+    fdf="{\"ACAV100M_sample\": \"$DATA/openwakeword_features_ACAV100M_2000_hrs_16bit.npy\"}"
+    bnpc='{"ACAV100M_sample": 1024, "adversarial_negative": 50, "positive": 50}'
+    steps=50000
+  fi
+  local body
+  body=$(cat <<EOF
+# Generated by brain/scripts/train-wake-word.sh ($mode) — edit there, not here.
+model_name: "$MODEL_NAME"
+target_phrase: $target
+custom_negative_phrases: []
+n_samples: $n_samples
+n_samples_val: $n_val
+tts_batch_size: $tts_bs
+augmentation_batch_size: 16
+piper_sample_generator_path: "$GEN_DIR"
+output_dir: "$out_dir"
+rir_paths: $rir
+background_paths: $bg
+background_paths_duplication_rate: $bg_dup
+false_positive_validation_data_path: "$DATA/validation_set_features.npy"
+augmentation_rounds: $aug_rounds
+feature_data_files: $fdf
+batch_n_per_class: $bnpc
+model_type: "dnn"
+layer_size: 32
+steps: $steps
+max_negative_weight: 1500
+target_false_positives_per_hour: 0.2
+EOF
+)
+  if [ "$out" = "-" ]; then printf '%s\n' "$body"; else printf '%s\n' "$body" > "$out"; fi
+}
+
+cmd_printconfig() {
+  case "${1:-}" in
+    smoke|full) _write_config "$1" - ;;
+    *) echo "usage: printconfig {smoke|full}" >&2; exit 2 ;;
+  esac
 }
 
 cmd_validate() {
-  # A model that trains cleanly can still be useless on the real microphone.
-  # Score it on whatever WAVs you drop in, then confirm on the rabbit itself.
   local model="$WAKE_DIR/$MODEL_NAME.onnx"
   [ -f "$model" ] || { echo "no model at $model — train first" >&2; exit 1; }
   local clips="${1:-$TRAIN_DIR/validation-clips}"
   mkdir -p "$clips"
   log "scoring $model against WAVs in $clips (16 kHz mono)"
-  "$PY" - "$model" "$clips" <<'EOF'
-import sys, wave, numpy as np
+  "$PY" - "$model" "$clips" <<'PY'
+import pathlib, sys, wave
+import numpy as np
 from openwakeword.model import Model
 
 model_path, clips_dir = sys.argv[1], sys.argv[2]
-import pathlib
 wavs = sorted(pathlib.Path(clips_dir).glob("*.wav"))
 if not wavs:
     print(f"no WAVs in {clips_dir} — record a few saying the wake word (and a few not)")
@@ -158,12 +294,10 @@ for path in wavs:
             peak = max(peak, float(score))
     print(f"{path.name}: peak score {peak:.3f}")
 print("\nPick wake.threshold from the gap between positive and negative peaks.")
-EOF
+PY
 }
 
 cmd_provenance() {
-  # The weights are gitignored, so this file is the ONLY record of what made
-  # them. Without it a model in models/wake/ is an unidentifiable binary.
   mkdir -p "$WAKE_DIR"
   local out="$WAKE_DIR/$MODEL_NAME.provenance.md"
   cat > "$out" <<EOF
@@ -171,38 +305,40 @@ cmd_provenance() {
 
 Trained by \`brain/scripts/train-wake-word.sh\` on $(date -u +%Y-%m-%dT%H:%M:%SZ) (UTC).
 
-- Wake phrases: ${WAKE_PHRASES[*]}
-- Languages: it, en (the rabbit is bilingual)
+- Wake phrase spellings: see target_phrase in $TRAIN_DIR/$MODEL_NAME.yaml
+- Voice: en_US-libritts_r-medium (English). Italian pronunciation coverage is a
+  follow-up (a second generation pass with an Italian piper voice).
 - openWakeWord: $OWW_REPO @ $OWW_REF (Apache-2.0)
-- Sample generator: $SAMPLE_GEN_REPO @ $SAMPLE_GEN_REF (build-time only)
+- Generator: $GEN_REPO @ $GEN_REF (build-time only)
+- Export: ONNX only (onnxruntime); TFLite intentionally not produced.
 - Host: $(uname -srm)
-- Training config: $TRAIN_DIR/$MODEL_NAME.yaml
 
-## Corpora
+## Corpora (record each licence — some restrict redistribution of the model)
 
-Record here EXACTLY which background-noise and RIR corpora were used, and each
-one's licence. Some (e.g. AudioSet) restrict redistribution — that governs
-whether this .onnx may be shared, not just the training code.
-
-- background: <fill in>
-- RIR: <fill in>
+- Negative features: openwakeword_features_ACAV100M_2000_hrs_16bit.npy
+  (davidscripka/openwakeword_features)
+- Validation features: validation_set_features.npy
+- RIR: davidscripka/MIT_environmental_impulse_responses
+- Background: rudraml/fma (small)
 
 ## Licence of this artifact
 
-The weights are ours (Apache-2.0 like the rest of the brain) SUBJECT TO the
-corpora terms above. The training tools are external and not vendored.
+Weights are ours (Apache-2.0 like the brain) SUBJECT TO the corpora terms above.
+The training tools are external and not vendored.
 EOF
   echo "provenance written to $out"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   case "${1:-}" in
-    setup)      cmd_setup ;;
-    datasets)   cmd_datasets ;;
-    config)     cmd_config ;;
-    train)      cmd_train ;;
-    validate)   shift; cmd_validate "$@" ;;
-    provenance) cmd_provenance ;;
-    *) echo "usage: $0 {setup|datasets|config|train|validate|provenance}" >&2; exit 2 ;;
+    setup)       cmd_setup ;;
+    smoke)       cmd_smoke ;;
+    datasets)    cmd_datasets ;;
+    config)      cmd_config ;;
+    train)       cmd_train ;;
+    validate)    shift; cmd_validate "$@" ;;
+    provenance)  cmd_provenance ;;
+    printconfig) shift; cmd_printconfig "$@" ;;
+    *) echo "usage: $0 {setup|smoke|datasets|config|train|validate|provenance|printconfig}" >&2; exit 2 ;;
   esac
 fi

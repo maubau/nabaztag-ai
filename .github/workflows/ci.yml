@@ -31,6 +31,14 @@ jobs:
           ruff format --check .
       - name: Unit tests (mock-OJN, no hardware)
         run: pytest -v
+      - name: Wake-word script online check (generator API still present)
+        # The offline install-smoke (pins, --no-deps, ONNX-only, config
+        # completeness) runs above with the rest; this extra step verifies the
+        # pinned generator commit still ships generate_samples.py. It skips
+        # itself on any network blip, so it can't flake the build red.
+        env:
+          WAKE_ONLINE_CHECK: "1"
+        run: pytest -v tests/test_train_wake_word.py -k generator_commit_ships
 
   audio-install-smoke:
     # Mirrors the Bolt (Ubuntu 24.04 / Python 3.12) and exercises optional-dep
