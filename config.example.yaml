@@ -134,17 +134,26 @@ audio_out:
   #   "local": a Bolt audio device. Real start/end events, instant cancel
   #     (barge-in), no MTL decoder. Ears and LEDs still play on the rabbit, so
   #     it stays animated while the sound comes from the Bolt.
+  #     NOTE: on its own this does NOT cut time-to-first-audio — it plays an
+  #     already-complete MP3, so it still waits for the TTS to finish. It is the
+  #     prerequisite for progressive playback (Realtime PCM deltas), not the win.
   backend: rabbit
   # Output device for backend: local — a PortAudio name substring or index,
-  # same matching as capture_device. STRONGLY PREFER the reSpeaker's own output
-  # (3.5 mm jack or its 5 W JST speaker connector): the XVF3800 takes the far-end
-  # reference over USB, so anything played through it is echo-cancelled from the
-  # mics on-chip. Play through the Bolt's HDMI/line-out instead and the mic hears
-  # the speaker — barge-in would trigger on the rabbit's own voice.
+  # same matching as capture_device. PREFER the reSpeaker's own output (3.5 mm
+  # jack, or its JST connector for an amplified speaker — up to 10 W into 4 ohm
+  # with an adequate supply): the XVF3800 takes the far-end reference over USB,
+  # so audio played through it CAN be echo-cancelled from the mics on-chip.
+  # That is a precondition, not a guarantee — verify with
+  # brain/scripts/aec-probe.py before relying on barge-in. Play through the
+  # Bolt's HDMI/line-out instead and there is no reference at all: the mic hears
+  # the speaker and barge-in fires on the rabbit's own voice.
   # device: "C16K6Ch"
-  # Left unset, the device's own defaults are used (fall back 48000 / 2ch).
-  # sample_rate: 48000
-  # channels: 2
+  # Leave the format UNSET so it is taken from the device: the reSpeaker's 6ch
+  # USB firmware runs at 16 kHz, and presetting 48 kHz would resample every
+  # reply to a rate the device never asked for. Set these only if the device
+  # cannot report its own format (the runtime then says so explicitly).
+  # sample_rate: 16000
+  # channels: 1
 
 leds:
   # LISTENING is a five-LED magenta breathing effect with counter-rotating

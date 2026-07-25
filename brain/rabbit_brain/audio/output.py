@@ -14,20 +14,32 @@ Two selectable output backends (`audio_out.backend` in config.yaml):
         - real playback start/end (the handle finishes when the audio really
           finished, so the half-duplex gate and PLAYING state stop guessing);
         - instant cancel -> barge-in becomes possible (OJN cannot cancel audio);
-        - progressive/streaming playback, the thing Gate L3 could not have.
+        - the ABILITY to play progressively, which Gate L3 could never have.
       The rabbit still moves: ears and LEDs are choreography on the OJN path
       regardless of where the sound comes from.
 
+SCOPE — what this does NOT yet buy: this plays an ALREADY-COMPLETE MP3, so it
+still waits for the TTS to finish synthesizing. It does not by itself reduce
+time-to-first-audio. The real latency win needs a source that emits audio
+progressively (the Realtime path, playing PCM deltas as they arrive); this
+backend is the prerequisite for that, not the win itself.
+
 ECHO CANCELLATION (why the OUTPUT DEVICE matters): the reSpeaker XVF3800 does
-AEC/beamforming ON-CHIP, and over USB it takes the far-end REFERENCE from the
-host — the UAC2 interface has a playback direction, and the board carries a
-3.5 mm jack and a JST connector for a 5 W amplified speaker. So if the speaker
-is driven THROUGH the reSpeaker, the chip knows what is being played and
-subtracts it from the mics for free: the rabbit stops hearing itself, which is
-the precondition for talking over it. Play through the Bolt's own HDMI/line-out
-instead and there is NO reference signal — the microphone hears the speaker and
-any barge-in detector will trigger on the rabbit's own voice. Prefer the
-reSpeaker's output; `audio_out.device` selects it.
+AEC/beamforming ON-CHIP and, over USB, takes the far-end REFERENCE from the host
+(the UAC2 interface has a playback direction). The board carries a 3.5 mm jack
+and a JST connector for an amplified speaker (up to 10 W into 4 Ω, given an
+adequate supply). Driving the speaker THROUGH the reSpeaker is therefore the
+configuration in which the chip can subtract our own audio from the mics.
+
+But this is NOT automatic — it holds only if ALL of these are true, and each is
+a hardware fact to be MEASURED, not assumed:
+  1. the audio really leaves via the USB XVF3800 device (not the Bolt's own
+     HDMI/line-out, which gives the chip no reference at all);
+  2. it lands on the reference channel the firmware expects (left);
+  3. the physical speaker reproduces that same signal.
+Verify with `brain/scripts/aec-probe.py` (single-talk residual + double-talk)
+BEFORE relying on barge-in: if AEC is not actually active, a barge-in detector
+fires on the rabbit's own voice and the conversation talks over itself.
 
 `sounddevice` is an optional dependency (rabbit-brain[audio]); ffmpeg does the
 MP3->PCM decode and is already required for the TTS gain stage.
@@ -47,11 +59,13 @@ log = logging.getLogger(__name__)
 _CARD_RE = re.compile(r"CARD=([^,]+)")
 
 # Decode/'write to the device' block size. Small enough that a cancel lands
-# quickly (barge-in), large enough not to churn: ~21 ms of 48 kHz stereo.
-_BLOCK_BYTES = 4096
+# quickly (barge-in), large enough not to churn (~64 ms of 16 kHz mono).
+_BLOCK_BYTES = 2048
 
-DEFAULT_SAMPLE_RATE = 48000
-DEFAULT_CHANNELS = 2
+# NOTE: no assumed sample rate. The reSpeaker's installed 6-channel USB firmware
+# runs at 16 kHz, so presetting 48 kHz would silently resample everything to a
+# rate the device does not want. The format is taken FROM THE DEVICE, and if it
+# can't be determined we say so instead of guessing (see _resolve).
 
 
 def resolve_output_device(devices: list[dict], wanted: str) -> int | None:
@@ -123,8 +137,13 @@ class LocalAudioPlayer:
     # --- device / format -------------------------------------------------
 
     def _resolve(self):
-        """Pick the PortAudio device and the stream format once, preferring the
-        device's own defaults over guesses when the config doesn't say."""
+        """Pick the PortAudio device and take the stream format FROM IT.
+
+        Deliberately no fallback rate: the reSpeaker's 6-channel USB firmware
+        runs at 16 kHz, and quietly assuming 48 kHz would resample every reply
+        to a rate the device never asked for. If the device can't tell us, we
+        raise and ask for an explicit audio_out.sample_rate/channels.
+        """
         if self._resolved is not None:
             return self._resolved
         import sounddevice as sd
@@ -140,11 +159,17 @@ class LocalAudioPlayer:
             device = index
         rate, channels = self._sample_rate, self._channels
         if rate is None or channels is None:
-            info = sd.query_devices(device, "output") if device is not None else {}
+            info = dict(sd.query_devices(device, "output"))
             if rate is None:
-                rate = int(info.get("default_samplerate") or DEFAULT_SAMPLE_RATE)
+                rate = int(info.get("default_samplerate") or 0)
             if channels is None:
-                channels = min(int(info.get("max_output_channels") or DEFAULT_CHANNELS), 2) or 1
+                channels = min(int(info.get("max_output_channels") or 0), 2)
+        if not rate or not channels:
+            raise RuntimeError(
+                "could not determine the output format from the device; set "
+                "audio_out.sample_rate and audio_out.channels explicitly "
+                "(the reSpeaker 6ch USB firmware runs at 16 kHz)"
+            )
         self._resolved = (device, int(rate), int(channels))
         log.info("local audio out: device=%s rate=%d channels=%d", device, rate, channels)
         return self._resolved
