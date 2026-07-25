@@ -114,6 +114,31 @@ def _capture_from_config(audio_cfg: dict) -> AlsaCapture:
     )
 
 
+def _audio_player_from_config(config: dict):
+    """Build the local audio backend, or None to keep playing on the rabbit.
+
+    audio_out.backend: "rabbit" (default) speaks from the Nabaztag via OJN;
+    "local" plays on a Bolt device — real playback events, instant cancel, and
+    no MTL decoder. Prefer routing the speaker THROUGH the reSpeaker so its
+    on-chip AEC gets the reference signal (see audio/output.py).
+    """
+    out_cfg = config.get("audio_out", {})
+    backend = str(out_cfg.get("backend", "rabbit")).lower()
+    if backend in ("", "rabbit", "nabaztag"):
+        return None
+    if backend != "local":
+        raise ValueError(f"unknown audio_out.backend {backend!r} (use 'rabbit' or 'local')")
+    from .audio.output import LocalAudioPlayer
+
+    log.info("audio out: LOCAL (Bolt device %s)", out_cfg.get("device", "<default>"))
+    return LocalAudioPlayer(
+        audio_dir=os.environ.get("NABAZTAG_AUDIO_DIR", "www/audio"),
+        device=out_cfg.get("device"),
+        sample_rate=out_cfg.get("sample_rate"),
+        channels=out_cfg.get("channels"),
+    )
+
+
 async def run(config_path: str, moods_path: str, system_prompt_path: str) -> None:
     config = _load_yaml(config_path)
     moods = _load_yaml(moods_path)
@@ -139,7 +164,7 @@ async def run(config_path: str, moods_path: str, system_prompt_path: str) -> Non
             serial=serial,
         )
         await listener.start()
-        controller = BodyController(adapter)
+        controller = BodyController(adapter, audio_player=_audio_player_from_config(config))
         controller_task = asyncio.create_task(controller.run())
 
         protected = {Path(beep_cfg["mp3"]).name} if beep_cfg.get("mp3") else None

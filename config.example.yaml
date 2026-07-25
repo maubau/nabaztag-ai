@@ -124,6 +124,28 @@ audio:
   #   "capture queue full, dropping blocks" still appears under real load —
   #   memory cost is trivial (~6 KB/block, raw 6ch).
 
+audio_out:
+  # WHERE THE VOICE COMES OUT. Switchable, so the two can be A/B'd on hardware.
+  #   "rabbit" (default): the Nabaztag's own speaker via OJN. The charm — but
+  #     the MTL decoder buffers each MP3 to EOF (Gate L3, hardware-rejected), so
+  #     playback can't start before synthesis ends, duration is only ESTIMATED
+  #     (no real playback events), audio can't be cancelled, and queued files
+  #     have a ~1.7 s gap.
+  #   "local": a Bolt audio device. Real start/end events, instant cancel
+  #     (barge-in), no MTL decoder. Ears and LEDs still play on the rabbit, so
+  #     it stays animated while the sound comes from the Bolt.
+  backend: rabbit
+  # Output device for backend: local — a PortAudio name substring or index,
+  # same matching as capture_device. STRONGLY PREFER the reSpeaker's own output
+  # (3.5 mm jack or its 5 W JST speaker connector): the XVF3800 takes the far-end
+  # reference over USB, so anything played through it is echo-cancelled from the
+  # mics on-chip. Play through the Bolt's HDMI/line-out instead and the mic hears
+  # the speaker — barge-in would trigger on the rabbit's own voice.
+  # device: "C16K6Ch"
+  # Left unset, the device's own defaults are used (fall back 48000 / 2ch).
+  # sample_rate: 48000
+  # channels: 2
+
 leds:
   # LISTENING is a five-LED magenta breathing effect with counter-rotating
   # ears. It stops at end of turn (Flux EndOfTurn, or VAD end-of-speech on the

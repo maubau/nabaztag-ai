@@ -60,8 +60,14 @@ class _Entry:
 
 
 class BodyController:
-    def __init__(self, adapter: BodyAdapter):
+    def __init__(self, adapter: BodyAdapter, audio_player=None):
         self._adapter = adapter
+        # Optional local audio backend (rabbit_brain.audio.output.LocalAudioPlayer).
+        # When set, PlayAudioCommand is rendered on a Bolt audio device instead of
+        # the rabbit's speaker; everything else here — the audio lane, audio_busy,
+        # the PLAYING state, ears/LED choreography — is unchanged, which is the
+        # point: the output is a swappable backend, not a second pipeline.
+        self._audio_player = audio_player
         self._state = BodyState()
         self._seq = itertools.count()
 
@@ -115,10 +121,16 @@ class BodyController:
                 if entry.priority < below and entry.seq not in self._dropped:
                     self._dropped.add(entry.seq)
                     self._finish_one()
-        if self._current_playback is not None and self._adapter.capabilities.can_cancel_audio:
+        if self._current_playback is not None and self.can_cancel_audio:
             task = asyncio.ensure_future(self._current_playback.cancel())
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
+
+    @property
+    def can_cancel_audio(self) -> bool:
+        """OJN cannot stop an utterance once queued; a local device can — so
+        barge-in is possible exactly when the local backend is in use."""
+        return self._audio_player is not None or self._adapter.capabilities.can_cancel_audio
 
     def snapshot(self) -> BodyState:
         return replace(self._state, leds=dict(self._state.leds))
@@ -217,7 +229,8 @@ class BodyController:
             self._audio_inflight = True
             try:
                 if isinstance(entry.cmd, PlayAudioCommand):
-                    handle = await self._adapter.play_audio(entry.cmd.urls, entry.cmd.duration_s)
+                    player = self._audio_player or self._adapter
+                    handle = await player.play_audio(entry.cmd.urls, entry.cmd.duration_s)
                     self._state.last_audio_urls = entry.cmd.urls
                 else:
                     assert isinstance(entry.cmd, SayCommand)
