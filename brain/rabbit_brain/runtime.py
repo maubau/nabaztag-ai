@@ -34,7 +34,7 @@ import yaml
 
 from .audio.capture import AlsaCapture
 from .audio.doa import make_doa
-from .audio.pipeline import DEFAULT_TURN_TIMEOUT_S, VoicePipeline
+from .audio.pipeline import DEFAULT_REALTIME_IDLE_S, DEFAULT_TURN_TIMEOUT_S, VoicePipeline
 from .audio.vad import DEFAULT_END_OF_SPEECH_MS, SileroProbe
 from .audio.wake import OpenWakeWordDetector
 from .body.controller import BodyController
@@ -139,6 +139,93 @@ def _audio_player_from_config(config: dict):
     )
 
 
+def realtime_tool_specs(tools) -> list[dict]:
+    """Body tools in the Realtime wire format, plus an explicit hang-up.
+
+    The conversation is continuous, so without `end_conversation` only a timeout
+    or an error could end it — the model needs a way to say goodbye.
+    """
+    from .llm.realtime import END_CONVERSATION_TOOL
+
+    specs = [
+        {
+            "type": "function",
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": spec.parameters,
+        }
+        for spec in tools.specs(include_all=True)
+    ]
+    specs.append(
+        {
+            "type": "function",
+            "name": END_CONVERSATION_TOOL,
+            "description": (
+                "End the conversation when the user says goodbye or is clearly done. "
+                "The wake word will start a new one."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        }
+    )
+    return specs
+
+
+def realtime_tool_executor(tools):
+    """Adapt BodyTools.execute(ToolCall) to the (name, arguments) the Realtime
+    session calls, so ears/LEDs/gestures work in both modes from one impl."""
+    from .llm.base import ToolCall
+
+    async def execute(name: str, arguments: dict) -> str:
+        result = await tools.execute(ToolCall(call_id="realtime", name=name, arguments=arguments))
+        return result.output
+
+    return execute
+
+
+def _make_realtime_factory(rt_cfg: dict, audio_cfg: dict, out_cfg: dict, instructions, tools):
+    """Build a per-conversation factory: each wake gets a fresh player+session.
+
+    Returns an async callable (on_response_start, on_barge_in) -> RealtimeSession
+    already connected, with its speaker running. The pipeline owns closing it.
+    """
+
+    async def factory(on_response_start, on_barge_in):
+        from .audio.streaming import StreamingAudioPlayer
+        from .llm.realtime import DEFAULT_MODEL, DEFAULT_VOICE, RealtimeSession
+
+        from .audio.output import LocalAudioPlayer  # isort: skip — resolve the device once
+
+        device, rate, channels = LocalAudioPlayer(
+            audio_dir=os.environ.get("NABAZTAG_AUDIO_DIR", "www/audio"),
+            device=out_cfg.get("device"),
+            sample_rate=out_cfg.get("sample_rate"),
+            channels=out_cfg.get("channels"),
+        )._resolve()
+        player = StreamingAudioPlayer(device, rate, channels)
+        await player.start()
+        session = RealtimeSession(
+            api_key=os.environ["OPENAI_API_KEY"],
+            player=player,
+            instructions=instructions,
+            model=rt_cfg.get("model", DEFAULT_MODEL),
+            voice=rt_cfg.get("voice", DEFAULT_VOICE),
+            mic_rate=audio_cfg.get("sample_rate", 16_000),
+            turn_detection=rt_cfg.get("turn_detection", "semantic_vad"),
+            tools=realtime_tool_specs(tools),
+            tool_executor=realtime_tool_executor(tools),
+            on_response_start=on_response_start,
+            on_barge_in=on_barge_in,
+        )
+        try:
+            await session.connect()
+        except Exception:
+            await session.aclose()  # never leak the open output stream
+            raise
+        return session
+
+    return factory
+
+
 def conversation_mode(config: dict) -> str:
     """conversation.mode: "turn_based" (default) or "realtime".
 
@@ -215,6 +302,24 @@ async def run(config_path: str, moods_path: str, system_prompt_path: str) -> Non
             # forward the STT-detected utterance language for TTS voice routing
             await agent.handle(text, language=pipeline.last_stt_language)
 
+        # THE branch: turn_based keeps the curated Flux/gpt-5.4-mini/Piper chain;
+        # realtime hands the same capture to a full-duplex session. Validated at
+        # startup (realtime requires audio_out.backend: local).
+        mode = conversation_mode(config)
+        rt_cfg = config.get("conversation", {}).get("realtime", {})
+        realtime_factory = None
+        if mode == "realtime":
+            log.info("conversation mode: REALTIME (full-duplex, barge-in)")
+            realtime_factory = _make_realtime_factory(
+                rt_cfg,
+                audio_cfg,
+                config.get("audio_out", {}),
+                system_prompt,
+                BodyTools(controller, get_direction=lambda: pipeline.last_doa_deg),
+            )
+        else:
+            log.info("conversation mode: turn-based")
+
         pipeline = VoicePipeline(
             capture=_capture_from_config(audio_cfg),
             wake=OpenWakeWordDetector(models=tuple(wake_cfg.get("models", ["hey_jarvis"]))),
@@ -231,6 +336,8 @@ async def run(config_path: str, moods_path: str, system_prompt_path: str) -> Non
             wake_beep=wake_beep,
             processing_indicator=config.get("leds", {}).get("processing_indicator", False),
             turn_timeout_s=config.get("flux", {}).get("turn_timeout_s", DEFAULT_TURN_TIMEOUT_S),
+            realtime_factory=realtime_factory,
+            realtime_idle_timeout_s=rt_cfg.get("idle_timeout_s", DEFAULT_REALTIME_IDLE_S),
         )
 
         async def watch_events() -> None:

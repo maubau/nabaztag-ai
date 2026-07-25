@@ -142,9 +142,15 @@ conversation:
     model: gpt-realtime-2.1
     # alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
     voice: marin
-    # Server-side turn detection: the model decides when you stopped talking,
-    # the same job Flux does on the turn-based path.
-    turn_detection: server_vad
+    # Turn detection, the job Flux does on the turn-based path:
+    #   semantic_vad — the model judges whether you finished a THOUGHT, so a
+    #     mid-sentence pause doesn't cut you off. Start here.
+    #   server_vad   — a plain silence/energy detector.
+    turn_detection: semantic_vad
+    # The wake word opens a CONTINUOUS conversation and is not repeated per
+    # turn; it ends after this much true silence (neither side speaking), when
+    # the model calls end_conversation (say goodbye), or on any error.
+    idle_timeout_s: 45
 
 audio_out:
   # WHERE THE VOICE COMES OUT. Switchable, so the two can be A/B'd on hardware.

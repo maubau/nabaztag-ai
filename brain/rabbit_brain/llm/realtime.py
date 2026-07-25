@@ -47,7 +47,14 @@ log = logging.getLogger(__name__)
 REALTIME_URL = "wss://api.openai.com/v1/realtime"
 DEFAULT_MODEL = "gpt-realtime-2.1"
 DEFAULT_VOICE = "marin"
-API_RATE = 24000  # the Realtime API speaks pcm16 at 24 kHz
+API_RATE = 24000  # the Realtime API speaks pcm at 24 kHz
+# Turn detection: "semantic_vad" lets the model judge whether you actually
+# finished a thought (kinder to mid-sentence pauses than a pure silence timer);
+# "server_vad" is the plain energy/silence detector.
+TURN_DETECTION = ("semantic_vad", "server_vad")
+# The model can hang up by calling this; the conversation is continuous, so
+# without it only a timeout or an error would end a session.
+END_CONVERSATION_TOOL = "end_conversation"
 
 
 @dataclass
@@ -93,20 +100,34 @@ class RealtimeSession:
         model: str = DEFAULT_MODEL,
         voice: str = DEFAULT_VOICE,
         mic_rate: int = 16000,
+        turn_detection: str = "semantic_vad",
         tools: list[dict] | None = None,
         tool_executor: Callable | None = None,
         session: aiohttp.ClientSession | None = None,
         on_transcript: Callable[[str], None] | None = None,
+        on_response_start: Callable[[], None] | None = None,
+        on_barge_in: Callable[[], None] | None = None,
+        close_player: bool = True,
     ):
         self._api_key = api_key
         self._player = player
+        self._close_player = close_player
         self._instructions = instructions
         self._model = model
         self._voice = voice
+        if turn_detection not in TURN_DETECTION:
+            raise ValueError(f"turn_detection must be one of {TURN_DETECTION}")
+        self._turn_detection = turn_detection
         self._tools = tools or []
         self._tool_executor = tool_executor
         self._on_transcript = on_transcript
+        self._on_response_start = on_response_start
+        self._on_barge_in = on_barge_in
         self._to_api = Resampler(mic_rate, API_RATE)
+        # Continuous conversation: the wake word is NOT repeated per turn, so
+        # the session ends on idle timeout, an explicit hang-up, or an error.
+        self.last_activity = time.monotonic()
+        self.ended_by_model = False
         self._session = session
         self._own_session = session is None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
@@ -138,9 +159,17 @@ class RealtimeSession:
                 "session": {
                     "type": "realtime",
                     "instructions": self._instructions,
+                    # Current audio schema: format is an object (type + rate),
+                    # not the old bare "pcm16" string.
                     "audio": {
-                        "input": {"format": "pcm16", "turn_detection": {"type": "server_vad"}},
-                        "output": {"format": "pcm16", "voice": self._voice},
+                        "input": {
+                            "format": {"type": "audio/pcm", "rate": API_RATE},
+                            "turn_detection": {"type": self._turn_detection},
+                        },
+                        "output": {
+                            "format": {"type": "audio/pcm", "rate": API_RATE},
+                            "voice": self._voice,
+                        },
                     },
                     "tools": self._tools,
                 },
@@ -148,10 +177,17 @@ class RealtimeSession:
         )
 
     async def aclose(self) -> None:
+        """Tear everything down: socket AND speaker. The capture iterator is NOT
+        touched — it belongs to the pipeline and must survive for the turn-based
+        path to keep working after a realtime failure."""
         if self._ws is not None and not self._ws.closed:
             with contextlib.suppress(Exception):
                 await self._ws.close()
         self._ws = None
+        closer = getattr(self._player, "aclose", None)
+        if self._close_player and closer is not None:
+            with contextlib.suppress(Exception):
+                await closer()
         if self._own_session and self._session is not None:
             with contextlib.suppress(Exception):
                 await self._session.close()
@@ -167,10 +203,41 @@ class RealtimeSession:
 
     # --- the two directions ----------------------------------------------
 
-    async def pump_microphone(self, frames: AsyncIterator[bytes]) -> None:
-        """Stream mic audio up for as long as the conversation lasts. Frames are
-        16 kHz mono from the reSpeaker; the API wants 24 kHz."""
-        async for frame in frames:
+    async def pump_microphone(
+        self,
+        frames: AsyncIterator[bytes],
+        stop: asyncio.Event | None = None,
+        should_continue: Callable[[], bool] | None = None,
+        idle_timeout_s: float | None = None,
+    ) -> str:
+        """Stream mic audio up for as long as the conversation lasts, INCLUDING
+        while the model is speaking — that is what makes barge-in possible at
+        all. Frames are 16 kHz mono from the reSpeaker; the API wants 24 kHz.
+
+        Returns why it stopped: "stopped" | "idle" | "hangup" | "exhausted".
+
+        The exit conditions are checked BETWEEN frames and this coroutine is
+        never cancelled mid-`anext`: cancelling a task blocked on the shared
+        capture iterator closes that async generator permanently, which would
+        take the microphone down for the rest of the process (a bug this
+        codebase has already paid for once, in _flush_residual).
+        """
+        while True:
+            if stop is not None and stop.is_set():
+                return "stopped"
+            if should_continue is not None and not should_continue():
+                return "stopped"
+            if self.ended_by_model:
+                return "hangup"
+            if (
+                idle_timeout_s is not None
+                and time.monotonic() - self.last_activity > idle_timeout_s
+            ):
+                return "idle"
+            try:
+                frame = await anext(frames)
+            except StopAsyncIteration:
+                return "exhausted"
             converted = self._to_api.process(frame)
             if not converted:
                 continue
@@ -195,6 +262,10 @@ class RealtimeSession:
         kind = event.get("type", "")
         if kind == "error":
             raise RealtimeError(f"realtime API error: {event.get('error')}")
+        # Any traffic that is the conversation actually happening keeps the
+        # session alive; the idle timeout only fires on real silence.
+        if kind.startswith(("input_audio_buffer.", "response.")):
+            self.last_activity = time.monotonic()
 
         if kind == "input_audio_buffer.speech_started":
             self.timings.speech_started_ms = self._ms()
@@ -230,6 +301,8 @@ class RealtimeSession:
             self._responding = True
             self._player.reset_position()
             await self._player.resume()
+            if self._on_response_start is not None:
+                self._on_response_start()  # UX: the rabbit is answering
         item_id = event.get("item_id")
         if item_id:
             self._current_item = item_id
@@ -260,6 +333,8 @@ class RealtimeSession:
         cut_ms = round((time.monotonic() - started) * 1000)
         self.timings.interruptions.append(cut_ms)
         log.info("barge-in: cut playback in %d ms after %d ms of speech", cut_ms, played_ms)
+        if self._on_barge_in is not None:
+            self._on_barge_in()  # UX: straight back to listening
 
     async def _on_tool_call(self, event: dict) -> None:
         """Body tools (ears, LEDs, gestures) stay available in realtime mode."""
@@ -270,6 +345,11 @@ class RealtimeSession:
             arguments = json.loads(event.get("arguments") or "{}")
         except json.JSONDecodeError:
             arguments = {}
+        if name == END_CONVERSATION_TOOL:
+            # Explicit hang-up: the pump sees this and closes the session.
+            self.ended_by_model = True
+            log.info("realtime: model ended the conversation")
+            return
         try:
             result = await self._tool_executor(name, arguments)
         except Exception as exc:  # a failed gesture must not kill the call
@@ -289,27 +369,37 @@ class RealtimeSession:
 
 
 async def converse(
-    session: RealtimeSession, frames: AsyncIterator[bytes], timeout_s: float | None = None
-) -> RealtimeTimings:
-    """Run both directions until the socket ends or `timeout_s` elapses.
+    session: RealtimeSession,
+    frames: AsyncIterator[bytes],
+    idle_timeout_s: float | None = None,
+    stop: asyncio.Event | None = None,
+) -> str:
+    """Run one continuous conversation and return why it ended.
+
+    The mic pump runs INLINE (never as a cancellable task): it holds the shared
+    capture iterator, and cancelling it mid-`anext` would close that generator
+    for good. Only the event reader is a task, and it is safe to cancel.
 
     Any failure surfaces as RealtimeError so the caller can re-arm the
     turn-based path — a broken realtime session must never leave the rabbit
-    mute, it just costs the full-duplex behaviour for that turn.
+    mute, it just costs the full-duplex behaviour.
     """
-    pump = asyncio.create_task(session.pump_microphone(frames))
     events = asyncio.create_task(session.run())
     try:
-        done, pending = await asyncio.wait(
-            {pump, events}, timeout=timeout_s, return_when=asyncio.FIRST_COMPLETED
+        reason = await session.pump_microphone(
+            frames,
+            stop=stop,
+            should_continue=lambda: not events.done(),
+            idle_timeout_s=idle_timeout_s,
         )
-        for task in done:
-            exc = task.exception()
+        # The event reader failing IS the error we must report (the pump would
+        # otherwise just return "stopped" and hide it).
+        if events.done() and not events.cancelled():
+            exc = events.exception()
             if exc is not None:
                 raise exc
+        return reason
     finally:
-        for task in (pump, events):
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
-    return session.timings
+        events.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await events

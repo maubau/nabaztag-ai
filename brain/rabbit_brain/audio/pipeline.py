@@ -38,6 +38,7 @@ from typing import Any
 from ..body.chor import (
     LISTENING_CYCLE_S,
     PROCESSING_PULSE_CYCLE_S,
+    build_dance_chor,
     build_leds_off_chor,
     build_listening_chor,
     build_processing_chor,
@@ -66,6 +67,10 @@ DEFAULT_TURN_TIMEOUT_S = 15.0
 # after the reply was queued (OJN round-trip). Bounded so a lost/failed
 # playback can never leave the LEDs pulsing.
 PLAYBACK_START_TIMEOUT_S = 5.0
+# Realtime mode: the wake word opens a CONTINUOUS conversation, so it is not
+# repeated per turn. The session ends on this much true silence (neither side
+# speaking), an explicit hang-up, or an error.
+DEFAULT_REALTIME_IDLE_S = 45.0
 # Safety ceiling on the PLAYING drain: a runaway reply must not wedge the
 # pipeline forever if audio_busy ever gets stuck (hardware round, July 2026).
 PLAYING_DRAIN_TIMEOUT_S = 30.0
@@ -76,6 +81,23 @@ PLAYING_DRAIN_TIMEOUT_S = 30.0
 FLUSH_TIMEOUT_S = 0.08
 
 _CLOSE = object()  # sentinel ending the STT chunk stream
+
+
+class _SpeakingState:
+    """Whether the rabbit is currently answering, shared between the Realtime
+    session (which flips it from its callbacks) and the UX feedback loop."""
+
+    def __init__(self) -> None:
+        self.value = False
+        self.changed = asyncio.Event()
+
+    def on_response_start(self) -> None:
+        self.value = True
+        self.changed.set()
+
+    def on_barge_in(self) -> None:
+        self.value = False
+        self.changed.set()
 
 
 @dataclass
@@ -162,6 +184,8 @@ class VoicePipeline:
         listening_cycle_s: float = LISTENING_CYCLE_S,
         doa_timeout_s: float = DEFAULT_DOA_TIMEOUT_S,
         turn_timeout_s: float = DEFAULT_TURN_TIMEOUT_S,
+        realtime_factory: Callable[[], Awaitable[Any]] | None = None,
+        realtime_idle_timeout_s: float = DEFAULT_REALTIME_IDLE_S,
     ):
         self._capture = capture
         self._wake = wake
@@ -185,6 +209,13 @@ class VoicePipeline:
         self._listening_cycle_s = listening_cycle_s
         self._doa_timeout_s = doa_timeout_s
         self._turn_timeout_s = turn_timeout_s
+        # Realtime (full-duplex) branch. None = turn-based only. Once a realtime
+        # session fails we stay on the turn-based path for the rest of the
+        # process: degrade in place, never require a service restart.
+        self._realtime_factory = realtime_factory
+        self._realtime_idle_timeout_s = realtime_idle_timeout_s
+        self.realtime_failed = False
+        self.realtime_sessions = 0  # diagnostics/tests
 
         self._feedback_tasks: set[asyncio.Task] = set()
         self.doa_reads = 0  # diagnostics/tests: periodic DoA reads during LISTENING
@@ -228,7 +259,13 @@ class VoicePipeline:
                     continue
                 if self._wake.feed(frame) >= self._wake_threshold:
                     log.info("wake word detected")
-                    await self._handle_wake(frames)
+                    if self._realtime_factory is not None and not self.realtime_failed:
+                        # Same `frames` iterator, handed straight to the
+                        # session: ONE owner of the ALSA capture, never a
+                        # second consumer competing for blocks.
+                        await self._handle_wake_realtime(frames)
+                    else:
+                        await self._handle_wake(frames)
                     # _handle_wake owns the reset: it must happen AFTER the
                     # PLAYING drain + flush, not right when it returns to us
                     # (which is the same instant, but the ordering is the
@@ -243,6 +280,80 @@ class VoicePipeline:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _handle_wake_realtime(self, frames: AsyncIterator[bytes]) -> None:
+        """One CONTINUOUS full-duplex conversation (conversation.mode: realtime).
+
+        The wake word opens the session and is then done: turns keep going
+        without saying it again. The session ends on idle timeout, an explicit
+        hang-up from the model, or an error — and an error costs only the
+        full-duplex behaviour, never the rabbit's voice: we close the socket and
+        the player, leave the capture iterator intact with its single owner, and
+        every later wake takes the turn-based path.
+        """
+        log.info("pipeline state -> REALTIME (continuous conversation)")
+        self._controller.interrupt()
+        self.realtime_sessions += 1
+        speaking = _SpeakingState()
+        stop = asyncio.Event()
+        feedback = self._spawn(self._realtime_feedback(speaking, stop), self._feedback_tasks)
+        session = None
+        reason = "error"
+        try:
+            session = await self._realtime_factory(speaking.on_response_start, speaking.on_barge_in)
+            from ..llm.realtime import converse
+
+            reason = await converse(
+                session, frames, idle_timeout_s=self._realtime_idle_timeout_s, stop=stop
+            )
+            log.info("realtime conversation ended (%s)", reason)
+        except Exception:
+            log.exception("realtime session failed — falling back to the turn-based path")
+            self.realtime_failed = True
+        finally:
+            stop.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await feedback
+            if session is not None:
+                with contextlib.suppress(Exception):
+                    await session.aclose()  # socket AND player
+            await self._submit_chor(build_leds_off_chor(ears_pose=self._listen_pose))
+            # Same re-arm discipline as the turn-based path: reset the detector
+            # only once everything is torn down, so our own audio can't wake us.
+            self._wake.reset()
+            log.info("pipeline state -> REARMED")
+
+    async def _realtime_feedback(self, speaking: _SpeakingState, stop: asyncio.Event) -> None:
+        """UX for the continuous conversation: green wake ack, then magenta
+        while listening and a body animation while the rabbit answers. A
+        barge-in returns to listening IMMEDIATELY rather than at the end of the
+        current animation cycle — the user talking is the strongest signal there
+        is that the rabbit should look like it is listening again."""
+        try:
+            await self._submit_chor(build_wake_ack_chor(None, listen_pose=self._listen_pose))
+            await self._wait_or_end(stop, self._ack_render_s)
+            while not stop.is_set():
+                is_speaking = speaking.value
+                if is_speaking:
+                    await self._submit_chor(build_dance_chor(self._listening_cycle_s))
+                else:
+                    await self._submit_chor(
+                        build_listening_chor(None, listen_pose=self._listen_pose)
+                    )
+                # wake early when the state flips (barge-in), not on a timer
+                speaking.changed.clear()
+                await self._wait_any(stop, speaking.changed, self._listening_cycle_s)
+        finally:
+            with contextlib.suppress(Exception):
+                await self._submit_chor(build_leds_off_chor(ears_pose=self._listen_pose))
+
+    async def _wait_any(self, stop: asyncio.Event, changed: asyncio.Event, seconds: float) -> None:
+        waiters = [asyncio.ensure_future(stop.wait()), asyncio.ensure_future(changed.wait())]
+        try:
+            await asyncio.wait(waiters, timeout=seconds, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
 
     async def _handle_wake(self, frames: AsyncIterator[bytes]) -> None:
         timings = WakeTimings(wake=time.monotonic())

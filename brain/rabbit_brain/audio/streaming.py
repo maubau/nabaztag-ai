@@ -164,17 +164,33 @@ class StreamingAudioPlayer:
 
     @property
     def played_ms(self) -> int:
-        """Milliseconds handed to the device since `reset_position`.
+        """ESTIMATED milliseconds actually heard, since `reset_position`.
 
-        This is what `conversation.item.truncate` needs. It counts audio WRITTEN
-        to the device, so it can overstate by the device's own buffer (tens of
-        ms) — erring that way is the right bias: claiming slightly more was
-        heard than really was is better than telling the model it never said
-        words the user did hear.
+        This is an estimate, not a measurement: it counts frames DELIVERED to
+        the device, and the last few are still sitting in the device buffer
+        rather than in the room. Where PortAudio reports the stream's output
+        latency we subtract it, which removes most of that error; where it does
+        not, the figure runs slightly ahead of reality.
+
+        It is what `conversation.item.truncate` gets, so the bias matters: the
+        residual error is bounded by the device buffer (tens of ms, i.e. well
+        under a word) and it errs towards claiming slightly MORE was heard.
+        That is the safer direction — trimming a word the user just caught is
+        recoverable, whereas telling the model it never said something the user
+        did hear leaves the two of you disagreeing about the conversation.
         """
         if self._rate <= 0:
             return 0
-        return int(self._device_frames * 1000 / self._rate)
+        delivered_ms = self._device_frames * 1000 / self._rate
+        return max(0, int(delivered_ms - self._output_latency_ms()))
+
+    def _output_latency_ms(self) -> float:
+        """The device's own buffering, if PortAudio exposes it (0 otherwise)."""
+        try:
+            latency = float(getattr(self._stream, "latency", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return latency * 1000.0
 
     def reset_position(self) -> None:
         """Start counting a new response's playback from zero."""
