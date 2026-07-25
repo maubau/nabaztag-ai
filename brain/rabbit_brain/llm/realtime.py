@@ -55,6 +55,23 @@ TURN_DETECTION = ("semantic_vad", "server_vad")
 # The model can hang up by calling this; the conversation is continuous, so
 # without it only a timeout or an error would end a session.
 END_CONVERSATION_TOOL = "end_conversation"
+# Errors that are RACES, not failures. With server-side VAD the server cancels
+# the response itself the moment it hears the user, so a cancel/truncate we send
+# in the same instant can legitimately arrive too late. Killing the session over
+# that would end the conversation on every successful barge-in (hardware, July
+# 2026: "response_cancel_not_active" took the whole session down).
+BENIGN_ERROR_CODES = frozenset(
+    {
+        "response_cancel_not_active",
+        "response_already_cancelled",
+        "item_truncate_invalid_audio_end_ms",
+        "invalid_value_for_truncate",
+    }
+)
+# Errors that really do make the session unusable — no point limping on.
+FATAL_ERROR_CODES = frozenset(
+    {"invalid_api_key", "authentication_error", "session_expired", "insufficient_quota"}
+)
 
 
 @dataclass
@@ -118,6 +135,9 @@ class RealtimeSession:
         if turn_detection not in TURN_DETECTION:
             raise ValueError(f"turn_detection must be one of {TURN_DETECTION}")
         self._turn_detection = turn_detection
+        # Both supported modes are SERVER-side: the server ends the turn and
+        # cancels the in-flight response itself, so we must not also cancel.
+        self._server_side_turn_detection = turn_detection in TURN_DETECTION
         self._tools = tools or []
         self._tool_executor = tool_executor
         self._on_transcript = on_transcript
@@ -261,7 +281,8 @@ class RealtimeSession:
     async def _handle(self, event: dict) -> None:
         kind = event.get("type", "")
         if kind == "error":
-            raise RealtimeError(f"realtime API error: {event.get('error')}")
+            self._handle_error(event)
+            return
         # Any traffic that is the conversation actually happening keeps the
         # session alive; the idle timeout only fires on real silence.
         if kind.startswith(("input_audio_buffer.", "response.")):
@@ -288,6 +309,26 @@ class RealtimeSession:
             await self._on_tool_call(event)
         elif kind == "response.done":
             self._responding = False
+
+    def _handle_error(self, event: dict) -> None:
+        """Not every `error` event is fatal — treating them all as fatal is what
+        made a WORKING barge-in end the conversation.
+
+        Benign races are logged and swallowed; only errors that genuinely make
+        the session unusable (auth, quota, expiry) bring it down so the caller
+        can re-arm the turn-based path. Anything unrecognised is logged and the
+        session continues: if it really was fatal the socket closes anyway, and
+        `run()` reports that.
+        """
+        error = event.get("error") or {}
+        code = str(error.get("code") or error.get("type") or "")
+        message = error.get("message", "")
+        if code in BENIGN_ERROR_CODES:
+            log.debug("realtime benign race (%s): %s", code, message)
+            return
+        if code in FATAL_ERROR_CODES:
+            raise RealtimeError(f"realtime API error [{code}]: {message}")
+        log.warning("realtime API error [%s]: %s — continuing", code, message)
 
     async def _on_audio_delta(self, event: dict) -> None:
         payload = event.get("delta")
@@ -320,8 +361,14 @@ class RealtimeSession:
         await self._player.stop()
         self._responding = False
         with contextlib.suppress(RealtimeError):
-            await self._send({"type": "response.cancel"})
-            if self._current_item:
+            # With server-side VAD the server cancels the response itself on
+            # speech_started. Sending our own response.cancel then races it and
+            # comes back "response_cancel_not_active" — harmless in itself, but
+            # it used to kill the session on every successful barge-in. Only
+            # cancel when nothing else will.
+            if not self._server_side_turn_detection:
+                await self._send({"type": "response.cancel"})
+            if self._current_item and played_ms > 0:
                 await self._send(
                     {
                         "type": "conversation.item.truncate",
@@ -330,6 +377,12 @@ class RealtimeSession:
                         "audio_end_ms": played_ms,
                     }
                 )
+            elif self._current_item:
+                # Cut before a single frame reached the speaker: there is
+                # nothing to trim, and truncating at 0 only invites an
+                # invalid-value error. The server's own cancel already means
+                # none of it was heard.
+                log.debug("barge-in before any audio played; no truncate needed")
         cut_ms = round((time.monotonic() - started) * 1000)
         self.timings.interruptions.append(cut_ms)
         log.info("barge-in: cut playback in %d ms after %d ms of speech", cut_ms, played_ms)

@@ -109,8 +109,13 @@ class StreamingAudioPlayer:
         self._device = device
         self._rate = device_rate
         self._channels = device_channels
+        self._source_rate = source_rate
         self._resampler = Resampler(source_rate, device_rate)
-        self._queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        # Queued chunks carry the EPOCH they belong to. A barge-in bumps the
+        # epoch, so audio from the cancelled reply that is already in flight is
+        # dropped instead of leaking into the next one.
+        self._queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue()
+        self._epoch = 0
         self._stream = None
         self._writer: asyncio.Task | None = None
         self._device_frames = 0  # frames handed to the device
@@ -118,18 +123,37 @@ class StreamingAudioPlayer:
 
     # --- lifecycle -------------------------------------------------------
 
-    async def start(self) -> None:
+    def _open_stream(self):
         import sounddevice as sd
 
-        self._stream = sd.RawOutputStream(
+        return sd.RawOutputStream(
             samplerate=self._rate, channels=self._channels, dtype="int16", device=self._device
         )
+
+    def _ensure_writer(self) -> None:
+        """There must ALWAYS be a live consumer once the device is open.
+
+        The writer used to die permanently the first time a barge-in aborted the
+        stream mid-write: abort() makes the blocked write raise, the task
+        returned, and resume() restarted the device but not the consumer — so
+        every later reply queued silently forever.
+        """
+        if self._writer is None or self._writer.done():
+            self._writer = asyncio.create_task(self._drain())
+
+    async def start(self) -> None:
+        self._stream = self._open_stream()
         self._stream.start()
         self._stopping = False
-        self._writer = asyncio.create_task(self._drain())
+        self._ensure_writer()
 
     async def aclose(self) -> None:
         await self.stop()
+        self._queue.put_nowait(None)  # let the writer finish
+        if self._writer is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._writer
+            self._writer = None
         if self._stream is not None:
             with contextlib.suppress(Exception):
                 self._stream.close()
@@ -144,21 +168,30 @@ class StreamingAudioPlayer:
             return
         converted = expand_channels(self._resampler.process(pcm), self._channels)
         if converted:
-            self._queue.put_nowait(converted)
+            self._queue.put_nowait((self._epoch, converted))
+            self._ensure_writer()
 
     async def _drain(self) -> None:
         while True:
-            chunk = await self._queue.get()
-            if chunk is None:
+            item = await self._queue.get()
+            if item is None:
                 return
-            if self._stopping:
-                continue
+            epoch, chunk = item
+            if self._stopping or epoch != self._epoch:
+                continue  # belongs to a reply the user interrupted
             try:
                 await asyncio.to_thread(self._stream.write, chunk)
             except Exception:
-                log.exception("streaming playback write failed")
-                return
-            self._device_frames += len(chunk) // (2 * self._channels)
+                # An intentional abort() makes the in-flight write raise
+                # (PortAudio -9999). That is the barge-in working, not a
+                # failure — and it must NEVER end the writer, or the next
+                # reply would queue into a consumer that no longer exists.
+                if self._stopping or epoch != self._epoch:
+                    continue
+                log.warning("streaming write failed; keeping the writer alive", exc_info=True)
+                continue
+            if epoch == self._epoch:
+                self._device_frames += len(chunk) // (2 * self._channels)
 
     # --- barge-in --------------------------------------------------------
 
@@ -199,6 +232,9 @@ class StreamingAudioPlayer:
     async def stop(self) -> None:
         """Cut playback NOW and drop anything queued (user is talking)."""
         self._stopping = True
+        # Bumping the epoch invalidates chunks already queued or mid-write, so
+        # the interrupted reply cannot bleed into the next one.
+        self._epoch += 1
         while not self._queue.empty():
             with contextlib.suppress(asyncio.QueueEmpty):
                 self._queue.get_nowait()
@@ -209,10 +245,13 @@ class StreamingAudioPlayer:
                 self._stream.abort()
 
     async def resume(self) -> None:
-        """Re-open the device after a barge-in stop, ready for the next response."""
+        """Re-open the device after a barge-in, ready for the next response."""
         if self._stream is None:
             return
         self._stopping = False
-        self._resampler = Resampler(self._resampler.src_rate, self._rate)
+        self._resampler = Resampler(self._source_rate, self._rate)
         with contextlib.suppress(Exception):
             self._stream.start()
+        # The abort almost certainly killed the in-flight write; make sure a
+        # consumer exists again before the next delta arrives.
+        self._ensure_writer()

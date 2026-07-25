@@ -118,8 +118,6 @@ async def test_barge_in_stops_playback_and_truncates_at_the_played_time():
     await session._handle({"type": "input_audio_buffer.speech_started"})
 
     assert player.stopped == 1  # speaker cut immediately
-    kinds = [m["type"] for m in session._ws.sent]
-    assert "response.cancel" in kinds
     truncate = next(m for m in session._ws.sent if m["type"] == "conversation.item.truncate")
     # the REALLY-played time, not the generated length
     assert truncate["audio_end_ms"] == 1234
@@ -145,10 +143,13 @@ async def test_second_response_resets_the_playback_position():
     assert player.resets == 2  # each reply is measured from zero
 
 
-async def test_api_error_raises_for_the_turn_based_fallback():
+async def test_fatal_api_error_raises_for_the_turn_based_fallback():
+    # only errors that really make the session unusable bring it down
     session = _session(FakePlayer())
     with pytest.raises(RealtimeError):
-        await session._handle({"type": "error", "error": {"message": "nope"}})
+        await session._handle(
+            {"type": "error", "error": {"code": "session_expired", "message": "nope"}}
+        )
 
 
 async def test_microphone_is_resampled_up_to_the_api_rate():
@@ -233,3 +234,145 @@ def test_default_mode_is_turn_based():
 def test_unknown_mode_is_rejected():
     with pytest.raises(ValueError, match="unknown conversation.mode"):
         conversation_mode({"conversation": {"mode": "telepathy"}})
+
+
+# --- hardware-found races (July 2026) -----------------------------------
+
+
+async def test_speech_started_does_not_cancel_under_server_side_vad():
+    """With VAD the server cancels the response itself; our extra
+    response.cancel raced it, came back response_cancel_not_active, and killed
+    the whole session on every SUCCESSFUL barge-in."""
+    session = _session(FakePlayer(played_ms=500), turn_detection="semantic_vad")
+    await session._handle(_audio_event(b"\x01\x00" * 10))
+    await session._handle({"type": "input_audio_buffer.speech_started"})
+    kinds = [m["type"] for m in session._ws.sent]
+    assert "response.cancel" not in kinds  # the server already did it
+    assert "conversation.item.truncate" in kinds  # but we still report what was heard
+
+
+async def test_cancel_not_active_error_does_not_end_the_session():
+    session = _session(FakePlayer())
+    # must NOT raise: this is a benign race, not a failure
+    await session._handle(
+        {
+            "type": "error",
+            "error": {"code": "response_cancel_not_active", "message": "no active response found"},
+        }
+    )
+
+
+async def test_unknown_errors_are_logged_but_not_fatal():
+    session = _session(FakePlayer())
+    await session._handle({"type": "error", "error": {"code": "weird_thing", "message": "hm"}})
+
+
+async def test_auth_errors_are_still_fatal():
+    session = _session(FakePlayer())
+    with pytest.raises(RealtimeError):
+        await session._handle(
+            {"type": "error", "error": {"code": "invalid_api_key", "message": "bad key"}}
+        )
+
+
+async def test_barge_in_before_any_audio_played_sends_no_truncate():
+    """played_ms == 0: nothing was heard, so there is nothing to trim — and
+    truncating at 0 only invites an invalid-value error."""
+    session = _session(FakePlayer(played_ms=0))
+    await session._handle(_audio_event(b"\x01\x00"))
+    await session._handle({"type": "input_audio_buffer.speech_started"})
+    kinds = [m["type"] for m in session._ws.sent]
+    assert "conversation.item.truncate" not in kinds
+    assert session.timings.interruptions  # still recorded as an interruption
+
+
+# --- the PortAudio abort race -------------------------------------------
+
+
+class BlockingStream:
+    """A device whose write blocks until released, and whose abort() makes the
+    in-flight write raise — exactly what PortAudio does (-9999)."""
+
+    def __init__(self):
+        import threading
+
+        self.written: list[bytes] = []
+        self.aborted = 0
+        self.starts = 0
+        self._release = threading.Event()
+        self.block = True
+
+    def write(self, chunk):
+        if self.block:
+            self._release.wait(timeout=2)
+            if self.aborted:
+                raise RuntimeError("PortAudioError -9999 (stream aborted)")
+        self.written.append(bytes(chunk))
+
+    def start(self):
+        self.starts += 1
+
+    def stop(self):
+        pass
+
+    def abort(self):
+        self.aborted += 1
+        self._release.set()
+
+    def close(self):
+        pass
+
+
+async def _player_with(stream):
+    from rabbit_brain.audio.streaming import StreamingAudioPlayer
+
+    player = StreamingAudioPlayer(device=None, device_rate=16000, device_channels=1)
+    player._open_stream = lambda: stream
+    await player.start()
+    return player
+
+
+async def test_abort_during_a_blocked_write_keeps_the_writer_alive():
+    """The hardware race: abort() while _drain was blocked in write() raised,
+    the writer returned, and every later reply queued into a dead consumer."""
+    import asyncio as aio
+
+    stream = BlockingStream()
+    player = await _player_with(stream)
+    try:
+        player.write(b"\x01\x00" * 400)  # response 1 — blocks in write()
+        await aio.sleep(0.05)
+        await player.stop()  # barge-in: abort makes that write raise
+        await aio.sleep(0.05)
+        assert stream.aborted == 1
+
+        # second response: the device is re-opened and the delta MUST be heard
+        stream.block = False
+        await player.resume()
+        player.reset_position()
+        player.write(b"\x02\x00" * 400)
+        await aio.sleep(0.1)
+        assert stream.written, "the second response was never consumed"
+        assert player._writer is not None and not player._writer.done()
+    finally:
+        await player.aclose()
+
+
+async def test_interrupted_audio_does_not_bleed_into_the_next_response():
+    """Chunks queued for the cancelled reply must be dropped, not played over
+    the new one."""
+    import asyncio as aio
+
+    stream = BlockingStream()
+    stream.block = False
+    player = await _player_with(stream)
+    try:
+        player.write(b"\x01\x00" * 400)
+        await player.stop()  # everything queued for response 1 is now stale
+        stale = len(stream.written)
+        await player.resume()
+        player.write(b"\x02\x00" * 400)
+        await aio.sleep(0.1)
+        assert len(stream.written) > stale  # the NEW response played
+    finally:
+        await player.aclose()
