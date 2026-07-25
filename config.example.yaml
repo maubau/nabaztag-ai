@@ -124,6 +124,28 @@ audio:
   #   "capture queue full, dropping blocks" still appears under real load —
   #   memory cost is trivial (~6 KB/block, raw 6ch).
 
+conversation:
+  # "turn_based" (default): wake -> Flux STT -> gpt-5.4-mini -> Piper -> play.
+  #   Each stage waits for the previous one. This is the CURATED path: the
+  #   Italian voices picked by ear on hardware (Paola @1.25 / Alba @1.0) live
+  #   here, and it stays the fallback.
+  # "realtime": one WebSocket carries audio both ways (OpenAI Realtime), so the
+  #   rabbit can start speaking sooner and you can TALK OVER IT. Costs: the model
+  #   generates its own voice, so Paola/Alba are NOT used and the Italian is
+  #   unverified — judge it by ear. Any WebSocket/API failure re-arms turn_based
+  #   automatically; a broken session must never leave the rabbit mute.
+  # REQUIRES audio_out.backend: local (barge-in needs interruptible playback —
+  # the rabbit's decoder buffers to EOF and cannot be cancelled). The runtime
+  # refuses the combination at startup rather than half-supporting it.
+  mode: turn_based
+  realtime:
+    model: gpt-realtime-2.1
+    # alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
+    voice: marin
+    # Server-side turn detection: the model decides when you stopped talking,
+    # the same job Flux does on the turn-based path.
+    turn_detection: server_vad
+
 audio_out:
   # WHERE THE VOICE COMES OUT. Switchable, so the two can be A/B'd on hardware.
   #   "rabbit" (default): the Nabaztag's own speaker via OJN. The charm — but

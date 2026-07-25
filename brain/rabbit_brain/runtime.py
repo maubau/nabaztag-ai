@@ -139,6 +139,28 @@ def _audio_player_from_config(config: dict):
     )
 
 
+def conversation_mode(config: dict) -> str:
+    """conversation.mode: "turn_based" (default) or "realtime".
+
+    Realtime is refused on the rabbit backend rather than half-supported: it
+    needs playback that can be cut mid-word for barge-in, and the MTL decoder
+    buffers each file to EOF and cannot be interrupted at all (Gate L3). Failing
+    loudly at startup beats a rabbit that talks over its owner.
+    """
+    mode = str(config.get("conversation", {}).get("mode", "turn_based")).lower()
+    if mode not in ("turn_based", "realtime"):
+        raise ValueError(f"unknown conversation.mode {mode!r} (turn_based | realtime)")
+    if mode == "realtime":
+        backend = str(config.get("audio_out", {}).get("backend", "rabbit")).lower()
+        if backend not in ("local",):
+            raise ValueError(
+                "conversation.mode: realtime requires audio_out.backend: local — "
+                "barge-in needs interruptible playback, and the rabbit's decoder "
+                "buffers to EOF and cannot be cancelled"
+            )
+    return mode
+
+
 async def run(config_path: str, moods_path: str, system_prompt_path: str) -> None:
     config = _load_yaml(config_path)
     moods = _load_yaml(moods_path)

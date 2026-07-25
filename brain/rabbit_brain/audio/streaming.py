@@ -1,0 +1,202 @@
+"""Streaming PCM playback + rate conversion for the Realtime path.
+
+The turn-based path synthesizes a whole MP3 and then plays it. The Realtime
+path cannot: audio arrives as PCM deltas while the model is still speaking, and
+the whole point is to start playing the first delta immediately rather than
+waiting for the utterance to finish. So this module provides:
+
+  * `Resampler` — the mic runs at 16 kHz (the reSpeaker's 6-channel USB
+    firmware) while the Realtime API speaks pcm16 at 24 kHz, so every chunk
+    crosses a rate boundary in both directions. It is STATEFUL on purpose:
+    resampling each chunk independently would restart the interpolation at every
+    boundary and add a click per chunk, ~50 times a second.
+
+  * `StreamingAudioPlayer` — push PCM in, hear it now. It also answers the one
+    question barge-in depends on: HOW MUCH have we actually played? When the
+    user talks over the rabbit we must tell the model exactly how far it got
+    (`conversation.item.truncate`), otherwise its transcript keeps words the
+    user never heard and the conversation drifts out of sync.
+
+Both are deliberately dependency-free (no numpy): at 16-24 kHz mono the work is
+trivial, and it keeps them testable anywhere.
+"""
+
+from __future__ import annotations
+
+import array
+import asyncio
+import contextlib
+import logging
+
+log = logging.getLogger(__name__)
+
+_INT16_MIN, _INT16_MAX = -32768, 32767
+
+
+class Resampler:
+    """Stateful linear-interpolation resampler for mono int16 PCM.
+
+    Keeps the last input sample and the fractional read position across calls,
+    so a stream cut into arbitrary chunks resamples exactly as if it had been
+    one buffer.
+    """
+
+    def __init__(self, src_rate: int, dst_rate: int):
+        if src_rate <= 0 or dst_rate <= 0:
+            raise ValueError("sample rates must be positive")
+        self.src_rate, self.dst_rate = src_rate, dst_rate
+        self._step = src_rate / dst_rate
+        self._prev: int | None = None
+        self._pos = 0.0
+
+    def process(self, pcm: bytes) -> bytes:
+        if self.src_rate == self.dst_rate:
+            return pcm
+        samples = array.array("h")
+        samples.frombytes(pcm)
+        if not samples:
+            return b""
+        buf = array.array("h")
+        if self._prev is not None:
+            buf.append(self._prev)
+        buf.extend(samples)
+        limit = len(buf) - 1
+        if limit < 1:
+            self._prev = buf[-1]
+            return b""
+        out = array.array("h")
+        pos = self._pos
+        while pos < limit:
+            index = int(pos)
+            frac = pos - index
+            first, second = buf[index], buf[index + 1]
+            value = int(first + (second - first) * frac)
+            out.append(max(_INT16_MIN, min(_INT16_MAX, value)))
+            pos += self._step
+        self._pos = pos - limit
+        self._prev = buf[-1]
+        return out.tobytes()
+
+
+def expand_channels(pcm: bytes, channels: int) -> bytes:
+    """Duplicate mono int16 PCM across `channels` interleaved channels."""
+    if channels <= 1:
+        return pcm
+    mono = array.array("h")
+    mono.frombytes(pcm)
+    out = array.array("h", bytes(len(pcm) * channels))
+    for i, sample in enumerate(mono):
+        base = i * channels
+        for c in range(channels):
+            out[base + c] = sample
+    return out.tobytes()
+
+
+class StreamingAudioPlayer:
+    """Plays PCM pushed in live, on a Bolt output device.
+
+    `source_rate` is the rate of the PCM handed to `write` (24 kHz from the
+    Realtime API); it is converted to the device's own rate and channel count.
+    """
+
+    def __init__(
+        self,
+        device: int | str | None,
+        device_rate: int,
+        device_channels: int,
+        source_rate: int = 24000,
+    ):
+        self._device = device
+        self._rate = device_rate
+        self._channels = device_channels
+        self._resampler = Resampler(source_rate, device_rate)
+        self._queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self._stream = None
+        self._writer: asyncio.Task | None = None
+        self._device_frames = 0  # frames handed to the device
+        self._stopping = False
+
+    # --- lifecycle -------------------------------------------------------
+
+    async def start(self) -> None:
+        import sounddevice as sd
+
+        self._stream = sd.RawOutputStream(
+            samplerate=self._rate, channels=self._channels, dtype="int16", device=self._device
+        )
+        self._stream.start()
+        self._stopping = False
+        self._writer = asyncio.create_task(self._drain())
+
+    async def aclose(self) -> None:
+        await self.stop()
+        if self._stream is not None:
+            with contextlib.suppress(Exception):
+                self._stream.close()
+            self._stream = None
+
+    # --- the audio path --------------------------------------------------
+
+    def write(self, pcm: bytes) -> None:
+        """Queue a PCM delta for immediate playback (never blocks the caller —
+        the model keeps streaming while the device drains)."""
+        if self._stopping or not pcm:
+            return
+        converted = expand_channels(self._resampler.process(pcm), self._channels)
+        if converted:
+            self._queue.put_nowait(converted)
+
+    async def _drain(self) -> None:
+        while True:
+            chunk = await self._queue.get()
+            if chunk is None:
+                return
+            if self._stopping:
+                continue
+            try:
+                await asyncio.to_thread(self._stream.write, chunk)
+            except Exception:
+                log.exception("streaming playback write failed")
+                return
+            self._device_frames += len(chunk) // (2 * self._channels)
+
+    # --- barge-in --------------------------------------------------------
+
+    @property
+    def played_ms(self) -> int:
+        """Milliseconds handed to the device since `reset_position`.
+
+        This is what `conversation.item.truncate` needs. It counts audio WRITTEN
+        to the device, so it can overstate by the device's own buffer (tens of
+        ms) — erring that way is the right bias: claiming slightly more was
+        heard than really was is better than telling the model it never said
+        words the user did hear.
+        """
+        if self._rate <= 0:
+            return 0
+        return int(self._device_frames * 1000 / self._rate)
+
+    def reset_position(self) -> None:
+        """Start counting a new response's playback from zero."""
+        self._device_frames = 0
+
+    async def stop(self) -> None:
+        """Cut playback NOW and drop anything queued (user is talking)."""
+        self._stopping = True
+        while not self._queue.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._queue.get_nowait()
+        if self._stream is not None:
+            with contextlib.suppress(Exception):
+                # abort() discards the device buffer; stop() would let it drain
+                # and the rabbit would keep talking over the user.
+                self._stream.abort()
+
+    async def resume(self) -> None:
+        """Re-open the device after a barge-in stop, ready for the next response."""
+        if self._stream is None:
+            return
+        self._stopping = False
+        self._resampler = Resampler(self._resampler.src_rate, self._rate)
+        with contextlib.suppress(Exception):
+            self._stream.start()
