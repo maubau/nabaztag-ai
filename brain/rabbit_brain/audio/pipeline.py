@@ -38,7 +38,6 @@ from typing import Any
 from ..body.chor import (
     LISTENING_CYCLE_S,
     PROCESSING_PULSE_CYCLE_S,
-    build_dance_chor,
     build_leds_off_chor,
     build_listening_chor,
     build_processing_chor,
@@ -70,7 +69,7 @@ PLAYBACK_START_TIMEOUT_S = 5.0
 # Realtime mode: the wake word opens a CONTINUOUS conversation, so it is not
 # repeated per turn. The session ends on this much true silence (neither side
 # speaking), an explicit hang-up, or an error.
-DEFAULT_REALTIME_IDLE_S = 45.0
+DEFAULT_REALTIME_IDLE_S = 25.0
 # Safety ceiling on the PLAYING drain: a runaway reply must not wedge the
 # pipeline forever if audio_busy ever gets stuck (hardware round, July 2026).
 PLAYING_DRAIN_TIMEOUT_S = 30.0
@@ -84,19 +83,36 @@ _CLOSE = object()  # sentinel ending the STT chunk stream
 
 
 class _SpeakingState:
-    """Whether the rabbit is currently answering, shared between the Realtime
-    session (which flips it from its callbacks) and the UX feedback loop."""
+    """Who is talking, shared between the Realtime session (which flips it from
+    its callbacks) and the UX feedback loop.
+
+    Only USER speech drives the ears. A continuous conversation stays open for
+    tens of seconds, and rotating the ears through all of it — including the
+    whole idle tail — read as agitation on hardware. So: the fuchsia glow means
+    "the session is open", and motion is reserved for the wake ack, for the user
+    actually speaking, and for gestures the model explicitly asks for.
+    """
 
     def __init__(self) -> None:
-        self.value = False
+        self.user_speaking = False
         self.changed = asyncio.Event()
 
+    def on_speech_started(self) -> None:
+        self.user_speaking = True
+        self.changed.set()
+
+    def on_speech_stopped(self) -> None:
+        self.user_speaking = False
+        self.changed.set()
+
     def on_response_start(self) -> None:
-        self.value = True
+        # The rabbit answering is shown by the light, not by turning ears.
+        self.user_speaking = False
         self.changed.set()
 
     def on_barge_in(self) -> None:
-        self.value = False
+        # Back to listening immediately.
+        self.user_speaking = True
         self.changed.set()
 
 
@@ -300,7 +316,7 @@ class VoicePipeline:
         session = None
         reason = "error"
         try:
-            session = await self._realtime_factory(speaking.on_response_start, speaking.on_barge_in)
+            session = await self._realtime_factory(speaking)
             from ..llm.realtime import converse
 
             reason = await converse(
@@ -333,13 +349,15 @@ class VoicePipeline:
             await self._submit_chor(build_wake_ack_chor(None, listen_pose=self._listen_pose))
             await self._wait_or_end(stop, self._ack_render_s)
             while not stop.is_set():
-                is_speaking = speaking.value
-                if is_speaking:
-                    await self._submit_chor(build_dance_chor(self._listening_cycle_s))
-                else:
-                    await self._submit_chor(
-                        build_listening_chor(None, listen_pose=self._listen_pose)
+                # Ears move only while the USER is speaking; otherwise the glow
+                # alone says the session is open (move_ears=False).
+                await self._submit_chor(
+                    build_listening_chor(
+                        None,
+                        listen_pose=self._listen_pose,
+                        move_ears=speaking.user_speaking,
                     )
+                )
                 # wake early when the state flips (barge-in), not on a timer
                 speaking.changed.clear()
                 await self._wait_any(stop, speaking.changed, self._listening_cycle_s)

@@ -148,9 +148,9 @@ conversation:
     #   server_vad   — a plain silence/energy detector.
     turn_detection: semantic_vad
     # The wake word opens a CONTINUOUS conversation and is not repeated per
-    # turn; it ends after this much true silence (neither side speaking), when
+    # turn; it ends after this much true silence (neither side speaking), when the
     # the model calls end_conversation (say goodbye), or on any error.
-    idle_timeout_s: 45
+    idle_timeout_s: 25
 
 audio_out:
   # WHERE THE VOICE COMES OUT. Switchable, so the two can be A/B'd on hardware.

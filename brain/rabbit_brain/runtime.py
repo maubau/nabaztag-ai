@@ -189,7 +189,7 @@ def _make_realtime_factory(rt_cfg: dict, audio_cfg: dict, out_cfg: dict, instruc
     already connected, with its speaker running. The pipeline owns closing it.
     """
 
-    async def factory(on_response_start, on_barge_in):
+    async def factory(state):
         from .audio.streaming import StreamingAudioPlayer
         from .llm.realtime import DEFAULT_MODEL, DEFAULT_VOICE, RealtimeSession
 
@@ -213,8 +213,10 @@ def _make_realtime_factory(rt_cfg: dict, audio_cfg: dict, out_cfg: dict, instruc
             turn_detection=rt_cfg.get("turn_detection", "semantic_vad"),
             tools=realtime_tool_specs(tools),
             tool_executor=realtime_tool_executor(tools),
-            on_response_start=on_response_start,
-            on_barge_in=on_barge_in,
+            on_response_start=state.on_response_start,
+            on_barge_in=state.on_barge_in,
+            on_speech_started=state.on_speech_started,
+            on_speech_stopped=state.on_speech_stopped,
         )
         try:
             await session.connect()

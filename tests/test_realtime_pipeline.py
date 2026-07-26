@@ -141,10 +141,10 @@ class ScriptedSession:
     """A RealtimeSession stand-in that plays a scripted conversation against the
     real pipeline: two model turns with a barge-in in between."""
 
-    def __init__(self, player, on_response_start, on_barge_in):
+    def __init__(self, player, state):
         self.player = player
-        self._on_response_start = on_response_start
-        self._on_barge_in = on_barge_in
+        self._on_response_start = state.on_response_start
+        self._on_barge_in = state.on_barge_in
         self.closed = False
         self.frames_pumped = 0
         self.events: list[str] = []
@@ -177,8 +177,8 @@ class ScriptedSession:
 async def test_full_cycle_wake_session_bargein_second_turn_close_rewake():
     sessions = []
 
-    async def factory(on_response_start, on_barge_in):
-        session = ScriptedSession(FakePlayer(), on_response_start, on_barge_in)
+    async def factory(state):
+        session = ScriptedSession(FakePlayer(), state)
         sessions.append(session)
         return session
 
@@ -206,11 +206,11 @@ async def test_ux_states_wake_green_listening_then_animation():
     """wake -> ack, listening -> magenta scanner, answering -> body animation."""
     started = asyncio.Event()
 
-    async def factory(on_response_start, on_barge_in):
-        session = ScriptedSession(FakePlayer(), on_response_start, on_barge_in)
+    async def factory(state):
+        session = ScriptedSession(FakePlayer(), state)
 
         async def pump(frames, stop=None, should_continue=None, idle_timeout_s=None):
-            on_response_start()  # rabbit answers -> animation
+            state.on_response_start()  # rabbit answers -> light only
             started.set()
             await asyncio.sleep(0.08)
             return "idle"
@@ -235,7 +235,7 @@ async def test_realtime_failure_falls_back_without_restart():
     and every later wake goes down the turn-based path."""
     calls = []
 
-    async def failing_factory(on_response_start, on_barge_in):
+    async def failing_factory(state):
         calls.append(1)
         raise RuntimeError("websocket refused")
 
@@ -265,8 +265,8 @@ async def test_realtime_failure_falls_back_without_restart():
 async def test_session_is_closed_even_when_the_conversation_errors():
     closed = []
 
-    async def factory(on_response_start, on_barge_in):
-        session = ScriptedSession(FakePlayer(), on_response_start, on_barge_in)
+    async def factory(state):
+        session = ScriptedSession(FakePlayer(), state)
 
         async def boom(frames, stop=None, should_continue=None, idle_timeout_s=None):
             raise RuntimeError("api error mid-conversation")
@@ -291,11 +291,11 @@ async def test_realtime_never_queues_mp3_on_the_rabbit():
     PCM straight to the local device, never an MP3 through OJN."""
     player = FakePlayer()
 
-    async def factory(on_response_start, on_barge_in):
-        session = ScriptedSession(player, on_response_start, on_barge_in)
+    async def factory(state):
+        session = ScriptedSession(player, state)
 
         async def pump(frames, stop=None, should_continue=None, idle_timeout_s=None):
-            on_response_start()
+            state.on_response_start()
             player.write(base64.b64decode(base64.b64encode(b"\x01\x00" * 8)))
             return "idle"
 

@@ -27,10 +27,16 @@ import array
 import asyncio
 import contextlib
 import logging
+import time
 
 log = logging.getLogger(__name__)
 
 _INT16_MIN, _INT16_MAX = -32768, 32767
+# Fallback for how long delivered frames keep sounding when PortAudio does not
+# report the stream's latency. Deliberately generous: over-estimating means a
+# barge-in still fires just after the last word, while under-estimating means it
+# silently does nothing — the failure we are fixing.
+_ASSUMED_DEVICE_BUFFER_MS = 250.0
 
 
 class Resampler:
@@ -120,6 +126,8 @@ class StreamingAudioPlayer:
         self._writer: asyncio.Task | None = None
         self._device_frames = 0  # frames handed to the device
         self._stopping = False
+        self._writing = False  # a write is blocked inside the device right now
+        self._last_write_at: float | None = None
 
     # --- lifecycle -------------------------------------------------------
 
@@ -180,7 +188,9 @@ class StreamingAudioPlayer:
             if self._stopping or epoch != self._epoch:
                 continue  # belongs to a reply the user interrupted
             try:
+                self._writing = True
                 await asyncio.to_thread(self._stream.write, chunk)
+                self._last_write_at = time.monotonic()
             except Exception:
                 # An intentional abort() makes the in-flight write raise
                 # (PortAudio -9999). That is the barge-in working, not a
@@ -190,10 +200,40 @@ class StreamingAudioPlayer:
                     continue
                 log.warning("streaming write failed; keeping the writer alive", exc_info=True)
                 continue
+            finally:
+                self._writing = False
             if epoch == self._epoch:
                 self._device_frames += len(chunk) // (2 * self._channels)
 
     # --- barge-in --------------------------------------------------------
+
+    @property
+    def has_unplayed_audio(self) -> bool:
+        """Is there still audio on its way to the room?
+
+        This is what decides whether a barge-in has anything to interrupt, and
+        it must cover the WHOLE local path, not just the queue: the model can
+        deliver a long reply in a fraction of its spoken duration, so the server
+        is finished (`response.done`) long before the rabbit has stopped
+        talking. Judging playback by the server's state was exactly the bug
+        that made barge-in silently do nothing (hardware, July 2026).
+
+        Three places audio can still be hiding:
+          1. the queue — chunks not yet handed to the device;
+          2. an in-flight write, blocked inside the device right now;
+          3. the device's own buffer — the last write was accepted, but those
+             frames are still being converted to sound. PortAudio's reported
+             output latency bounds that window; without it we assume a small
+             fixed one rather than claim silence we cannot verify.
+        """
+        if self._stopping:
+            return False
+        if not self._queue.empty() or self._writing:
+            return True
+        if self._last_write_at is None:
+            return False
+        buffered_s = (self._output_latency_ms() or _ASSUMED_DEVICE_BUFFER_MS) / 1000.0
+        return (time.monotonic() - self._last_write_at) < buffered_s
 
     @property
     def played_ms(self) -> int:
@@ -235,9 +275,17 @@ class StreamingAudioPlayer:
         # Bumping the epoch invalidates chunks already queued or mid-write, so
         # the interrupted reply cannot bleed into the next one.
         self._epoch += 1
+        discarded = 0
         while not self._queue.empty():
             with contextlib.suppress(asyncio.QueueEmpty):
                 self._queue.get_nowait()
+                discarded += 1
+        log.info(
+            "playback drain: aborted after %d ms played, %d queued chunks discarded",
+            self.played_ms,
+            discarded,
+        )
+        self._last_write_at = None
         if self._stream is not None:
             with contextlib.suppress(Exception):
                 # abort() discards the device buffer; stop() would let it drain

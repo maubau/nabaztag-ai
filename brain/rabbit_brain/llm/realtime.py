@@ -124,6 +124,8 @@ class RealtimeSession:
         on_transcript: Callable[[str], None] | None = None,
         on_response_start: Callable[[], None] | None = None,
         on_barge_in: Callable[[], None] | None = None,
+        on_speech_started: Callable[[], None] | None = None,
+        on_speech_stopped: Callable[[], None] | None = None,
         close_player: bool = True,
     ):
         self._api_key = api_key
@@ -143,6 +145,8 @@ class RealtimeSession:
         self._on_transcript = on_transcript
         self._on_response_start = on_response_start
         self._on_barge_in = on_barge_in
+        self._on_speech_started = on_speech_started
+        self._on_speech_stopped = on_speech_stopped
         self._to_api = Resampler(mic_rate, API_RATE)
         # Continuous conversation: the wake word is NOT repeated per turn, so
         # the session ends on idle timeout, an explicit hang-up, or an error.
@@ -152,7 +156,10 @@ class RealtimeSession:
         self._own_session = session is None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._current_item: str | None = None
-        self._responding = False
+        # The SERVER's generation state. Local playback is tracked by the
+        # player itself (has_unplayed_audio) — conflating the two is what
+        # silently disabled barge-in.
+        self._server_response_active = False
         self._t0 = 0.0
         self.timings = RealtimeTimings()
 
@@ -290,9 +297,15 @@ class RealtimeSession:
 
         if kind == "input_audio_buffer.speech_started":
             self.timings.speech_started_ms = self._ms()
+            log.info("user speech started")
+            if self._on_speech_started is not None:
+                self._on_speech_started()
             await self._barge_in()
         elif kind == "input_audio_buffer.speech_stopped":
             self.timings.speech_stopped_ms = self._ms()
+            log.info("user speech stopped")
+            if self._on_speech_stopped is not None:
+                self._on_speech_stopped()
         elif kind in ("response.output_audio.delta", "response.audio.delta"):
             await self._on_audio_delta(event)
         elif kind in (
@@ -308,7 +321,15 @@ class RealtimeSession:
         elif kind == "response.function_call_arguments.done":
             await self._on_tool_call(event)
         elif kind == "response.done":
-            self._responding = False
+            # The SERVER has finished generating. That says nothing about the
+            # speaker: the model delivers a reply far faster than it takes to
+            # speak it, so the rabbit is usually still talking. Local playback
+            # is judged by the player, never by this event.
+            self._server_response_active = False
+            log.info(
+                "response.done (server finished; local audio still playing: %s)",
+                self._local_audio_pending(),
+            )
 
     def _handle_error(self, event: dict) -> None:
         """Not every `error` event is fatal — treating them all as fatal is what
@@ -336,10 +357,10 @@ class RealtimeSession:
             return
         if self.timings.first_audio_delta_ms is None:
             self.timings.first_audio_delta_ms = self._ms()
-        if not self._responding:
+        if not self._server_response_active:
             # a new response: playback position restarts, so a later truncate
             # reports THIS reply's played time, not a running total
-            self._responding = True
+            self._server_response_active = True
             self._player.reset_position()
             await self._player.resume()
             if self._on_response_start is not None:
@@ -351,15 +372,33 @@ class RealtimeSession:
         if self.timings.playback_started_ms is None:
             self.timings.playback_started_ms = self._ms()
 
+    def _local_audio_pending(self) -> bool:
+        return bool(getattr(self._player, "has_unplayed_audio", False))
+
     async def _barge_in(self) -> None:
         """User started talking: stop the speaker and tell the model exactly how
-        far it got, so its transcript matches what was actually heard."""
-        if not self._responding:
+        far it got, so its transcript matches what was actually heard.
+
+        The trigger is LOCAL PLAYBACK, not the server's generation state. The
+        model finishes generating long before the rabbit finishes speaking, so
+        gating on the server's `response.done` meant that by the time the user
+        cut in there was "nothing to interrupt" and the speaker just kept
+        talking (hardware, July 2026: no barge-in log ever appeared).
+        """
+        server_active = self._server_response_active
+        local_pending = self._local_audio_pending()
+        if not (server_active or local_pending):
+            log.info("barge-in ignored: nothing playing (server idle, no local audio)")
             return
+        log.info(
+            "barge-in: interrupting (server_active=%s local_audio_pending=%s)",
+            server_active,
+            local_pending,
+        )
         started = time.monotonic()
         played_ms = self._player.played_ms
         await self._player.stop()
-        self._responding = False
+        self._server_response_active = False
         with contextlib.suppress(RealtimeError):
             # With server-side VAD the server cancels the response itself on
             # speech_started. Sending our own response.cancel then races it and

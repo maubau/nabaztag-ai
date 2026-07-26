@@ -75,6 +75,7 @@ def build_listening_chor(
     listen_pose: tuple[int, int] = (0, 0),
     color: tuple[int, int, int] = LISTENING_COLOR,
     tempo_ms: int = LISTENING_TEMPO_MS,
+    move_ears: bool = True,
 ) -> str:
     """One conspicuous LISTENING cycle.
 
@@ -84,6 +85,12 @@ def build_listening_chor(
     pipeline still samples DoA each cycle, but LISTENING intentionally moves
     both ears: this is a state indicator rather than a directional twitch.
     Choreography-only (never posleft/posright — probe #7).
+
+    ``move_ears=False`` keeps only the light. A continuous conversation stays
+    open for a long time, and ears turning through the whole idle window reads
+    as agitation rather than attention (hardware, July 2026) — so the glow marks
+    "the session is open" while motion is reserved for the wake, for the user
+    actually speaking, and for gestures the model asks for.
     """
     r, g, b = color
     n = len(_LISTENING_PULSE_LEVELS)
@@ -98,6 +105,9 @@ def build_listening_chor(
                 str(round(g * level / 255)),
                 str(round(b * level / 255)),
             ]
+
+    if not move_ears:
+        return ",".join(parts)  # light only: the session is open, nothing more
 
     # motor ear index: 0=left, 1=right. Opposite direction flags make the
     # motion visibly counter-rotating; 288° is the maximum exposed by VAPI

@@ -376,3 +376,91 @@ async def test_interrupted_audio_does_not_bleed_into_the_next_response():
         assert len(stream.written) > stale  # the NEW response played
     finally:
         await player.aclose()
+
+
+# --- the "server done but speaker still talking" bug ---------------------
+
+
+async def test_has_unplayed_audio_covers_queue_inflight_and_device_buffer():
+    import asyncio as aio
+
+    stream = BlockingStream()
+    stream.block = False
+    player = await _player_with(stream)
+    try:
+        assert player.has_unplayed_audio is False  # nothing ever written
+        player.write(b"\x01\x00" * 400)
+        assert player.has_unplayed_audio is True  # queued
+        await aio.sleep(0.1)
+        # written to the device: still sounding for the buffer window
+        assert player.has_unplayed_audio is True
+        await player.stop()
+        assert player.has_unplayed_audio is False  # aborted
+    finally:
+        await player.aclose()
+
+
+async def test_barge_in_fires_after_response_done_while_audio_still_playing():
+    """THE bug: the model delivers 2 s of speech in a moment, response.done
+    arrives, and the rabbit is still talking. Gating barge-in on the server's
+    state meant speech_started found 'nothing to interrupt' and the speaker
+    just carried on."""
+
+    class StillPlaying(FakePlayer):
+        has_unplayed_audio = True  # the speaker has a backlog
+
+    player = StillPlaying(played_ms=800)
+    session = _session(player)
+    await session._handle(_audio_event(b"\x01\x00" * 10))
+    await session._handle({"type": "response.done"})  # server finished
+    assert session._server_response_active is False
+    # user cuts in while the speaker is still working through the backlog
+    await session._handle({"type": "input_audio_buffer.speech_started"})
+    assert player.stopped == 1, "the speaker must be aborted"
+    truncate = next(m for m in session._ws.sent if m["type"] == "conversation.item.truncate")
+    assert truncate["audio_end_ms"] == 800
+
+
+async def test_barge_in_still_ignored_when_truly_idle():
+    # no server response AND no local audio: nothing to interrupt
+    player = FakePlayer()
+    player.has_unplayed_audio = False
+    session = _session(player)
+    await session._handle({"type": "response.done"})
+    await session._handle({"type": "input_audio_buffer.speech_started"})
+    assert player.stopped == 0
+    assert not any(m["type"] == "conversation.item.truncate" for m in session._ws.sent)
+
+
+async def test_fast_deltas_then_done_then_bargein_clears_the_queue():
+    """2 s of audio delivered fast, response.done, speaker still playing,
+    speech_started -> audio cut and the queue emptied."""
+    import asyncio as aio
+
+    from rabbit_brain.audio.streaming import StreamingAudioPlayer
+
+    stream = BlockingStream()
+    stream.block = False
+    player = StreamingAudioPlayer(device=None, device_rate=16000, device_channels=1)
+    player._open_stream = lambda: stream
+    await player.start()
+    session = _session(player)
+    try:
+        # ~2 s of 24 kHz mono PCM arriving all at once
+        session._server_response_active = False
+        await session._handle(_audio_event(b"\x00\x01" * 24000))
+        await session._handle({"type": "response.done"})
+        assert player.has_unplayed_audio is True  # speaker is still working
+        await session._handle({"type": "input_audio_buffer.speech_started"})
+        await aio.sleep(0.05)
+        assert player.has_unplayed_audio is False  # cut
+        assert player._queue.empty(), "the pending audio must be discarded"
+        assert stream.aborted >= 1
+
+        # the second turn must be audible immediately, with no residue
+        stream.written.clear()
+        await session._handle(_audio_event(b"\x02\x00" * 2400, item_id="item_2"))
+        await aio.sleep(0.1)
+        assert stream.written, "the second response never reached the device"
+    finally:
+        await player.aclose()
