@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
-from ..audio.streaming import Resampler
+from ..audio.streaming import CLOSE_TIMEOUT_S, Resampler
 
 log = logging.getLogger(__name__)
 
@@ -206,15 +206,23 @@ class RealtimeSession:
     async def aclose(self) -> None:
         """Tear everything down: socket AND speaker. The capture iterator is NOT
         touched — it belongs to the pipeline and must survive for the turn-based
-        path to keep working after a realtime failure."""
+        path to keep working after a realtime failure.
+
+        Every step is BOUNDED: a socket that will not close, or a player whose
+        writer is stuck inside PortAudio, must never stop the pipeline from
+        re-arming (hardware, July 2026: an unbounded wait here left the
+        microphone unconsumed and "capture queue full" forever).
+        """
         if self._ws is not None and not self._ws.closed:
-            with contextlib.suppress(Exception):
-                await self._ws.close()
+            with contextlib.suppress(Exception, TimeoutError):
+                await asyncio.wait_for(self._ws.close(), CLOSE_TIMEOUT_S)
         self._ws = None
+        log.info("realtime cleanup: socket closed")
         closer = getattr(self._player, "aclose", None)
         if self._close_player and closer is not None:
-            with contextlib.suppress(Exception):
-                await closer()
+            with contextlib.suppress(Exception, TimeoutError):
+                await asyncio.wait_for(closer(), CLOSE_TIMEOUT_S + 1.0)
+        log.info("realtime cleanup: player closed")
         if self._own_session and self._session is not None:
             with contextlib.suppress(Exception):
                 await self._session.close()

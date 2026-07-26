@@ -464,3 +464,68 @@ async def test_fast_deltas_then_done_then_bargein_clears_the_queue():
         assert stream.written, "the second response never reached the device"
     finally:
         await player.aclose()
+
+
+# --- bounded teardown (the "never REARMED" blocker) ----------------------
+
+
+class StuckStream(BlockingStream):
+    """A device whose write does NOT return even after abort() — the case that
+    left the pipeline unable to re-arm. It gives up eventually so the test
+    process doesn't inherit a thread that never ends."""
+
+    def __init__(self, hang_s=1.5):
+        super().__init__()
+        self._hang_s = hang_s
+        self.latency = 0.05
+
+    def write(self, chunk):
+        import time as _t
+
+        _t.sleep(self._hang_s)  # ignores abort() entirely
+        self.written.append(bytes(chunk))
+
+
+async def test_aclose_is_bounded_when_a_write_never_returns():
+    """asyncio.to_thread cannot be cancelled, so waiting for a stuck writer
+    means waiting forever. aclose must give up and let the pipeline re-arm."""
+    import asyncio as aio
+    import time as _t
+
+    stream = StuckStream()
+    player = await _player_with(stream)
+    player.write(b"\x01\x00" * 400)
+    await aio.sleep(0.05)  # the writer is now inside the stuck write
+    started = _t.monotonic()
+    await aio.wait_for(player.aclose(timeout=0.2), timeout=2.0)
+    assert _t.monotonic() - started < 1.4, "aclose waited for the stuck writer"
+
+
+async def test_latency_is_read_once_and_not_queried_after_abort():
+    """Querying the stream's latency after abort() calls into PortAudio on a
+    torn-down device (ALSA GetStreamWriteAvailable noise)."""
+
+    class LatencyTrap(BlockingStream):
+        def __init__(self):
+            super().__init__()
+            self.block = False
+            self._aborted_once = False
+            self.latency = 0.05
+
+        def abort(self):
+            super().abort()
+            self._aborted_once = True
+
+        def __getattribute__(self, name):
+            if name == "latency" and object.__getattribute__(self, "_aborted_once"):
+                raise AssertionError("latency queried after abort()")
+            return object.__getattribute__(self, name)
+
+    player = await _player_with(LatencyTrap())
+    try:
+        player.write(b"\x01\x00" * 100)
+        await player.stop()  # aborts; played_ms/has_unplayed_audio use the cache
+        assert player.played_ms >= 0
+        assert player.has_unplayed_audio is False
+    finally:
+        await player.aclose(timeout=0.5)

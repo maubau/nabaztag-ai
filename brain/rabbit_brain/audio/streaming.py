@@ -37,6 +37,13 @@ _INT16_MIN, _INT16_MAX = -32768, 32767
 # barge-in still fires just after the last word, while under-estimating means it
 # silently does nothing — the failure we are fixing.
 _ASSUMED_DEVICE_BUFFER_MS = 250.0
+# Teardown ceiling. `asyncio.to_thread` CANNOT be cancelled: if a write is stuck
+# inside the device, cancelling the writer task does not unblock it, so waiting
+# for it means waiting forever. Re-arming the pipeline matters more than a tidy
+# shutdown, so we wait this long and then walk away (hardware, July 2026: a
+# blocked writer after abort() stopped the pipeline ever reaching REARMED, and
+# the microphone was never consumed again — "capture queue full" forever).
+CLOSE_TIMEOUT_S = 2.0
 
 
 class Resampler:
@@ -128,6 +135,7 @@ class StreamingAudioPlayer:
         self._stopping = False
         self._writing = False  # a write is blocked inside the device right now
         self._last_write_at: float | None = None
+        self._latency_s = 0.0  # read once at open, never re-queried
 
     # --- lifecycle -------------------------------------------------------
 
@@ -152,20 +160,60 @@ class StreamingAudioPlayer:
     async def start(self) -> None:
         self._stream = self._open_stream()
         self._stream.start()
+        # Read the latency ONCE, while the stream is healthy. Querying it later
+        # means calling into PortAudio on a stream we may just have aborted,
+        # which logs ALSA GetStreamWriteAvailable noise and asks the driver
+        # about a device it has already torn down.
+        try:
+            self._latency_s = float(getattr(self._stream, "latency", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            self._latency_s = 0.0
         self._stopping = False
         self._ensure_writer()
 
-    async def aclose(self) -> None:
+    async def _shutdown_writer(self, timeout: float) -> bool:  # noqa: ASYNC109 — see aclose
+        """Stop the writer, bounded. Returns True if it really finished.
+
+        A write stuck inside the device cannot be cancelled (to_thread owns a
+        real thread), so past the timeout we abandon the task rather than hold
+        the whole pipeline hostage to it.
+        """
+        if self._writer is None:
+            return True
+        writer, self._writer = self._writer, None
+        self._queue.put_nowait(None)  # ask it to finish if it is idle
+        try:
+            await asyncio.wait_for(asyncio.shield(writer), timeout)
+            return True
+        except TimeoutError:
+            log.warning(
+                "audio writer still stuck in the device after %.1fs; abandoning it so the "
+                "pipeline can re-arm",
+                timeout,
+            )
+            return False
+        except (asyncio.CancelledError, Exception):
+            return True
+
+    async def aclose(self, timeout: float = CLOSE_TIMEOUT_S) -> None:  # noqa: ASYNC109
+        # `timeout` is a parameter rather than an asyncio.timeout() at the
+        # call site on purpose: an external cancel would abort the WHOLE
+        # cleanup, and we must abandon only the stuck writer while still
+        # closing everything else.
+        """Bounded teardown: nothing here may block the pipeline re-arming."""
         await self.stop()
-        self._queue.put_nowait(None)  # let the writer finish
-        if self._writer is not None:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._writer
-            self._writer = None
+        finished = await self._shutdown_writer(timeout)
         if self._stream is not None:
-            with contextlib.suppress(Exception):
-                self._stream.close()
+            if finished:
+                with contextlib.suppress(Exception):
+                    self._stream.close()
+            else:
+                # Never call close() while another thread is still inside the
+                # device — that is how you turn a hang into a crash. Let the
+                # abandoned stream be collected instead.
+                log.warning("leaving the audio stream open: a write is still in flight")
             self._stream = None
+        log.info("streaming player closed")
 
     # --- the audio path --------------------------------------------------
 
@@ -258,12 +306,9 @@ class StreamingAudioPlayer:
         return max(0, int(delivered_ms - self._output_latency_ms()))
 
     def _output_latency_ms(self) -> float:
-        """The device's own buffering, if PortAudio exposes it (0 otherwise)."""
-        try:
-            latency = float(getattr(self._stream, "latency", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
-        return latency * 1000.0
+        """The device's own buffering, captured at open (never re-queried — the
+        stream may since have been aborted)."""
+        return self._latency_s * 1000.0
 
     def reset_position(self) -> None:
         """Start counting a new response's playback from zero."""

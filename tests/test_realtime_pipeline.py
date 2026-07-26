@@ -307,3 +307,74 @@ async def test_realtime_never_queues_mp3_on_the_rabbit():
     assert player.written  # PCM went to the local speaker
     # FakeAdapter.play_audio raises if anything tries the rabbit's audio lane
     assert not any(isinstance(c, tuple) for c in controller.chors)
+
+
+async def test_hangup_rearms_even_when_teardown_hangs():
+    """The blocker: after end_conversation the pipeline never reached REARMED,
+    so the microphone stopped being consumed for the rest of the run. Teardown
+    is bounded now — a session that refuses to close must not prevent re-arming
+    or a second conversation."""
+    sessions = []
+
+    async def factory(state):
+        session = ScriptedSession(FakePlayer(), state)
+
+        async def pump(frames, stop=None, should_continue=None, idle_timeout_s=None):
+            await anext(frames)
+            return "hangup"  # the model said goodbye
+
+        async def never_closes():
+            await asyncio.sleep(30)  # a writer stuck inside PortAudio
+
+        session.pump_microphone = pump
+        session.aclose = never_closes
+        sessions.append(session)
+        return session
+
+    class TwiceWake(FakeWake):
+        def feed(self, frame):
+            self._seen += 1
+            return 1.0 if self._seen in (1, 6) else 0.0
+
+    pipeline, capture, _ = _pipeline(factory, wake=TwiceWake())
+    # cleanup is bounded at REALTIME_CLEANUP_TIMEOUT_S; keep the test brisk
+    import rabbit_brain.audio.pipeline as pipeline_mod
+
+    original = pipeline_mod.REALTIME_CLEANUP_TIMEOUT_S
+    pipeline_mod.REALTIME_CLEANUP_TIMEOUT_S = 0.1
+    try:
+        await _run_briefly(pipeline, seconds=0.6)
+    finally:
+        pipeline_mod.REALTIME_CLEANUP_TIMEOUT_S = original
+
+    assert pipeline._wake.resets >= 1, "never re-armed: the microphone would stay unconsumed"
+    assert capture.streams == 1, "still exactly one capture consumer"
+    # the second wake opened another conversation, so the pipeline kept running
+    assert len(sessions) >= 2, "a second realtime session must be startable"
+
+
+async def test_frames_keep_being_consumed_after_a_hangup():
+    """After the session ends the run loop must go back to pulling frames —
+    that is what stops 'capture queue full, dropping blocks'."""
+    consumed_after = []
+
+    async def factory(state):
+        session = ScriptedSession(FakePlayer(), state)
+
+        async def pump(frames, stop=None, should_continue=None, idle_timeout_s=None):
+            await anext(frames)
+            return "hangup"
+
+        session.pump_microphone = pump
+        return session
+
+    class OnceWake(FakeWake):
+        def feed(self, frame):
+            self._seen += 1
+            if self._seen > 3:
+                consumed_after.append(1)  # the run loop is pulling frames again
+            return 1.0 if self._seen == 1 else 0.0
+
+    pipeline, _, _ = _pipeline(factory, wake=OnceWake())
+    await _run_briefly(pipeline, seconds=0.4)
+    assert consumed_after, "the pipeline stopped consuming the microphone"

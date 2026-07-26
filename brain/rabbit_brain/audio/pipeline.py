@@ -70,6 +70,10 @@ PLAYBACK_START_TIMEOUT_S = 5.0
 # repeated per turn. The session ends on this much true silence (neither side
 # speaking), an explicit hang-up, or an error.
 DEFAULT_REALTIME_IDLE_S = 25.0
+# Per-step ceiling on realtime teardown. Nothing in the cleanup path may block
+# the wake detector being re-armed — a stuck PortAudio write once left the
+# microphone unconsumed for the rest of the run.
+REALTIME_CLEANUP_TIMEOUT_S = 3.0
 # Safety ceiling on the PLAYING drain: a runaway reply must not wedge the
 # pipeline forever if audio_busy ever gets stuck (hardware round, July 2026).
 PLAYING_DRAIN_TIMEOUT_S = 30.0
@@ -327,13 +331,30 @@ class VoicePipeline:
             log.exception("realtime session failed — falling back to the turn-based path")
             self.realtime_failed = True
         finally:
+            # EVERY step here is bounded. Re-arming matters more than a tidy
+            # shutdown: if any of this can hang, the pipeline stops consuming
+            # the microphone and the run is over ("capture queue full" forever,
+            # hardware July 2026). Each step also logs, so a slow one is
+            # visible instead of looking like a freeze.
             stop.set()
-            with contextlib.suppress(asyncio.CancelledError):
-                await feedback
+            feedback.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception, TimeoutError):
+                await asyncio.wait_for(feedback, REALTIME_CLEANUP_TIMEOUT_S)
+            log.info("realtime cleanup: feedback stopped")
             if session is not None:
-                with contextlib.suppress(Exception):
-                    await session.aclose()  # socket AND player
-            await self._submit_chor(build_leds_off_chor(ears_pose=self._listen_pose))
+                try:
+                    await asyncio.wait_for(session.aclose(), REALTIME_CLEANUP_TIMEOUT_S)
+                except (TimeoutError, Exception):
+                    log.warning(
+                        "realtime cleanup: session teardown exceeded %.1fs; abandoning it",
+                        REALTIME_CLEANUP_TIMEOUT_S,
+                        exc_info=True,
+                    )
+            with contextlib.suppress(Exception, TimeoutError):
+                await asyncio.wait_for(
+                    self._submit_chor(build_leds_off_chor(ears_pose=self._listen_pose)),
+                    REALTIME_CLEANUP_TIMEOUT_S,
+                )
             # Same re-arm discipline as the turn-based path: reset the detector
             # only once everything is torn down, so our own audio can't wake us.
             self._wake.reset()
