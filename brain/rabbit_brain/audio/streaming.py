@@ -24,10 +24,11 @@ trivial, and it keeps them testable anywhere.
 from __future__ import annotations
 
 import array
-import asyncio
 import contextlib
 import logging
+import threading
 import time
+from collections import deque
 
 log = logging.getLogger(__name__)
 
@@ -37,12 +38,10 @@ _INT16_MIN, _INT16_MAX = -32768, 32767
 # barge-in still fires just after the last word, while under-estimating means it
 # silently does nothing — the failure we are fixing.
 _ASSUMED_DEVICE_BUFFER_MS = 250.0
-# Teardown ceiling. `asyncio.to_thread` CANNOT be cancelled: if a write is stuck
-# inside the device, cancelling the writer task does not unblock it, so waiting
-# for it means waiting forever. Re-arming the pipeline matters more than a tidy
-# shutdown, so we wait this long and then walk away (hardware, July 2026: a
-# blocked writer after abort() stopped the pipeline ever reaching REARMED, and
-# the microphone was never consumed again — "capture queue full" forever).
+# Ceiling on the remaining awaitable teardown steps (the WebSocket close). The
+# player itself no longer needs one — with the callback design there is no
+# Python thread that can block — but nothing in the cleanup path may hold the
+# pipeline back from re-arming, so anything that can wait, waits with a bound.
 CLOSE_TIMEOUT_S = 2.0
 
 
@@ -105,8 +104,36 @@ def expand_channels(pcm: bytes, channels: int) -> bytes:
     return out.tobytes()
 
 
+class AudioBackendUnrecoverable(RuntimeError):
+    """The output device could not be reclaimed.
+
+    Raised instead of limping on, because the failure mode it replaces is the
+    dangerous one: a stream we abandoned still holds the device, so the pipeline
+    re-arms, the wake word lights the LEDs, and the reply is SILENT while every
+    log line says the runtime is healthy. Better to die and let systemd's
+    Restart=always rebuild the process — and PortAudio with it.
+    """
+
+
 class StreamingAudioPlayer:
     """Plays PCM pushed in live, on a Bolt output device.
+
+    CALLBACK-DRIVEN on purpose. The first implementation pushed audio with
+    blocking `RawOutputStream.write()` calls inside `asyncio.to_thread`, and
+    that design has no safe way out: `to_thread` cannot be cancelled, so a write
+    stuck in the driver (which is exactly what happens around `abort()`) hangs
+    teardown forever, and abandoning it leaves the device held by a zombie
+    stream — the rabbit then wakes, lights up, and answers in silence.
+
+    Here PortAudio pulls instead: its own callback thread copies out of a ring
+    buffer and never calls into Python code that can block. That removes the
+    whole class of problems at once —
+      * barge-in is instant and needs no `abort()`: clearing the buffer makes
+        the very next callback output silence;
+      * there is no Python thread to get stuck, so teardown is bounded by
+        construction;
+      * `played_ms` stops being an estimate — the callback counts the frames it
+        actually handed to the device.
 
     `source_rate` is the rate of the PCM handed to `write` (24 kHz from the
     Realtime API); it is converted to the device's own rate and channel count.
@@ -123,19 +150,19 @@ class StreamingAudioPlayer:
         self._rate = device_rate
         self._channels = device_channels
         self._source_rate = source_rate
+        self._frame_bytes = 2 * device_channels
         self._resampler = Resampler(source_rate, device_rate)
-        # Queued chunks carry the EPOCH they belong to. A barge-in bumps the
-        # epoch, so audio from the cancelled reply that is already in flight is
-        # dropped instead of leaking into the next one.
-        self._queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue()
-        self._epoch = 0
+        # Ring buffer of (generation, buffer, offset). The generation is what
+        # keeps one reply's audio out of the next one: a barge-in bumps it, and
+        # anything still carrying the old value is dropped rather than played.
+        self._pending: deque[tuple[int, bytes, int]] = deque()
+        self._lock = threading.Lock()
+        self._generation = 0
         self._stream = None
-        self._writer: asyncio.Task | None = None
-        self._device_frames = 0  # frames handed to the device
-        self._stopping = False
-        self._writing = False  # a write is blocked inside the device right now
-        self._last_write_at: float | None = None
+        self._consumed_frames = 0  # frames the callback really handed over
+        self._last_consumed_at: float | None = None
         self._latency_s = 0.0  # read once at open, never re-queried
+        self.backend_broken = False
 
     # --- lifecycle -------------------------------------------------------
 
@@ -143,115 +170,81 @@ class StreamingAudioPlayer:
         import sounddevice as sd
 
         return sd.RawOutputStream(
-            samplerate=self._rate, channels=self._channels, dtype="int16", device=self._device
+            samplerate=self._rate,
+            channels=self._channels,
+            dtype="int16",
+            device=self._device,
+            callback=self._callback,
         )
-
-    def _ensure_writer(self) -> None:
-        """There must ALWAYS be a live consumer once the device is open.
-
-        The writer used to die permanently the first time a barge-in aborted the
-        stream mid-write: abort() makes the blocked write raise, the task
-        returned, and resume() restarted the device but not the consumer — so
-        every later reply queued silently forever.
-        """
-        if self._writer is None or self._writer.done():
-            self._writer = asyncio.create_task(self._drain())
 
     async def start(self) -> None:
         self._stream = self._open_stream()
         self._stream.start()
-        # Read the latency ONCE, while the stream is healthy. Querying it later
-        # means calling into PortAudio on a stream we may just have aborted,
-        # which logs ALSA GetStreamWriteAvailable noise and asks the driver
-        # about a device it has already torn down.
+        # Read the latency ONCE, while the stream is healthy: querying it later
+        # means calling into PortAudio about a device we may have just stopped.
         try:
             self._latency_s = float(getattr(self._stream, "latency", 0.0) or 0.0)
         except (TypeError, ValueError):
             self._latency_s = 0.0
-        self._stopping = False
-        self._ensure_writer()
 
-    async def _shutdown_writer(self, timeout: float) -> bool:  # noqa: ASYNC109 — see aclose
-        """Stop the writer, bounded. Returns True if it really finished.
-
-        A write stuck inside the device cannot be cancelled (to_thread owns a
-        real thread), so past the timeout we abandon the task rather than hold
-        the whole pipeline hostage to it.
-        """
-        if self._writer is None:
-            return True
-        writer, self._writer = self._writer, None
-        self._queue.put_nowait(None)  # ask it to finish if it is idle
+    async def aclose(self) -> None:
+        """Release the device. Bounded by construction — there is no Python
+        thread here that can block — but if PortAudio still refuses to let go we
+        say so loudly instead of pretending the runtime is healthy."""
+        with self._lock:
+            self._generation += 1
+            self._pending.clear()
+        stream, self._stream = self._stream, None
+        if stream is None:
+            return
         try:
-            await asyncio.wait_for(asyncio.shield(writer), timeout)
-            return True
-        except TimeoutError:
-            log.warning(
-                "audio writer still stuck in the device after %.1fs; abandoning it so the "
-                "pipeline can re-arm",
-                timeout,
-            )
-            return False
-        except (asyncio.CancelledError, Exception):
-            return True
-
-    async def aclose(self, timeout: float = CLOSE_TIMEOUT_S) -> None:  # noqa: ASYNC109
-        # `timeout` is a parameter rather than an asyncio.timeout() at the
-        # call site on purpose: an external cancel would abort the WHOLE
-        # cleanup, and we must abandon only the stuck writer while still
-        # closing everything else.
-        """Bounded teardown: nothing here may block the pipeline re-arming."""
-        await self.stop()
-        finished = await self._shutdown_writer(timeout)
-        if self._stream is not None:
-            if finished:
-                with contextlib.suppress(Exception):
-                    self._stream.close()
-            else:
-                # Never call close() while another thread is still inside the
-                # device — that is how you turn a hang into a crash. Let the
-                # abandoned stream be collected instead.
-                log.warning("leaving the audio stream open: a write is still in flight")
-            self._stream = None
+            stream.stop()
+            stream.close()
+        except Exception as exc:
+            self.backend_broken = True
+            log.critical("could not release the audio device: %s", exc)
+            raise AudioBackendUnrecoverable(f"audio device not released: {exc}") from exc
         log.info("streaming player closed")
 
     # --- the audio path --------------------------------------------------
 
+    def _callback(self, outdata, frames, time_info, status) -> None:
+        """PortAudio pulls from here on its own thread. Must never block: no
+        I/O, no awaits, just a memcpy out of the ring buffer (and silence when
+        it runs dry, which is what makes a barge-in instant)."""
+        wanted = frames * self._frame_bytes
+        out = memoryview(outdata).cast("B")
+        filled = 0
+        with self._lock:
+            generation = self._generation
+            while filled < wanted and self._pending:
+                gen, buf, offset = self._pending[0]
+                if gen != generation:
+                    self._pending.popleft()  # belongs to an interrupted reply
+                    continue
+                take = min(wanted - filled, len(buf) - offset)
+                out[filled : filled + take] = buf[offset : offset + take]
+                filled += take
+                if offset + take >= len(buf):
+                    self._pending.popleft()
+                else:
+                    self._pending[0] = (gen, buf, offset + take)
+            if filled:
+                self._consumed_frames += filled // self._frame_bytes
+                self._last_consumed_at = time.monotonic()
+        if filled < wanted:
+            out[filled:wanted] = b"\x00" * (wanted - filled)
+
     def write(self, pcm: bytes) -> None:
-        """Queue a PCM delta for immediate playback (never blocks the caller —
-        the model keeps streaming while the device drains)."""
-        if self._stopping or not pcm:
+        """Queue a PCM delta for immediate playback (never blocks: the model
+        keeps streaming while PortAudio drains the buffer at its own pace)."""
+        if not pcm:
             return
         converted = expand_channels(self._resampler.process(pcm), self._channels)
-        if converted:
-            self._queue.put_nowait((self._epoch, converted))
-            self._ensure_writer()
-
-    async def _drain(self) -> None:
-        while True:
-            item = await self._queue.get()
-            if item is None:
-                return
-            epoch, chunk = item
-            if self._stopping or epoch != self._epoch:
-                continue  # belongs to a reply the user interrupted
-            try:
-                self._writing = True
-                await asyncio.to_thread(self._stream.write, chunk)
-                self._last_write_at = time.monotonic()
-            except Exception:
-                # An intentional abort() makes the in-flight write raise
-                # (PortAudio -9999). That is the barge-in working, not a
-                # failure — and it must NEVER end the writer, or the next
-                # reply would queue into a consumer that no longer exists.
-                if self._stopping or epoch != self._epoch:
-                    continue
-                log.warning("streaming write failed; keeping the writer alive", exc_info=True)
-                continue
-            finally:
-                self._writing = False
-            if epoch == self._epoch:
-                self._device_frames += len(chunk) // (2 * self._channels)
+        if not converted:
+            return
+        with self._lock:
+            self._pending.append((self._generation, converted, 0))
 
     # --- barge-in --------------------------------------------------------
 
@@ -259,92 +252,73 @@ class StreamingAudioPlayer:
     def has_unplayed_audio(self) -> bool:
         """Is there still audio on its way to the room?
 
-        This is what decides whether a barge-in has anything to interrupt, and
-        it must cover the WHOLE local path, not just the queue: the model can
-        deliver a long reply in a fraction of its spoken duration, so the server
-        is finished (`response.done`) long before the rabbit has stopped
-        talking. Judging playback by the server's state was exactly the bug
-        that made barge-in silently do nothing (hardware, July 2026).
-
-        Three places audio can still be hiding:
-          1. the queue — chunks not yet handed to the device;
-          2. an in-flight write, blocked inside the device right now;
-          3. the device's own buffer — the last write was accepted, but those
-             frames are still being converted to sound. PortAudio's reported
-             output latency bounds that window; without it we assume a small
-             fixed one rather than claim silence we cannot verify.
+        Covers the buffer we hold AND the device's own: the model delivers a
+        long reply in a moment, so the server is finished (`response.done`) long
+        before the rabbit stops talking. Judging playback by the server's state
+        was the bug that made barge-in silently do nothing.
         """
-        if self._stopping:
+        with self._lock:
+            if self._pending:
+                return True
+            last = self._last_consumed_at
+        if last is None:
             return False
-        if not self._queue.empty() or self._writing:
-            return True
-        if self._last_write_at is None:
-            return False
-        buffered_s = (self._output_latency_ms() or _ASSUMED_DEVICE_BUFFER_MS) / 1000.0
-        return (time.monotonic() - self._last_write_at) < buffered_s
+        buffered_s = (self._latency_s * 1000 or _ASSUMED_DEVICE_BUFFER_MS) / 1000.0
+        return (time.monotonic() - last) < buffered_s
 
     @property
     def played_ms(self) -> int:
-        """ESTIMATED milliseconds actually heard, since `reset_position`.
+        """Milliseconds of THIS response actually handed to the device.
 
-        This is an estimate, not a measurement: it counts frames DELIVERED to
-        the device, and the last few are still sitting in the device buffer
-        rather than in the room. Where PortAudio reports the stream's output
-        latency we subtract it, which removes most of that error; where it does
-        not, the figure runs slightly ahead of reality.
-
-        It is what `conversation.item.truncate` gets, so the bias matters: the
-        residual error is bounded by the device buffer (tens of ms, i.e. well
-        under a word) and it errs towards claiming slightly MORE was heard.
-        That is the safer direction — trimming a word the user just caught is
-        recoverable, whereas telling the model it never said something the user
-        did hear leaves the two of you disagreeing about the conversation.
+        A real count now (the callback tallies what it copied), less the
+        device's own buffer, which is still sound in the pipeline rather than in
+        the room. The counter is zeroed per response by `reset_position`, and
+        the callback only counts frames of the CURRENT generation, so audio from
+        an interrupted reply can never inflate the next one's figure — which is
+        what produced truncate values longer than the item itself.
         """
         if self._rate <= 0:
             return 0
-        delivered_ms = self._device_frames * 1000 / self._rate
-        return max(0, int(delivered_ms - self._output_latency_ms()))
-
-    def _output_latency_ms(self) -> float:
-        """The device's own buffering, captured at open (never re-queried — the
-        stream may since have been aborted)."""
-        return self._latency_s * 1000.0
+        with self._lock:
+            frames = self._consumed_frames
+        delivered_ms = frames * 1000 / self._rate
+        return max(0, int(delivered_ms - self._latency_s * 1000))
 
     def reset_position(self) -> None:
-        """Start counting a new response's playback from zero."""
-        self._device_frames = 0
+        """Begin a new response: new generation, empty buffer, zeroed counter —
+        all atomically, so a straggling chunk cannot be credited to it."""
+        with self._lock:
+            self._generation += 1
+            self._pending.clear()
+            self._consumed_frames = 0
+            self._last_consumed_at = None
+        self._resampler = Resampler(self._source_rate, self._rate)
 
     async def stop(self) -> None:
-        """Cut playback NOW and drop anything queued (user is talking)."""
-        self._stopping = True
-        # Bumping the epoch invalidates chunks already queued or mid-write, so
-        # the interrupted reply cannot bleed into the next one.
-        self._epoch += 1
-        discarded = 0
-        while not self._queue.empty():
-            with contextlib.suppress(asyncio.QueueEmpty):
-                self._queue.get_nowait()
-                discarded += 1
+        """Cut playback NOW (the user is talking).
+
+        No `abort()` is needed: dropping the buffer means the next callback —
+        within one block — outputs silence, and the stream stays healthy for the
+        next reply instead of being torn down and rebuilt.
+        """
+        with self._lock:
+            played = self._consumed_frames * 1000 / self._rate if self._rate else 0
+            discarded = len(self._pending)
+            self._generation += 1
+            self._pending.clear()
+            # The buffer is gone AND the device is about to run dry, so nothing
+            # is still on its way to the room — say so at once, or the very
+            # next barge-in check would think the rabbit is still talking.
+            self._last_consumed_at = None
         log.info(
-            "playback drain: aborted after %d ms played, %d queued chunks discarded",
-            self.played_ms,
+            "playback drain: cut after %d ms played, %d queued chunks discarded",
+            int(played),
             discarded,
         )
-        self._last_write_at = None
-        if self._stream is not None:
-            with contextlib.suppress(Exception):
-                # abort() discards the device buffer; stop() would let it drain
-                # and the rabbit would keep talking over the user.
-                self._stream.abort()
 
     async def resume(self) -> None:
-        """Re-open the device after a barge-in, ready for the next response."""
-        if self._stream is None:
-            return
-        self._stopping = False
-        self._resampler = Resampler(self._source_rate, self._rate)
-        with contextlib.suppress(Exception):
-            self._stream.start()
-        # The abort almost certainly killed the in-flight write; make sure a
-        # consumer exists again before the next delta arrives.
-        self._ensure_writer()
+        """Nothing to re-open: the stream was never torn down. Kept so the
+        session code reads the same for either backend."""
+        if self._stream is not None:
+            with contextlib.suppress(Exception):
+                self._stream.start()

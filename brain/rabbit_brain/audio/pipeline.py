@@ -48,6 +48,7 @@ from ..body.types import ChorCommand, PlayAudioCommand, Priority
 from ..stt.base import STTProvider, STTResult
 from .capture import MicCapture
 from .doa import FailOpenDoa
+from .streaming import AudioBackendUnrecoverable
 from .vad import SpeechProbe, UtteranceRecorder
 from .wake import WakeDetector
 
@@ -341,9 +342,16 @@ class VoicePipeline:
             with contextlib.suppress(asyncio.CancelledError, Exception, TimeoutError):
                 await asyncio.wait_for(feedback, REALTIME_CLEANUP_TIMEOUT_S)
             log.info("realtime cleanup: feedback stopped")
+            backend_lost = None
             if session is not None:
                 try:
                     await asyncio.wait_for(session.aclose(), REALTIME_CLEANUP_TIMEOUT_S)
+                except AudioBackendUnrecoverable as exc:
+                    # NEVER re-arm on a dead audio backend: the wake word would
+                    # light the LEDs and the reply would be silent while every
+                    # log said the runtime was fine. Die and let systemd's
+                    # Restart=always rebuild the process, and PortAudio with it.
+                    backend_lost = exc
                 except (TimeoutError, Exception):
                     log.warning(
                         "realtime cleanup: session teardown exceeded %.1fs; abandoning it",
@@ -355,6 +363,13 @@ class VoicePipeline:
                     self._submit_chor(build_leds_off_chor(ears_pose=self._listen_pose)),
                     REALTIME_CLEANUP_TIMEOUT_S,
                 )
+            if backend_lost is not None:
+                log.critical(
+                    "audio backend unrecoverable — NOT re-arming; exiting so the "
+                    "service restarts with a fresh PortAudio: %s",
+                    backend_lost,
+                )
+                raise backend_lost
             # Same re-arm discipline as the turn-based path: reset the detector
             # only once everything is torn down, so our own audio can't wake us.
             self._wake.reset()

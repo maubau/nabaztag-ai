@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
-from ..audio.streaming import CLOSE_TIMEOUT_S, Resampler
+from ..audio.streaming import CLOSE_TIMEOUT_S, AudioBackendUnrecoverable, Resampler
 
 log = logging.getLogger(__name__)
 
@@ -160,6 +160,7 @@ class RealtimeSession:
         # player itself (has_unplayed_audio) — conflating the two is what
         # silently disabled barge-in.
         self._server_response_active = False
+        self._item_audio_ms = 0.0  # audio received for the current item
         self._t0 = 0.0
         self.timings = RealtimeTimings()
 
@@ -220,8 +221,12 @@ class RealtimeSession:
         log.info("realtime cleanup: socket closed")
         closer = getattr(self._player, "aclose", None)
         if self._close_player and closer is not None:
-            with contextlib.suppress(Exception, TimeoutError):
+            try:
                 await asyncio.wait_for(closer(), CLOSE_TIMEOUT_S + 1.0)
+            except AudioBackendUnrecoverable:
+                raise  # the caller must NOT re-arm on a dead device
+            except (Exception, TimeoutError):
+                log.warning("realtime cleanup: player close failed", exc_info=True)
         log.info("realtime cleanup: player closed")
         if self._own_session and self._session is not None:
             with contextlib.suppress(Exception):
@@ -369,6 +374,7 @@ class RealtimeSession:
             # a new response: playback position restarts, so a later truncate
             # reports THIS reply's played time, not a running total
             self._server_response_active = True
+            self._item_audio_ms = 0.0
             self._player.reset_position()
             await self._player.resume()
             if self._on_response_start is not None:
@@ -376,7 +382,13 @@ class RealtimeSession:
         item_id = event.get("item_id")
         if item_id:
             self._current_item = item_id
-        self._player.write(base64.b64decode(payload))
+        pcm = base64.b64decode(payload)
+        # How much audio this item actually CONTAINS. A truncate may never claim
+        # more was heard than the item holds — the server rejects it ("audio
+        # content of 10800ms is already shorter than 13804ms") and the reply
+        # then isn't trimmed at all.
+        self._item_audio_ms += len(pcm) / 2 * 1000 / API_RATE
+        self._player.write(pcm)
         if self.timings.playback_started_ms is None:
             self.timings.playback_started_ms = self._ms()
 
@@ -404,7 +416,9 @@ class RealtimeSession:
             local_pending,
         )
         started = time.monotonic()
-        played_ms = self._player.played_ms
+        # Never claim more was heard than the item holds: the server rejects
+        # an over-long truncate outright, and then nothing gets trimmed.
+        played_ms = min(self._player.played_ms, int(self._item_audio_ms))
         await self._player.stop()
         self._server_response_active = False
         with contextlib.suppress(RealtimeError):

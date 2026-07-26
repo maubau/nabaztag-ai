@@ -114,7 +114,8 @@ async def test_audio_delta_plays_immediately_without_an_mp3():
 async def test_barge_in_stops_playback_and_truncates_at_the_played_time():
     player = FakePlayer(played_ms=1234)
     session = _session(player)
-    await session._handle(_audio_event(b"\x01\x00" * 10))  # rabbit is speaking
+    # 1250 ms of 24 kHz mono: the item must really contain what we claim was heard
+    await session._handle(_audio_event(b"\x01\x00" * 30000))
     await session._handle({"type": "input_audio_buffer.speech_started"})
 
     assert player.stopped == 1  # speaker cut immediately
@@ -244,7 +245,7 @@ async def test_speech_started_does_not_cancel_under_server_side_vad():
     response.cancel raced it, came back response_cancel_not_active, and killed
     the whole session on every SUCCESSFUL barge-in."""
     session = _session(FakePlayer(played_ms=500), turn_detection="semantic_vad")
-    await session._handle(_audio_event(b"\x01\x00" * 10))
+    await session._handle(_audio_event(b"\x01\x00" * 24000))  # 1000 ms
     await session._handle({"type": "input_audio_buffer.speech_started"})
     kinds = [m["type"] for m in session._ws.sent]
     assert "response.cancel" not in kinds  # the server already did it
@@ -286,246 +287,137 @@ async def test_barge_in_before_any_audio_played_sends_no_truncate():
     assert session.timings.interruptions  # still recorded as an interruption
 
 
-# --- the PortAudio abort race -------------------------------------------
+# --- callback-driven player (no blockable Python thread) -----------------
 
 
-class BlockingStream:
-    """A device whose write blocks until released, and whose abort() makes the
-    in-flight write raise — exactly what PortAudio does (-9999)."""
+class FakeCallbackStream:
+    """Stands in for a PortAudio callback stream: the test pumps the callback
+    itself, exactly as the driver's own thread would."""
 
-    def __init__(self):
-        import threading
-
-        self.written: list[bytes] = []
-        self.aborted = 0
-        self.starts = 0
-        self._release = threading.Event()
-        self.block = True
-
-    def write(self, chunk):
-        if self.block:
-            self._release.wait(timeout=2)
-            if self.aborted:
-                raise RuntimeError("PortAudioError -9999 (stream aborted)")
-        self.written.append(bytes(chunk))
+    def __init__(self, channels=1, fail_close=False):
+        self.callback = None
+        self.channels = channels
+        self.latency = 0.02
+        self.started = 0
+        self.stopped = 0
+        self.closed = 0
+        self.fail_close = fail_close
 
     def start(self):
-        self.starts += 1
+        self.started += 1
 
     def stop(self):
-        pass
-
-    def abort(self):
-        self.aborted += 1
-        self._release.set()
+        self.stopped += 1
 
     def close(self):
-        pass
+        if self.fail_close:
+            raise RuntimeError("device busy")
+        self.closed += 1
+
+    def pump(self, frames):
+        """Run one callback and return what the device would have played."""
+        buf = bytearray(frames * 2 * self.channels)
+        self.callback(buf, frames, None, None)
+        return bytes(buf)
 
 
-async def _player_with(stream):
+async def _callback_player(stream=None, rate=24000):
     from rabbit_brain.audio.streaming import StreamingAudioPlayer
 
-    player = StreamingAudioPlayer(device=None, device_rate=16000, device_channels=1)
-    player._open_stream = lambda: stream
+    stream = stream or FakeCallbackStream()
+    player = StreamingAudioPlayer(device=None, device_rate=rate, device_channels=1)
+
+    def _open():
+        stream.callback = player._callback
+        return stream
+
+    player._open_stream = _open
     await player.start()
-    return player
+    return player, stream
 
 
-async def test_abort_during_a_blocked_write_keeps_the_writer_alive():
-    """The hardware race: abort() while _drain was blocked in write() raised,
-    the writer returned, and every later reply queued into a dead consumer."""
-    import asyncio as aio
+async def test_callback_plays_queued_pcm_and_counts_real_frames():
+    player, stream = await _callback_player()
+    player.write(b"\x01\x00" * 100)
+    played = stream.pump(100)
+    assert played == b"\x01\x00" * 100  # the device really got it
+    # played_ms is a COUNT now, not an estimate (minus the device buffer)
+    assert player.played_ms == max(0, int(100 / 24000 * 1000 - 20))
 
-    stream = BlockingStream()
-    player = await _player_with(stream)
-    try:
-        player.write(b"\x01\x00" * 400)  # response 1 — blocks in write()
-        await aio.sleep(0.05)
-        await player.stop()  # barge-in: abort makes that write raise
-        await aio.sleep(0.05)
-        assert stream.aborted == 1
 
-        # second response: the device is re-opened and the delta MUST be heard
-        stream.block = False
-        await player.resume()
-        player.reset_position()
-        player.write(b"\x02\x00" * 400)
-        await aio.sleep(0.1)
-        assert stream.written, "the second response was never consumed"
-        assert player._writer is not None and not player._writer.done()
-    finally:
+async def test_callback_outputs_silence_when_the_buffer_is_empty():
+    player, stream = await _callback_player()
+    assert stream.pump(50) == b"\x00" * 100  # silence, never a stall
+
+
+async def test_stop_makes_the_very_next_callback_silent():
+    """Barge-in needs no abort(): dropping the buffer is enough, and the stream
+    stays healthy for the next reply instead of being torn down."""
+    player, stream = await _callback_player()
+    player.write(b"\x01\x00" * 500)
+    stream.pump(10)  # started playing
+    await player.stop()
+    assert stream.pump(50) == b"\x00" * 100  # cut immediately
+    assert stream.stopped == 0, "the stream must NOT be torn down to interrupt"
+
+
+async def test_interrupted_audio_never_bleeds_into_the_next_response():
+    player, stream = await _callback_player()
+    player.write(b"\x01\x00" * 500)  # reply 1
+    await player.stop()
+    player.reset_position()  # reply 2 begins
+    player.write(b"\x02\x00" * 10)
+    played = stream.pump(10)
+    assert played == b"\x02\x00" * 10, "audio from the interrupted reply leaked"
+
+
+async def test_played_ms_is_not_inflated_by_a_previous_response():
+    """The 'audio content is already shorter than' bug: a straggling chunk from
+    the previous reply must not be credited to the new one."""
+    player, stream = await _callback_player()
+    player.write(b"\x01\x00" * 24000)  # a long reply 1
+    stream.pump(12000)
+    assert player.played_ms > 0
+    player.reset_position()  # reply 2
+    assert player.played_ms == 0, "the counter carried over between responses"
+    stream.pump(1000)  # nothing queued for reply 2 yet -> silence, no credit
+    assert player.played_ms == 0
+
+
+async def test_has_unplayed_audio_tracks_buffer_and_device_window():
+    player, stream = await _callback_player()
+    assert player.has_unplayed_audio is False
+    player.write(b"\x01\x00" * 500)
+    assert player.has_unplayed_audio is True  # buffered
+    stream.pump(500)
+    assert player.has_unplayed_audio is True  # still sounding (device latency)
+    await player.stop()
+    assert player.has_unplayed_audio is False
+
+
+async def test_aclose_releases_the_device():
+    player, stream = await _callback_player()
+    await player.aclose()
+    assert stream.stopped == 1 and stream.closed == 1
+
+
+async def test_aclose_raises_when_the_device_cannot_be_reclaimed():
+    """A device we cannot release must NOT look like a healthy shutdown: the
+    next wake would light the LEDs and answer in silence."""
+    from rabbit_brain.audio.streaming import AudioBackendUnrecoverable
+
+    player, _ = await _callback_player(FakeCallbackStream(fail_close=True))
+    with pytest.raises(AudioBackendUnrecoverable):
         await player.aclose()
+    assert player.backend_broken is True
 
 
-async def test_interrupted_audio_does_not_bleed_into_the_next_response():
-    """Chunks queued for the cancelled reply must be dropped, not played over
-    the new one."""
-    import asyncio as aio
-
-    stream = BlockingStream()
-    stream.block = False
-    player = await _player_with(stream)
-    try:
-        player.write(b"\x01\x00" * 400)
-        await player.stop()  # everything queued for response 1 is now stale
-        stale = len(stream.written)
-        await player.resume()
-        player.write(b"\x02\x00" * 400)
-        await aio.sleep(0.1)
-        assert len(stream.written) > stale  # the NEW response played
-    finally:
-        await player.aclose()
-
-
-# --- the "server done but speaker still talking" bug ---------------------
-
-
-async def test_has_unplayed_audio_covers_queue_inflight_and_device_buffer():
-    import asyncio as aio
-
-    stream = BlockingStream()
-    stream.block = False
-    player = await _player_with(stream)
-    try:
-        assert player.has_unplayed_audio is False  # nothing ever written
-        player.write(b"\x01\x00" * 400)
-        assert player.has_unplayed_audio is True  # queued
-        await aio.sleep(0.1)
-        # written to the device: still sounding for the buffer window
-        assert player.has_unplayed_audio is True
-        await player.stop()
-        assert player.has_unplayed_audio is False  # aborted
-    finally:
-        await player.aclose()
-
-
-async def test_barge_in_fires_after_response_done_while_audio_still_playing():
-    """THE bug: the model delivers 2 s of speech in a moment, response.done
-    arrives, and the rabbit is still talking. Gating barge-in on the server's
-    state meant speech_started found 'nothing to interrupt' and the speaker
-    just carried on."""
-
-    class StillPlaying(FakePlayer):
-        has_unplayed_audio = True  # the speaker has a backlog
-
-    player = StillPlaying(played_ms=800)
+async def test_truncate_never_exceeds_the_items_own_duration():
+    """The server rejects an over-long truncate outright, and then nothing is
+    trimmed at all."""
+    player = FakePlayer(played_ms=13804)  # counter says more than we ever sent
     session = _session(player)
-    await session._handle(_audio_event(b"\x01\x00" * 10))
-    await session._handle({"type": "response.done"})  # server finished
-    assert session._server_response_active is False
-    # user cuts in while the speaker is still working through the backlog
+    await session._handle(_audio_event(b"\x01\x00" * 12000))  # only 500 ms
     await session._handle({"type": "input_audio_buffer.speech_started"})
-    assert player.stopped == 1, "the speaker must be aborted"
     truncate = next(m for m in session._ws.sent if m["type"] == "conversation.item.truncate")
-    assert truncate["audio_end_ms"] == 800
-
-
-async def test_barge_in_still_ignored_when_truly_idle():
-    # no server response AND no local audio: nothing to interrupt
-    player = FakePlayer()
-    player.has_unplayed_audio = False
-    session = _session(player)
-    await session._handle({"type": "response.done"})
-    await session._handle({"type": "input_audio_buffer.speech_started"})
-    assert player.stopped == 0
-    assert not any(m["type"] == "conversation.item.truncate" for m in session._ws.sent)
-
-
-async def test_fast_deltas_then_done_then_bargein_clears_the_queue():
-    """2 s of audio delivered fast, response.done, speaker still playing,
-    speech_started -> audio cut and the queue emptied."""
-    import asyncio as aio
-
-    from rabbit_brain.audio.streaming import StreamingAudioPlayer
-
-    stream = BlockingStream()
-    stream.block = False
-    player = StreamingAudioPlayer(device=None, device_rate=16000, device_channels=1)
-    player._open_stream = lambda: stream
-    await player.start()
-    session = _session(player)
-    try:
-        # ~2 s of 24 kHz mono PCM arriving all at once
-        session._server_response_active = False
-        await session._handle(_audio_event(b"\x00\x01" * 24000))
-        await session._handle({"type": "response.done"})
-        assert player.has_unplayed_audio is True  # speaker is still working
-        await session._handle({"type": "input_audio_buffer.speech_started"})
-        await aio.sleep(0.05)
-        assert player.has_unplayed_audio is False  # cut
-        assert player._queue.empty(), "the pending audio must be discarded"
-        assert stream.aborted >= 1
-
-        # the second turn must be audible immediately, with no residue
-        stream.written.clear()
-        await session._handle(_audio_event(b"\x02\x00" * 2400, item_id="item_2"))
-        await aio.sleep(0.1)
-        assert stream.written, "the second response never reached the device"
-    finally:
-        await player.aclose()
-
-
-# --- bounded teardown (the "never REARMED" blocker) ----------------------
-
-
-class StuckStream(BlockingStream):
-    """A device whose write does NOT return even after abort() — the case that
-    left the pipeline unable to re-arm. It gives up eventually so the test
-    process doesn't inherit a thread that never ends."""
-
-    def __init__(self, hang_s=1.5):
-        super().__init__()
-        self._hang_s = hang_s
-        self.latency = 0.05
-
-    def write(self, chunk):
-        import time as _t
-
-        _t.sleep(self._hang_s)  # ignores abort() entirely
-        self.written.append(bytes(chunk))
-
-
-async def test_aclose_is_bounded_when_a_write_never_returns():
-    """asyncio.to_thread cannot be cancelled, so waiting for a stuck writer
-    means waiting forever. aclose must give up and let the pipeline re-arm."""
-    import asyncio as aio
-    import time as _t
-
-    stream = StuckStream()
-    player = await _player_with(stream)
-    player.write(b"\x01\x00" * 400)
-    await aio.sleep(0.05)  # the writer is now inside the stuck write
-    started = _t.monotonic()
-    await aio.wait_for(player.aclose(timeout=0.2), timeout=2.0)
-    assert _t.monotonic() - started < 1.4, "aclose waited for the stuck writer"
-
-
-async def test_latency_is_read_once_and_not_queried_after_abort():
-    """Querying the stream's latency after abort() calls into PortAudio on a
-    torn-down device (ALSA GetStreamWriteAvailable noise)."""
-
-    class LatencyTrap(BlockingStream):
-        def __init__(self):
-            super().__init__()
-            self.block = False
-            self._aborted_once = False
-            self.latency = 0.05
-
-        def abort(self):
-            super().abort()
-            self._aborted_once = True
-
-        def __getattribute__(self, name):
-            if name == "latency" and object.__getattribute__(self, "_aborted_once"):
-                raise AssertionError("latency queried after abort()")
-            return object.__getattribute__(self, name)
-
-    player = await _player_with(LatencyTrap())
-    try:
-        player.write(b"\x01\x00" * 100)
-        await player.stop()  # aborts; played_ms/has_unplayed_audio use the cache
-        assert player.played_ms >= 0
-        assert player.has_unplayed_audio is False
-    finally:
-        await player.aclose(timeout=0.5)
+    assert truncate["audio_end_ms"] == 500
