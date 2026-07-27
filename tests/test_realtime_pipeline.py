@@ -98,13 +98,21 @@ class FakeController:
     def __init__(self):
         self.adapter = FakeAdapter()
         self.chors: list[str] = []
+        self.submitted: list[tuple[str, object]] = []
         self.interrupts = 0
+        self.dropped_below: list[object] = []
 
-    def interrupt(self):
+    def interrupt(self, below=None):
         self.interrupts += 1
+        if below is not None:
+            self.dropped_below.append(below)
+            # mirror the real controller: pending work below `below` is dropped
+            self.chors.clear()
 
-    async def submit(self, cmd, priority):
-        self.chors.append(getattr(cmd, "chor", cmd))
+    async def submit(self, cmd, priority, deadline=None):
+        chor = getattr(cmd, "chor", cmd)
+        self.chors.append(chor)
+        self.submitted.append((chor, priority))
 
     @property
     def audio_busy(self):
@@ -202,17 +210,21 @@ async def test_full_cycle_wake_session_bargein_second_turn_close_rewake():
     assert pipeline.realtime_sessions >= 1
 
 
-async def test_ux_states_wake_green_listening_then_animation():
-    """wake -> ack, listening -> magenta scanner, answering -> body animation."""
+async def test_ux_is_event_driven_with_no_periodic_animation():
+    """Hardware-confirmed (#8): a chor QUEUES behind the running one and cannot
+    be cancelled, so a periodic animation builds a remote backlog the terminator
+    lands behind — the rabbit kept moving 20-30 s after the conversation ended.
+    Feedback must therefore be emitted per TRANSITION, never on a timer."""
     started = asyncio.Event()
+    release = asyncio.Event()
 
     async def factory(state):
         session = ScriptedSession(FakePlayer(), state)
 
         async def pump(frames, stop=None, should_continue=None, idle_timeout_s=None):
-            state.on_response_start()  # rabbit answers -> light only
+            state.on_response_start()  # one transition: waiting/answering
             started.set()
-            await asyncio.sleep(0.08)
+            await release.wait()
             return "idle"
 
         session.pump_microphone = pump
@@ -221,13 +233,74 @@ async def test_ux_states_wake_green_listening_then_animation():
     pipeline, _, controller = _pipeline(factory)
     task = asyncio.create_task(pipeline.run())
     await asyncio.wait_for(started.wait(), timeout=1)
-    await asyncio.sleep(0.06)
+    await asyncio.sleep(0.25)  # >> the old ~1.9 s loop would have fired here
+    emitted = len(controller.chors)
+    await asyncio.sleep(0.25)  # nothing changes, so nothing more may be sent
+    assert len(controller.chors) == emitted, "feedback is still firing on a timer"
+    release.set()
+    await asyncio.sleep(0.1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    # the ack lands first, then feedback keeps submitting choreography
-    assert controller.interrupts >= 1
-    assert len(controller.chors) >= 2
+
+
+async def test_cleanup_drops_pending_feedback_and_ends_with_the_terminator():
+    """Choreography already on the rabbit cannot be recalled, so the only lever
+    is refusing to lengthen the remote queue: everything still local is dropped
+    and the neutral state goes out above it, LAST."""
+    from rabbit_brain.body.types import Priority
+
+    async def factory(state):
+        session = ScriptedSession(FakePlayer(), state)
+
+        async def pump(frames, stop=None, should_continue=None, idle_timeout_s=None):
+            state.on_speech_started()
+            await asyncio.sleep(0)
+            state.on_speech_stopped()
+            await anext(frames)
+            return "hangup"
+
+        session.pump_microphone = pump
+        return session
+
+    pipeline, _, controller = _pipeline(factory)
+    await _run_briefly(pipeline, seconds=0.4)
+
+    assert controller.dropped_below, "pending cosmetic feedback was never dropped"
+    assert Priority.USER_SPEECH_SYNC in controller.dropped_below
+    last_chor, last_priority = controller.submitted[-1]
+    # LEDs off + ears neutral, above the cosmetic priority
+    assert "led,0,0,0,0" in last_chor
+    assert last_priority == Priority.USER_SPEECH_SYNC
+    assert controller.chors[-1] == last_chor, "something was queued after the terminator"
+
+
+async def test_cosmetic_feedback_carries_a_deadline():
+    """A late state indicator describes a moment that has passed; the controller
+    must be allowed to drop it rather than fire it."""
+    deadlines = []
+
+    async def factory(state):
+        session = ScriptedSession(FakePlayer(), state)
+
+        async def pump(frames, stop=None, should_continue=None, idle_timeout_s=None):
+            state.on_speech_started()
+            await asyncio.sleep(0.05)
+            return "idle"
+
+        session.pump_microphone = pump
+        return session
+
+    pipeline, _, controller = _pipeline(factory)
+    original = controller.submit
+
+    async def recording_submit(cmd, priority, deadline=None):
+        deadlines.append(deadline)
+        await original(cmd, priority, deadline)
+
+    controller.submit = recording_submit
+    await _run_briefly(pipeline, seconds=0.3)
+    assert any(d is not None for d in deadlines), "cosmetic feedback had no deadline"
 
 
 async def test_realtime_failure_falls_back_without_restart():

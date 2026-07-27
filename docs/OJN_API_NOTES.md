@@ -96,15 +96,30 @@ Hardware half — status on the real rabbit:
    way as intended (stock ears are continuous-rotation, so expected) vs the shortest path.
    At end-of-speech the stop chor also returns both ears to the neutral listen pose
    (`build_leds_off_chor(ears_pose=...)`).
-8. **OPEN — chor-interrupts-chor semantics.** Does submitting a new choreography while one
-   is playing REPLACE it immediately, or queue behind it? The looping LISTENING/PROCESSING
-   indicators and their all-off terminator assume prompt replacement so the stop is
-   instant; if OJN queues instead, the stop lands one cycle late (cosmetic). The pipeline's
-   WakeTimings log records `wake_to_scanner_stop_enqueued_ms` (when the LEDs-off chor was
-   SUBMITTED, ≈ end-of-speech) — but wire execution needs a BodyController completion/ack to
-   measure; submit() only enqueues (hardware finding: the old `scanner_stop` metric was set
-   after awaiting STT, so it always equalled `stt_final`; now it is stamped at the enqueue
-   inside `_listening_feedback`, distinguishing enqueue from wire).
+8. **RESOLVED — chor-interrupts-chor: choreography QUEUES, it does not replace (hardware,
+   July 2026).** A new `chor=` submitted while one is playing does NOT preempt it; it is
+   appended, and OJN/VAPI exposes no cancel or replace. Confirmed by the realtime UX: the
+   feedback loop resubmitted a ~1.9 s LISTENING animation every cycle, so a ~30 s conversation
+   handed the rabbit roughly fifteen queued animations. After `end_conversation` the logs
+   reached `pipeline state -> REARMED` immediately and the session really was closed — yet the
+   LEDs and ears kept animating for a further 20-30 s, working through the remote backlog, with
+   the all-off terminator stuck behind it.
+   **Consequences, now designed around rather than assumed away:**
+   - `BodyController.submit()` confirms LOCAL enqueue only. Nothing reports execution on the
+     rabbit, so there is no ack to wait on and no way to recall what was already sent.
+   - Looping indicators driven by a timer are a design error in any long-lived state: each
+     cycle lengthens a queue that cannot be shortened. Realtime feedback is therefore
+     EVENT-DRIVEN — at most one SHORT choreography per transition (`build_static_leds_chor`
+     for a state, `build_speech_ack_chor` for a brief acknowledgement), never on a timer.
+   - Cosmetic commands carry a DEADLINE (`FEEDBACK_DEADLINE_S`), so one that cannot run
+     promptly is dropped instead of firing late into a state it no longer describes.
+   - On teardown the pipeline drops everything still queued LOCALLY
+     (`interrupt(below=USER_SPEECH_SYNC)`) and sends the all-off terminator ABOVE the cosmetic
+     priority. Commands already delivered to the rabbit cannot be recovered — the only
+     available lever is refusing to make that remote queue longer.
+   - The turn-based LISTENING/PROCESSING indicators still resubmit per cycle; their states are
+     short (bounded by one utterance) so the backlog stays small, but the same rule applies if
+     either is ever used for a long-lived state.
 9. **Deepgram bilingual it/en via `language: multi` + `endpointing: 100` (July 2026).** The
    desired behavior is automatic it/en code-switching (an "English" transcript was in fact
    an English phrase, not a misdetection). Keep `language: multi`; add `endpointing: 100`

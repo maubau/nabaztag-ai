@@ -203,3 +203,50 @@ def build_dance_chor(duration_s: float, tempo_ms: int = 100) -> str:
     for ear in ("0", "1"):
         parts += [str(ticks), "motor", ear, "0", "0", "1"]
     return ",".join(parts)
+
+
+def build_static_leds_chor(
+    color: tuple[int, int, int] = LISTENING_COLOR,
+    ears_pose: tuple[int, int] | None = None,
+    tempo_ms: int = 10,
+) -> str:
+    """Set the LEDs to a colour and STOP — no cycle, no animation.
+
+    Realtime mode needs states that cost one short choreography, not a loop.
+    Hardware-confirmed (OJN_API_NOTES #8): a new `chor=` does NOT replace the
+    running one, it QUEUES behind it. A periodic animation therefore builds a
+    remote backlog we cannot cancel, and the terminator lands behind all of it —
+    which is why the rabbit kept animating for 20-30 s after the conversation
+    had actually ended. A static state has nothing to outlive.
+    """
+    r, g, b = color
+    parts = [str(tempo_ms)]
+    for led in range(5):
+        parts += ["0", "led", str(led), str(r), str(g), str(b)]
+    if ears_pose is not None:
+        for ear in (0, 1):
+            parts += ["0", "motor", str(ear), str(ears_pose[ear] * _EAR_STEP_DEG), "0", "1"]
+    return ",".join(parts)
+
+
+def build_speech_ack_chor(
+    listen_pose: tuple[int, int] = (0, 0),
+    color: tuple[int, int, int] = LISTENING_COLOR,
+    tempo_ms: int = 80,
+) -> str:
+    """ONE short acknowledgement that the user started speaking: a brief ear
+    twitch and an LED pulse, then settle. Under a second, and emitted once per
+    transition — never on a timer."""
+    r, g, b = color
+    parts = [str(tempo_ms)]
+    for led in range(5):  # bright pulse
+        parts += ["0", "led", str(led), str(r), str(g), str(b)]
+    # a small twitch (2 steps) and back to the listening pose
+    twitch = min(listen_pose[0] + 2, 16)
+    parts += ["0", "motor", "0", str(twitch * _EAR_STEP_DEG), "0", "0"]
+    parts += ["0", "motor", "1", str(twitch * _EAR_STEP_DEG), "0", "1"]
+    for led in range(5):  # settle to a dimmer steady colour
+        parts += ["3", "led", str(led), str(r // 3), str(g // 3), str(b // 3)]
+    for ear in (0, 1):
+        parts += ["3", "motor", str(ear), str(listen_pose[ear] * _EAR_STEP_DEG), "0", "1"]
+    return ",".join(parts)

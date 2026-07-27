@@ -370,23 +370,25 @@ class RealtimeSession:
             return
         if self.timings.first_audio_delta_ms is None:
             self.timings.first_audio_delta_ms = self._ms()
-        if not self._server_response_active:
-            # a new response: playback position restarts, so a later truncate
-            # reports THIS reply's played time, not a running total
-            self._server_response_active = True
+        new_response = not self._server_response_active
+        self._server_response_active = True
+        # The boundary that matters is the ITEM, not the response: `truncate`
+        # addresses one item_id, and a single response can carry several.
+        # Counting per response let audio from a sibling item inflate the total
+        # (hardware: truncate 13680 ms against an item holding only 10550 ms —
+        # the server rejects that outright and then nothing is trimmed at all).
+        item_id = event.get("item_id")
+        if item_id and item_id != self._current_item:
+            self._current_item = item_id
             self._item_audio_ms = 0.0
+            # A fresh playback generation per item keeps played_ms measured from
+            # the start of the item the truncate will name.
             self._player.reset_position()
             await self._player.resume()
+        if new_response:
             if self._on_response_start is not None:
                 self._on_response_start()  # UX: the rabbit is answering
-        item_id = event.get("item_id")
-        if item_id:
-            self._current_item = item_id
         pcm = base64.b64decode(payload)
-        # How much audio this item actually CONTAINS. A truncate may never claim
-        # more was heard than the item holds — the server rejects it ("audio
-        # content of 10800ms is already shorter than 13804ms") and the reply
-        # then isn't trimmed at all.
         self._item_audio_ms += len(pcm) / 2 * 1000 / API_RATE
         self._player.write(pcm)
         if self.timings.playback_started_ms is None:

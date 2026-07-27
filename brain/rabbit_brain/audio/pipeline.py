@@ -41,6 +41,8 @@ from ..body.chor import (
     build_leds_off_chor,
     build_listening_chor,
     build_processing_chor,
+    build_speech_ack_chor,
+    build_static_leds_chor,
     build_wake_ack_chor,
 )
 from ..body.controller import BodyController
@@ -75,6 +77,11 @@ DEFAULT_REALTIME_IDLE_S = 25.0
 # the wake detector being re-armed — a stuck PortAudio write once left the
 # microphone unconsumed for the rest of the run.
 REALTIME_CLEANUP_TIMEOUT_S = 3.0
+# Cosmetic feedback is worthless once it is late: a `chor=` queues behind the
+# running one on the rabbit (OJN_API_NOTES #8), so a state indicator that
+# cannot run promptly would describe a moment that has already passed. Past
+# this deadline the controller drops it instead of firing it.
+FEEDBACK_DEADLINE_S = 2.0
 # Safety ceiling on the PLAYING drain: a runaway reply must not wedge the
 # pipeline forever if audio_busy ever gets stuck (hardware round, July 2026).
 PLAYING_DRAIN_TIMEOUT_S = 30.0
@@ -358,9 +365,18 @@ class VoicePipeline:
                         REALTIME_CLEANUP_TIMEOUT_S,
                         exc_info=True,
                     )
+            # Drop every cosmetic command we have NOT yet handed to the rabbit,
+            # then send the terminator above them. Choreography already on the
+            # rabbit cannot be recalled (no cancel/replace exists — #8), so the
+            # only lever is refusing to lengthen that remote queue: whatever is
+            # still local dies here, and the neutral state goes out first.
+            self._controller.interrupt(below=Priority.USER_SPEECH_SYNC)
             with contextlib.suppress(Exception, TimeoutError):
                 await asyncio.wait_for(
-                    self._submit_chor(build_leds_off_chor(ears_pose=self._listen_pose)),
+                    self._controller.submit(
+                        ChorCommand(build_leds_off_chor(ears_pose=self._listen_pose)),
+                        Priority.USER_SPEECH_SYNC,
+                    ),
                     REALTIME_CLEANUP_TIMEOUT_S,
                 )
             if backend_lost is not None:
@@ -376,30 +392,57 @@ class VoicePipeline:
             log.info("pipeline state -> REARMED")
 
     async def _realtime_feedback(self, speaking: _SpeakingState, stop: asyncio.Event) -> None:
-        """UX for the continuous conversation: green wake ack, then magenta
-        while listening and a body animation while the rabbit answers. A
-        barge-in returns to listening IMMEDIATELY rather than at the end of the
-        current animation cycle — the user talking is the strongest signal there
-        is that the rabbit should look like it is listening again."""
+        """EVENT-DRIVEN UX for the continuous conversation: at most ONE short
+        choreography per state transition, never a loop.
+
+        Hardware-confirmed (OJN_API_NOTES #8): a new `chor=` does not replace
+        the running one, it QUEUES behind it, and `submit()` only tells us the
+        command was enqueued locally — nothing reports execution on the rabbit.
+        The old design resubmitted a ~1.9 s animation on a timer, so a 30 s
+        conversation handed the rabbit ~15 queued animations and the terminator
+        landed behind all of them: the body kept moving for 20-30 s after the
+        conversation had really ended.
+
+        So: transitions only, each one short, and each with a DEADLINE — a
+        cosmetic command that could not run in time is dropped rather than
+        fired late into a state it no longer describes.
+        """
         try:
-            await self._submit_chor(build_wake_ack_chor(None, listen_pose=self._listen_pose))
+            await self._submit_feedback(build_wake_ack_chor(None, listen_pose=self._listen_pose))
             await self._wait_or_end(stop, self._ack_render_s)
+            shown: bool | None = None
             while not stop.is_set():
-                # Ears move only while the USER is speaking; otherwise the glow
-                # alone says the session is open (move_ears=False).
-                await self._submit_chor(
-                    build_listening_chor(
-                        None,
-                        listen_pose=self._listen_pose,
-                        move_ears=speaking.user_speaking,
-                    )
-                )
-                # wake early when the state flips (barge-in), not on a timer
                 speaking.changed.clear()
-                await self._wait_any(stop, speaking.changed, self._listening_cycle_s)
+                if speaking.user_speaking != shown:
+                    shown = speaking.user_speaking
+                    if shown:
+                        # the user started talking: one brief twitch + pulse
+                        await self._submit_feedback(
+                            build_speech_ack_chor(listen_pose=self._listen_pose)
+                        )
+                    else:
+                        # waiting / the rabbit answering: a STATIC state, so
+                        # nothing outlives the moment it describes
+                        await self._submit_feedback(
+                            build_static_leds_chor(ears_pose=self._listen_pose)
+                        )
+                # purely event-driven: nothing is emitted until something changes
+                await self._wait_any(stop, speaking.changed, None)
         finally:
-            with contextlib.suppress(Exception):
-                await self._submit_chor(build_leds_off_chor(ears_pose=self._listen_pose))
+            # No terminator here: _handle_wake_realtime owns it, and sends it
+            # ABOVE the cosmetic priority after dropping whatever is still
+            # queued locally. Emitting one here too would just add to the queue
+            # we are trying to keep short.
+            pass
+
+    async def _submit_feedback(self, chor: str) -> None:
+        """Cosmetic body feedback: below USER_SPEECH_SYNC so cleanup can drop it,
+        and with a short deadline so it is never fired late."""
+        await self._controller.submit(
+            ChorCommand(chor),
+            Priority.AGENT_EXPRESSION,
+            deadline=time.monotonic() + FEEDBACK_DEADLINE_S,
+        )
 
     async def _wait_any(self, stop: asyncio.Event, changed: asyncio.Event, seconds: float) -> None:
         waiters = [asyncio.ensure_future(stop.wait()), asyncio.ensure_future(changed.wait())]
