@@ -456,6 +456,23 @@ Hardware half — status on the real rabbit:
     speed**: runtime hardening, systemd service + start-on-boot, recovery, and a custom "Nabaztag"
     wake word (`hey_jarvis` was only ever a smoke-test placeholder).
 
+24. **REALTIME + UX BLOCK CLOSED (hardware acceptance, runtime 1305de0, July 2026).** Full
+    acceptance passed on the Bolt: ASSISTANT_SPEAKING with LED/ear animation, barge-in,
+    per-`item_id` truncate, cleanup, idle timeout, hangup, re-arm and a second session — with **no
+    residual technical warnings** (the `already shorter than` truncate log is gone).
+    **DECISION — no further cosmetic optimisation of the realtime UX for now.** The five hardware
+    rounds that got here are recorded in #8 and in the commit history; the design constraints they
+    established (playback-driven state, bounded tick period, deadlines on cosmetics, terminator
+    above the cosmetic priority) are load-bearing and must survive any later change.
+    **Still open, and deliberately not fixed in this block:** the TURN-BASED `LocalAudioPlayer`
+    (`brain/rabbit_brain/audio/output.py`) still writes through a blocking `write` inside
+    `asyncio.to_thread`. That is the exact hazard the realtime player was rewritten to remove — it
+    cannot be cancelled, so a write stuck in the driver would hang teardown and leave the device
+    held. It has not bitten on hardware because that path plays a complete MP3 and is never
+    interrupted, but the same callback treatment should be applied before the turn-based path is
+    ever asked to support cancellation.
+    Work now moves to **features** (news/briefing, timers, RFID intents), not to the voice path.
+
 Record answers here, then stamp the matrix rows hardware-confirmed.
 
 ### Build & deployment findings (Gate S1)
