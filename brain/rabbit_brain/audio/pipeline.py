@@ -41,6 +41,7 @@ from ..body.chor import (
     build_leds_off_chor,
     build_listening_chor,
     build_processing_chor,
+    build_speaking_tick_chor,
     build_speech_ack_chor,
     build_static_leds_chor,
     build_wake_ack_chor,
@@ -82,6 +83,11 @@ REALTIME_CLEANUP_TIMEOUT_S = 3.0
 # cannot run promptly would describe a moment that has already passed. Past
 # this deadline the controller drops it instead of firing it.
 FEEDBACK_DEADLINE_S = 2.0
+# Gap between two ASSISTANT_SPEAKING ticks. Must stay comfortably LONGER than a
+# tick (~0.42 s) so the rabbit finishes one before the next arrives: that is
+# what guarantees at most one queued remotely, and bounds the residue after a
+# barge-in to a single tick rather than to a backlog.
+SPEAKING_TICK_PERIOD_S = 0.9
 # Safety ceiling on the PLAYING drain: a runaway reply must not wedge the
 # pipeline forever if audio_busy ever gets stuck (hardware round, July 2026).
 PLAYING_DRAIN_TIMEOUT_S = 30.0
@@ -98,15 +104,19 @@ class _SpeakingState:
     """Who is talking, shared between the Realtime session (which flips it from
     its callbacks) and the UX feedback loop.
 
-    Only USER speech drives the ears. A continuous conversation stays open for
-    tens of seconds, and rotating the ears through all of it — including the
-    whole idle tail — read as agitation on hardware. So: the fuchsia glow means
-    "the session is open", and motion is reserved for the wake ack, for the user
-    actually speaking, and for gestures the model explicitly asks for.
+    Two INDEPENDENT facts, and keeping them apart is the point:
+
+      * ``user_speaking`` — the server's VAD heard the user.
+      * ``assistant_speaking`` — the SPEAKER is actually producing sound. This
+        follows the player's playback events, never the server's response state:
+        `response.done` arrives while seconds of PCM are still queued, so an
+        indicator driven by the server would go dark while the rabbit is
+        visibly still talking.
     """
 
     def __init__(self) -> None:
         self.user_speaking = False
+        self.assistant_speaking = False
         self.changed = asyncio.Event()
 
     def on_speech_started(self) -> None:
@@ -118,13 +128,31 @@ class _SpeakingState:
         self.changed.set()
 
     def on_response_start(self) -> None:
-        # The rabbit answering is shown by the light, not by turning ears.
+        # The server began generating. NOT the same as the rabbit talking:
+        # assistant_speaking waits for audio to actually reach the device.
         self.user_speaking = False
         self.changed.set()
 
     def on_barge_in(self) -> None:
-        # Back to listening immediately.
+        # Back to listening immediately. The player also emits playback_cut, but
+        # the order of the two is not guaranteed and this must not wait: the
+        # whole promise of barge-in is that the body reacts at once.
         self.user_speaking = True
+        self.assistant_speaking = False
+        self.changed.set()
+
+    # --- driven by StreamingAudioPlayer, on the asyncio loop -------------
+
+    def on_playback_started(self) -> None:
+        self.assistant_speaking = True
+        self.changed.set()
+
+    def on_playback_drained(self) -> None:
+        self.assistant_speaking = False
+        self.changed.set()
+
+    def on_playback_cut(self) -> None:
+        self.assistant_speaking = False
         self.changed.set()
 
 
@@ -406,34 +434,83 @@ class VoicePipeline:
         So: transitions only, each one short, and each with a DEADLINE — a
         cosmetic command that could not run in time is dropped rather than
         fired late into a state it no longer describes.
+
+        The ONE state that repeats is ASSISTANT_SPEAKING. A reply lasts many
+        seconds and a body that sits still through all of it reads as broken, so
+        it gets a short "tick" (mouth-like LEDs + counter-rotating ears) re-sent
+        while playback is REALLY running. This is not the old timer loop: the
+        tick period is longer than a tick, at most one is ever in flight, and the
+        trigger is the player's own playback state — so it stops the instant the
+        speaker does, and the worst-case residue after a cut is one tick.
         """
         try:
             await self._submit_feedback(build_wake_ack_chor(None, listen_pose=self._listen_pose))
             await self._wait_or_end(stop, self._ack_render_s)
-            shown: bool | None = None
+            shown: str | None = None
+            phase = 0
             while not stop.is_set():
                 speaking.changed.clear()
-                if speaking.user_speaking != shown:
-                    shown = speaking.user_speaking
-                    if shown:
+                state = self._realtime_ux_state(speaking)
+                if state != shown:
+                    was_speaking = shown == "assistant"
+                    shown = state
+                    phase = 0
+                    if state == "user":
                         # the user started talking: one brief twitch + pulse
-                        await self._submit_feedback(
-                            build_speech_ack_chor(listen_pose=self._listen_pose)
-                        )
+                        ack = build_speech_ack_chor(listen_pose=self._listen_pose)
+                        if was_speaking:
+                            # A BARGE-IN. Drop every tick still sitting in our
+                            # own queue — anything already on the rabbit cannot
+                            # be recalled (#8), so not lengthening that queue is
+                            # the only lever — and put "listening" above the
+                            # cosmetic priority so it cannot be dropped in turn.
+                            self._controller.interrupt(below=Priority.USER_SPEECH_SYNC)
+                            await self._controller.submit(
+                                ChorCommand(ack), Priority.USER_SPEECH_SYNC
+                            )
+                        else:
+                            await self._submit_feedback(ack)
+                    elif state == "assistant":
+                        await self._submit_speaking_tick(phase)
+                        phase += 1
                     else:
-                        # waiting / the rabbit answering: a STATIC state, so
-                        # nothing outlives the moment it describes
+                        # waiting: a STATIC state, so nothing outlives the
+                        # moment it describes
                         await self._submit_feedback(
                             build_static_leds_chor(ears_pose=self._listen_pose)
                         )
-                # purely event-driven: nothing is emitted until something changes
-                await self._wait_any(stop, speaking.changed, None)
+                elif state == "assistant":
+                    # still talking: the next tick, with the ears reversed
+                    await self._submit_speaking_tick(phase)
+                    phase += 1
+                # Event-driven everywhere EXCEPT while the rabbit speaks, where
+                # the wait is the inter-tick gap — and even then any transition
+                # wakes us immediately, which is what makes a barge-in stop the
+                # animation inside one tick rather than at the next period.
+                period = SPEAKING_TICK_PERIOD_S if state == "assistant" else None
+                await self._wait_any(stop, speaking.changed, period)
         finally:
             # No terminator here: _handle_wake_realtime owns it, and sends it
             # ABOVE the cosmetic priority after dropping whatever is still
             # queued locally. Emitting one here too would just add to the queue
             # we are trying to keep short.
             pass
+
+    @staticmethod
+    def _realtime_ux_state(speaking: _SpeakingState) -> str:
+        """ "user" | "assistant" | "open" — what the body should be showing.
+
+        The user wins: if the VAD hears them while audio is still draining, the
+        rabbit must look like it is listening, not like it is still talking.
+        """
+        if speaking.user_speaking:
+            return "user"
+        if speaking.assistant_speaking:
+            return "assistant"
+        return "open"
+
+    async def _submit_speaking_tick(self, phase: int) -> None:
+        await self._submit_feedback(build_speaking_tick_chor(phase, listen_pose=self._listen_pose))
 
     async def _submit_feedback(self, chor: str) -> None:
         """Cosmetic body feedback: below USER_SPEECH_SYNC so cleanup can drop it,

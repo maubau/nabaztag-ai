@@ -156,6 +156,13 @@ class RealtimeSession:
         self._own_session = session is None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._current_item: str | None = None
+        # The item PLAYBACK is currently accounted against. Deliberately NOT the
+        # same field as _current_item: `response.output_item.added` announces an
+        # item before a single byte of its audio exists, so if the reset keyed
+        # off _current_item, by the time the first delta arrived the ids already
+        # matched and nothing was ever reset — the counter simply kept running
+        # across items (hardware: truncate 13968 ms against an 11250 ms item).
+        self._playback_item: str | None = None
         # The SERVER's generation state. Local playback is tracked by the
         # player itself (has_unplayed_audio) — conflating the two is what
         # silently disabled barge-in.
@@ -378,7 +385,11 @@ class RealtimeSession:
         # (hardware: truncate 13680 ms against an item holding only 10550 ms —
         # the server rejects that outright and then nothing is trimmed at all).
         item_id = event.get("item_id")
-        if item_id and item_id != self._current_item:
+        if item_id and item_id != self._playback_item:
+            # Keyed on the PLAYBACK item, never on _current_item: the latter is
+            # already set by response.output_item.added before any audio exists,
+            # so comparing against it made this branch dead code.
+            self._playback_item = item_id
             self._current_item = item_id
             self._item_audio_ms = 0.0
             # A fresh playback generation per item keeps played_ms measured from
@@ -431,16 +442,16 @@ class RealtimeSession:
             # cancel when nothing else will.
             if not self._server_side_turn_detection:
                 await self._send({"type": "response.cancel"})
-            if self._current_item and played_ms > 0:
+            if self._playback_item and played_ms > 0:
                 await self._send(
                     {
                         "type": "conversation.item.truncate",
-                        "item_id": self._current_item,
+                        "item_id": self._playback_item,
                         "content_index": 0,
                         "audio_end_ms": played_ms,
                     }
                 )
-            elif self._current_item:
+            elif self._playback_item:
                 # Cut before a single frame reached the speaker: there is
                 # nothing to trim, and truncating at 0 only invites an
                 # invalid-value error. The server's own cancel already means

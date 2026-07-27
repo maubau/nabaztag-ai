@@ -5,6 +5,7 @@ not match what was actually heard, the model's transcript diverges from reality
 and every later turn reasons from it.
 """
 
+import asyncio
 import base64
 import json
 
@@ -421,3 +422,112 @@ async def test_truncate_never_exceeds_the_items_own_duration():
     await session._handle({"type": "input_audio_buffer.speech_started"})
     truncate = next(m for m in session._ws.sent if m["type"] == "conversation.item.truncate")
     assert truncate["audio_end_ms"] == 500
+
+
+async def test_output_item_added_does_not_defeat_the_per_item_reset():
+    """`response.output_item.added` announces an item BEFORE any of its audio
+    exists. Keying the reset on that id meant the ids already matched when the
+    first delta arrived, so the counter simply ran on across items — hardware
+    kept logging truncate 13968 ms against an 11250 ms item."""
+    player = FakePlayer(played_ms=99999)
+    session = _session(player)
+    await session._handle(
+        {"type": "response.output_item.added", "item": {"type": "message", "id": "item_1"}}
+    )
+    await session._handle(_audio_event(b"\x01\x00" * 12000, item_id="item_1"))  # 500 ms
+    assert player.resets == 1, "the announced item suppressed the playback reset"
+
+    # a sibling item in the SAME response: announced first, then its audio
+    await session._handle(
+        {"type": "response.output_item.added", "item": {"type": "message", "id": "item_2"}}
+    )
+    await session._handle(_audio_event(b"\x01\x00" * 4800, item_id="item_2"))  # 200 ms
+    assert player.resets == 2
+
+    await session._handle({"type": "input_audio_buffer.speech_started"})
+    truncate = next(m for m in session._ws.sent if m["type"] == "conversation.item.truncate")
+    # scoped to the item whose audio is playing, and capped by ITS duration
+    assert truncate["item_id"] == "item_2"
+    assert truncate["audio_end_ms"] == 200
+
+
+# --- playback lifecycle events (what drives ASSISTANT_SPEAKING) ----------
+
+
+async def _event_player(rate=24000):
+    from rabbit_brain.audio.streaming import StreamingAudioPlayer
+
+    seen: list[str] = []
+    stream = FakeCallbackStream()
+    player = StreamingAudioPlayer(
+        device=None,
+        device_rate=rate,
+        device_channels=1,
+        on_playback_started=lambda: seen.append("started"),
+        on_playback_drained=lambda: seen.append("drained"),
+        on_playback_cut=lambda: seen.append("cut"),
+    )
+
+    def _open():
+        stream.callback = player._callback
+        return stream
+
+    player._open_stream = _open
+    await player.start()
+    return player, stream, seen
+
+
+async def test_playback_events_follow_the_speaker_not_the_server():
+    player, stream, seen = await _event_player()
+    assert seen == []  # nothing queued: the rabbit is not talking
+    player.write(b"\x01\x00" * 100)
+    stream.pump(100)
+    await asyncio.sleep(0)  # events hop through the loop
+    assert seen == ["started"] and player.is_playing
+
+
+async def test_a_gap_between_deltas_does_not_end_the_utterance():
+    """Deltas arrive over the network and an item boundary empties the buffer for
+    a moment: a bare underrun must not flicker the speaking indicator off."""
+    player, stream, seen = await _event_player()
+    player.write(b"\x01\x00" * 100)
+    stream.pump(100)
+    stream.pump(100)  # dry, but only just
+    await asyncio.sleep(0)
+    assert seen == ["started"], "a momentary underrun was mistaken for the end"
+    assert player.is_playing
+
+
+async def test_sustained_silence_reports_the_playback_drained():
+    player, stream, seen = await _event_player()
+    player.write(b"\x01\x00" * 100)
+    stream.pump(100)
+    stream.pump(100)  # runs dry: starts the debounce
+    await asyncio.sleep(0.3)  # longer than the drain window
+    stream.pump(100)
+    await asyncio.sleep(0)
+    assert seen == ["started", "drained"]
+    assert not player.is_playing
+
+
+async def test_stop_reports_a_cut_at_once_not_a_drain():
+    """A barge-in must reach the UX immediately — not when the (already emptied)
+    buffer would eventually have been noticed as dry."""
+    player, stream, seen = await _event_player()
+    player.write(b"\x01\x00" * 500)
+    stream.pump(10)
+    await player.stop()
+    await asyncio.sleep(0)
+    assert seen == ["started", "cut"]
+    assert not player.is_playing
+
+
+async def test_a_new_item_inside_one_reply_is_not_a_drain():
+    player, stream, seen = await _event_player()
+    player.write(b"\x01\x00" * 100)
+    stream.pump(100)
+    player.reset_position()  # next item of the same reply
+    player.write(b"\x02\x00" * 100)
+    stream.pump(100)
+    await asyncio.sleep(0)
+    assert seen == ["started"], "the indicator flapped at an item boundary"

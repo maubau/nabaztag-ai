@@ -41,6 +41,29 @@ LISTENING_COLOR = (255, 0, 255)
 PROCESSING_PULSE_TEMPO_MS = 100
 PROCESSING_PULSE_CYCLE_S = 1.0
 
+# ASSISTANT_SPEAKING indicator: one short "tick" emitted repeatedly, but on the
+# real playback state rather than on a timer, and with a gap between ticks that
+# is longer than a tick — so at most one is ever in flight and the remote queue
+# (which cannot be cancelled, #8) never accumulates.
+# Cyan, deliberately a different hue from LISTENING magenta: at a glance the
+# colour alone says who is talking.
+SPEAKING_COLOR = (0, 170, 255)
+SPEAKING_TICK_TEMPO_MS = 60
+# A mouth opening and closing once: low -> high -> low -> faint. The last level
+# is NOT zero. It leaves a dim glow that carries into the gap before the next
+# tick, so "the rabbit is speaking" stays visible without a second command to
+# hold the state — every extra chor lengthens a queue we cannot recall.
+_SPEAKING_MOUTH_LEVELS = (40, 150, 255, 255, 150, 60, 25)
+SPEAKING_TICK_S = len(_SPEAKING_MOUTH_LEVELS) * SPEAKING_TICK_TEMPO_MS / 1000
+# 1=left, 2=middle(nose), 3=right are the front-facing LEDs and carry the
+# "mouth"; 0=bottom and 4=top only glow along with it, at a lower intensity.
+_SPEAKING_MOUTH_LEDS = (1, 2, 3)
+_SPEAKING_HALO_LEDS = (0, 4)
+_SPEAKING_HALO_RATIO = 0.35
+# How far the ears swing per tick, in 18° steps. Small: this must read as
+# talking, not as the full-range sweep LISTENING uses.
+SPEAKING_EAR_SWING = 4
+
 
 def build_wake_ack_chor(
     side: str | None,
@@ -226,6 +249,55 @@ def build_static_leds_chor(
     if ears_pose is not None:
         for ear in (0, 1):
             parts += ["0", "motor", str(ear), str(ears_pose[ear] * _EAR_STEP_DEG), "0", "1"]
+    return ",".join(parts)
+
+
+def build_speaking_tick_chor(
+    phase: int = 0,
+    listen_pose: tuple[int, int] = (0, 0),
+    color: tuple[int, int, int] = SPEAKING_COLOR,
+    tempo_ms: int = SPEAKING_TICK_TEMPO_MS,
+    move_ears: bool = True,
+) -> str:
+    """ONE ~420 ms "the rabbit is talking" tick: the front LEDs open and close
+    like a mouth while the ears turn in OPPOSITE directions.
+
+    ``phase`` alternates the ear direction: even phases swing outward (left
+    forward, right backward), odd phases bring both back the other way. Calling
+    this with an incrementing phase produces continuous counter-rotation, but as
+    a series of independent short commands — never one long choreography.
+
+    That distinction is the whole design (OJN_API_NOTES #8): a long chor cannot
+    be cut short when the user barges in, and a timer-driven one queues on the
+    rabbit faster than it drains. A short tick, re-emitted only while playback
+    is REALLY running, bounds the worst-case residue after a cut to the length
+    of a single tick.
+    """
+    r, g, b = color
+    parts = [str(tempo_ms)]
+    for t, level in enumerate(_SPEAKING_MOUTH_LEVELS):
+        halo = round(level * _SPEAKING_HALO_RATIO)
+        for leds, lvl in ((_SPEAKING_MOUTH_LEDS, level), (_SPEAKING_HALO_LEDS, halo)):
+            for led in leds:
+                parts += [
+                    str(t),
+                    "led",
+                    str(led),
+                    str(round(r * lvl / 255)),
+                    str(round(g * lvl / 255)),
+                    str(round(b * lvl / 255)),
+                ]
+    if not move_ears:
+        return ",".join(parts)
+
+    outward = phase % 2 == 0
+    for ear in (0, 1):
+        rest = max(0, min(16, listen_pose[ear]))
+        target = min(16, rest + SPEAKING_EAR_SWING) if outward else rest
+        # Opposite direction flags on the two ears is what makes the motion read
+        # as counter-rotating; flipping them with the phase reverses it.
+        direction = ("0", "1")[ear] if outward else ("1", "0")[ear]
+        parts += ["0", "motor", str(ear), str(target * _EAR_STEP_DEG), "0", direction]
     return ",".join(parts)
 
 

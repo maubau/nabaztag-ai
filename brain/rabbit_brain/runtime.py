@@ -201,7 +201,16 @@ def _make_realtime_factory(rt_cfg: dict, audio_cfg: dict, out_cfg: dict, instruc
             sample_rate=out_cfg.get("sample_rate"),
             channels=out_cfg.get("channels"),
         )._resolve()
-        player = StreamingAudioPlayer(device, rate, channels)
+        # The speaking indicator follows the SPEAKER, not the server: the model
+        # finishes generating long before the rabbit finishes talking.
+        player = StreamingAudioPlayer(
+            device,
+            rate,
+            channels,
+            on_playback_started=state.on_playback_started,
+            on_playback_drained=state.on_playback_drained,
+            on_playback_cut=state.on_playback_cut,
+        )
         await player.start()
         session = RealtimeSession(
             api_key=os.environ["OPENAI_API_KEY"],

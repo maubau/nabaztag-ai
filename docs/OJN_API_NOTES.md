@@ -120,6 +120,16 @@ Hardware half — status on the real rabbit:
    - The turn-based LISTENING/PROCESSING indicators still resubmit per cycle; their states are
      short (bounded by one utterance) so the backlog stays small, but the same rule applies if
      either is ever used for a long-lived state.
+   - **ASSISTANT_SPEAKING is the one repeating realtime indicator, and it is bounded by
+     construction.** A reply lasts seconds and a motionless body reads as broken, so
+     `build_speaking_tick_chor` emits a ~0.42 s "tick" (mouth-like front LEDs, counter-rotating
+     ears, direction reversed each phase) every `SPEAKING_TICK_PERIOD_S` = 0.9 s. The gap is
+     longer than the tick, so at most one is ever in flight and nothing accumulates; the tick
+     ends DIM rather than off, so the state stays visible between ticks without a second command
+     to hold it. Crucially the trigger is the PLAYER, not the server: `assistant_speaking`
+     follows `playback_started`/`playback_drained`/`playback_cut` from `StreamingAudioPlayer`,
+     because `response.done` arrives while seconds of PCM are still queued. Worst-case residue
+     after a barge-in is therefore one tick, not a backlog.
 9. **Deepgram bilingual it/en via `language: multi` + `endpointing: 100` (July 2026).** The
    desired behavior is automatic it/en code-switching (an "English" transcript was in fact
    an English phrase, not a misdetection). Keep `language: multi`; add `endpointing: 100`

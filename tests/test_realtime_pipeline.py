@@ -451,3 +451,199 @@ async def test_frames_keep_being_consumed_after_a_hangup():
     pipeline, _, _ = _pipeline(factory, wake=OnceWake())
     await _run_briefly(pipeline, seconds=0.4)
     assert consumed_after, "the pipeline stopped consuming the microphone"
+
+
+# --- ASSISTANT_SPEAKING: the body must show that the rabbit is talking -----
+
+
+def _speaking_ticks(controller):
+    from rabbit_brain.body.chor import SPEAKING_TICK_TEMPO_MS
+
+    prefix = f"{SPEAKING_TICK_TEMPO_MS},"
+    return [c for c in controller.submitted if str(c[0]).startswith(prefix)]
+
+
+async def test_assistant_speaking_animates_for_as_long_as_playback_runs():
+    """A reply lasts seconds; a body that sits still through all of it reads as
+    broken. The animation is driven by the PLAYER, not by the server: the model
+    finishes generating long before the rabbit finishes talking."""
+    release = asyncio.Event()
+
+    async def factory(state):
+        session = ScriptedSession(FakePlayer(), state)
+
+        async def pump(frames, stop=None, should_continue=None, idle_timeout_s=None):
+            state.on_response_start()
+            state.on_playback_started()
+            await release.wait()
+            return "idle"
+
+        session.pump_microphone = pump
+        return session
+
+    pipeline, _, controller = _pipeline(factory)
+    from rabbit_brain.audio import pipeline as pipeline_mod
+
+    pipeline_mod.SPEAKING_TICK_PERIOD_S = 0.02  # keep the test quick
+    task = asyncio.create_task(pipeline.run())
+    await asyncio.sleep(0.2)
+    ticks = len(_speaking_ticks(controller))
+    assert ticks >= 2, "the rabbit stood still while it was speaking"
+    release.set()
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    pipeline_mod.SPEAKING_TICK_PERIOD_S = 0.9
+
+
+async def test_speaking_stops_at_the_drain_and_never_on_response_done():
+    """`response.done` arrives while seconds of PCM are still queued. Only the
+    player's own drain may end the speaking indicator."""
+    from rabbit_brain.audio.pipeline import VoicePipeline as _VP
+
+    state = _make_state()
+    state.on_response_start()
+    assert _VP._realtime_ux_state(state) == "open"  # generating != talking
+    state.on_playback_started()
+    assert _VP._realtime_ux_state(state) == "assistant"
+    state.on_playback_drained()
+    assert _VP._realtime_ux_state(state) == "open"
+
+
+def _make_state():
+    from rabbit_brain.audio.pipeline import _SpeakingState
+
+    return _SpeakingState()
+
+
+async def test_barge_in_stops_the_ticks_and_puts_listening_above_them():
+    """Worst case after a cut must be ONE tick already on the wire, not a
+    backlog: the scheduler stops on the same event, whatever is still local is
+    dropped, and 'listening' goes out above the cosmetic priority."""
+    from rabbit_brain.body.chor import build_speech_ack_chor
+    from rabbit_brain.body.types import Priority
+
+    async def factory(state):
+        session = ScriptedSession(FakePlayer(), state)
+
+        async def pump(frames, stop=None, should_continue=None, idle_timeout_s=None):
+            state.on_response_start()
+            state.on_playback_started()
+            await asyncio.sleep(0.1)  # the rabbit is talking
+            state.on_barge_in()  # the user cuts in
+            state.on_playback_cut()
+            await asyncio.sleep(0.15)
+            return "hangup"
+
+        session.pump_microphone = pump
+        return session
+
+    pipeline, _, controller = _pipeline(factory)
+    from rabbit_brain.audio import pipeline as pipeline_mod
+
+    pipeline_mod.SPEAKING_TICK_PERIOD_S = 0.02
+    try:
+        await _run_briefly(pipeline, seconds=0.5)
+    finally:
+        pipeline_mod.SPEAKING_TICK_PERIOD_S = 0.9
+
+    order = [chor for chor, _ in controller.submitted]
+    ack_index = next(
+        i for i, chor in enumerate(order) if chor == build_speech_ack_chor(listen_pose=(0, 0))
+    )
+    from rabbit_brain.body.chor import SPEAKING_TICK_TEMPO_MS
+
+    prefix = f"{SPEAKING_TICK_TEMPO_MS},"
+    assert any(c.startswith(prefix) for c in order[:ack_index]), "no speaking animation at all"
+    assert not any(c.startswith(prefix) for c in order[ack_index:]), (
+        "a speaking tick was queued AFTER the barge-in"
+    )
+    assert Priority.USER_SPEECH_SYNC in controller.dropped_below
+    assert (build_speech_ack_chor(listen_pose=(0, 0)), Priority.USER_SPEECH_SYNC) in (
+        controller.submitted
+    )
+
+
+async def test_hangup_leaves_no_speaking_command_after_the_terminator():
+    from rabbit_brain.body.chor import SPEAKING_TICK_TEMPO_MS
+    from rabbit_brain.body.types import Priority
+
+    async def factory(state):
+        session = ScriptedSession(FakePlayer(), state)
+
+        async def pump(frames, stop=None, should_continue=None, idle_timeout_s=None):
+            state.on_playback_started()
+            await asyncio.sleep(0.1)
+            state.on_playback_drained()
+            return "hangup"
+
+        session.pump_microphone = pump
+        return session
+
+    pipeline, _, controller = _pipeline(factory)
+    from rabbit_brain.audio import pipeline as pipeline_mod
+
+    pipeline_mod.SPEAKING_TICK_PERIOD_S = 0.02
+    try:
+        await _run_briefly(pipeline, seconds=0.5)
+    finally:
+        pipeline_mod.SPEAKING_TICK_PERIOD_S = 0.9
+
+    last_chor, last_priority = controller.submitted[-1]
+    assert "led,0,0,0,0" in last_chor and last_priority == Priority.USER_SPEECH_SYNC
+    assert not last_chor.startswith(f"{SPEAKING_TICK_TEMPO_MS},")
+
+
+# --- the tick itself ------------------------------------------------------
+
+
+def test_speaking_tick_is_short_and_reverses_the_ears_each_phase():
+    from rabbit_brain.body.chor import (
+        SPEAKING_EAR_SWING,
+        SPEAKING_TICK_S,
+        build_speaking_tick_chor,
+    )
+
+    assert SPEAKING_TICK_S < 0.6, "a tick must be short enough to be cut cleanly"
+    even = build_speaking_tick_chor(0, listen_pose=(0, 0)).split(",")
+    odd = build_speaking_tick_chor(1, listen_pose=(0, 0)).split(",")
+
+    even_motors = _motor_actions(even)
+    odd_motors = _motor_actions(odd)
+    assert len(even_motors) == 2 and len(odd_motors) == 2
+    # the two ears always turn in OPPOSITE directions...
+    assert even_motors[0]["dir"] != even_motors[1]["dir"]
+    assert odd_motors[0]["dir"] != odd_motors[1]["dir"]
+    # ...and the next tick reverses them
+    assert even_motors[0]["dir"] != odd_motors[0]["dir"]
+    # even phases swing out, odd phases come back
+    assert even_motors[0]["angle"] == SPEAKING_EAR_SWING * 18
+    assert odd_motors[0]["angle"] == 0
+
+
+def _motor_actions(parts):
+    out = []
+    for i, token in enumerate(parts):
+        if token == "motor":
+            out.append({"ear": int(parts[i + 1]), "angle": int(parts[i + 2]), "dir": parts[i + 4]})
+    return out
+
+
+def test_speaking_tick_drives_the_front_leds_like_a_mouth():
+    """Front/nose brightest, base and top only glowing along — and it ends DIM,
+    not off, so the state stays visible between ticks without a second command
+    to hold it."""
+    from rabbit_brain.body.chor import build_speaking_tick_chor
+
+    parts = build_speaking_tick_chor(0, listen_pose=(0, 0)).split(",")
+    frames = {}
+    for i, token in enumerate(parts):
+        if token == "led":
+            t, led = int(parts[i - 1]), int(parts[i + 1])
+            frames.setdefault(t, {})[led] = tuple(int(x) for x in parts[i + 2 : i + 5])
+    assert all(len(f) == 5 for f in frames.values()), "every LED is addressed in every frame"
+    peak = max(frames, key=lambda t: sum(frames[t][2]))
+    assert sum(frames[peak][2]) > sum(frames[peak][0]), "the nose must lead the base"
+    last = frames[max(frames)]
+    assert 0 < sum(last[2]) < sum(frames[peak][2]), "the tick must end dim, not off or bright"

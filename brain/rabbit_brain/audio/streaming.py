@@ -24,11 +24,13 @@ trivial, and it keeps them testable anywhere.
 from __future__ import annotations
 
 import array
+import asyncio
 import contextlib
 import logging
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +40,11 @@ _INT16_MIN, _INT16_MAX = -32768, 32767
 # barge-in still fires just after the last word, while under-estimating means it
 # silently does nothing — the failure we are fixing.
 _ASSUMED_DEVICE_BUFFER_MS = 250.0
+# Minimum silence before the buffer running dry counts as "the rabbit stopped
+# talking". Deltas arrive over the network and an item boundary empties the
+# buffer for a moment, so a bare underrun is not the end of the reply; without
+# this debounce the speaking indicator would flicker off and on mid-sentence.
+_DRAIN_DEBOUNCE_S = 0.25
 # Ceiling on the remaining awaitable teardown steps (the WebSocket close). The
 # player itself no longer needs one — with the callback design there is no
 # Python thread that can block — but nothing in the cleanup path may hold the
@@ -145,6 +152,9 @@ class StreamingAudioPlayer:
         device_rate: int,
         device_channels: int,
         source_rate: int = 24000,
+        on_playback_started: Callable[[], None] | None = None,
+        on_playback_drained: Callable[[], None] | None = None,
+        on_playback_cut: Callable[[], None] | None = None,
     ):
         self._device = device
         self._rate = device_rate
@@ -163,6 +173,67 @@ class StreamingAudioPlayer:
         self._last_consumed_at: float | None = None
         self._latency_s = 0.0  # read once at open, never re-queried
         self.backend_broken = False
+        # Playback lifecycle, for the UX layer. `assistant_speaking` must follow
+        # the SPEAKER, not the server: `response.done` arrives while seconds of
+        # PCM are still queued here, so anything driven by the server's state
+        # would stop animating while the rabbit is visibly still talking.
+        self._on_started = on_playback_started
+        self._on_drained = on_playback_drained
+        self._on_cut = on_playback_cut
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._playing = False
+        self._dry_since: float | None = None
+
+    # --- playback lifecycle events ----------------------------------------
+
+    def _emit(self, callback: Callable[[], None] | None) -> None:
+        """Hand an event to the asyncio loop. Called from PortAudio's own
+        thread, so it must never touch loop state directly — and it must never
+        raise: an exception here would propagate into the audio callback and
+        take the stream down over a cosmetic notification."""
+        if callback is None:
+            return
+        loop = self._loop
+        try:
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(callback)
+            else:
+                callback()
+        except Exception:  # pragma: no cover - defensive
+            log.debug("playback event callback failed", exc_info=True)
+
+    def _note_fill(self, filled: int, wanted: int, now: float) -> tuple[bool, bool]:
+        """Update the playing/dry state from one callback block.
+
+        Returns (started, drained) so the caller can emit OUTSIDE the lock.
+        """
+        started = drained = False
+        if filled:
+            self._dry_since = None
+            if not self._playing:
+                self._playing = True
+                started = True
+        if filled < wanted:
+            # The buffer ran out mid-block. That alone means nothing — the next
+            # delta may be milliseconds away — so only a sustained gap ends the
+            # utterance.
+            if self._dry_since is None:
+                self._dry_since = now
+            elif self._playing and (now - self._dry_since) >= self._drain_window_s:
+                self._playing = False
+                self._dry_since = None
+                drained = True
+        return started, drained
+
+    @property
+    def _drain_window_s(self) -> float:
+        return max(self._latency_s, _DRAIN_DEBOUNCE_S)
+
+    @property
+    def is_playing(self) -> bool:
+        """True between playback_started and playback_drained/cut."""
+        with self._lock:
+            return self._playing
 
     # --- lifecycle -------------------------------------------------------
 
@@ -178,6 +249,8 @@ class StreamingAudioPlayer:
         )
 
     async def start(self) -> None:
+        with contextlib.suppress(RuntimeError):
+            self._loop = asyncio.get_running_loop()
         self._stream = self._open_stream()
         self._stream.start()
         # Read the latency ONCE, while the stream is healthy: querying it later
@@ -194,6 +267,11 @@ class StreamingAudioPlayer:
         with self._lock:
             self._generation += 1
             self._pending.clear()
+            was_playing = self._playing
+            self._playing = False
+            self._dry_since = None
+        if was_playing:
+            self._emit(self._on_cut)
         stream, self._stream = self._stream, None
         if stream is None:
             return
@@ -229,11 +307,19 @@ class StreamingAudioPlayer:
                     self._pending.popleft()
                 else:
                     self._pending[0] = (gen, buf, offset + take)
+            now = time.monotonic()
             if filled:
                 self._consumed_frames += filled // self._frame_bytes
-                self._last_consumed_at = time.monotonic()
+                self._last_consumed_at = now
+            started, drained = self._note_fill(filled, wanted, now)
         if filled < wanted:
             out[filled:wanted] = b"\x00" * (wanted - filled)
+        # Outside the lock: these hop to the asyncio loop and must not hold up
+        # the next block of audio.
+        if started:
+            self._emit(self._on_started)
+        if drained:
+            self._emit(self._on_drained)
 
     def write(self, pcm: bytes) -> None:
         """Queue a PCM delta for immediate playback (never blocks: the model
@@ -292,6 +378,11 @@ class StreamingAudioPlayer:
             self._pending.clear()
             self._consumed_frames = 0
             self._last_consumed_at = None
+            # Deliberately NOT touching _playing: a new item inside the same
+            # reply is not the rabbit falling silent, and flapping the speaking
+            # indicator at every item boundary is exactly what the debounce in
+            # _note_fill exists to prevent.
+            self._dry_since = None
         self._resampler = Resampler(self._source_rate, self._rate)
 
     async def stop(self) -> None:
@@ -310,11 +401,18 @@ class StreamingAudioPlayer:
             # is still on its way to the room — say so at once, or the very
             # next barge-in check would think the rabbit is still talking.
             self._last_consumed_at = None
+            was_playing = self._playing
+            self._playing = False
+            self._dry_since = None
         log.info(
             "playback drain: cut after %d ms played, %d queued chunks discarded",
             int(played),
             discarded,
         )
+        if was_playing:
+            # The UX layer must react to a barge-in NOW, not when the (already
+            # emptied) buffer would have been noticed as dry.
+            self._emit(self._on_cut)
 
     async def resume(self) -> None:
         """Nothing to re-open: the stream was never torn down. Kept so the
