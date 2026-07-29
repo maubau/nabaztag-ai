@@ -8,7 +8,9 @@
 
 ## What & why
 
-In 2006 the Nabaztag:tag was the first consumer connected device — a Wi-Fi rabbit that read the news and wiggled its ears. Twenty years later, this project revives a **stock, unopened** Nabaztag:tag as the body of a modern AI assistant: wake word → speech-to-text → Claude with tool use → text-to-speech, played through the rabbit's own speaker, with the LLM deciding ear positions and LED moods itself.
+In 2006 the Nabaztag:tag was the first consumer connected device — a Wi-Fi rabbit that read the news and wiggled its ears. Twenty years later, this project revives a **stock, unopened** Nabaztag:tag as the body of a modern AI assistant: wake word → speech-to-text → an LLM with tool use → text-to-speech, played through the rabbit's own speaker, with the LLM deciding ear positions and LED moods itself.
+
+There is also a **full-duplex mode**: the wake word opens a continuous conversation and you can talk over the rabbit mid-sentence. That needs playback which can be cancelled — the 2006 decoder cannot be — so it routes audio through the reSpeaker instead, whose on-chip echo cancellation was measured before being relied on. The rabbit keeps the ears and the lights.
 
 The rabbit stays 100% original. It talks to a self-hosted [OpenJabNab](https://github.com/OpenJabNab/OpenJabNab) server; modern audio input comes from an external reSpeaker 4-mic array; the brain runs on a UDOO Bolt — a board co-created by the project's owner, closing a personal 20-year loop between the first connected device and modern edge AI.
 
@@ -62,7 +64,7 @@ One persistent process owns the whole conversation loop (one BodyController, one
 python -m rabbit_brain.runtime --config config.yaml
 ```
 
-Pipeline: reSpeaker → openWakeWord → **Deepgram Flux** (recognition *and* end-of-turn detection in one pass, `stt_profile: flux`) → **OpenAI Responses** → TTS (Deepgram Aura by default, voice routed by the STT-detected language; ElevenLabs/Piper as alternatives) → local MP3 → OpenJabNab → Nabaztag speaker. `stt_profile: cloud` switches back to nova-3 + a local silero VAD window, which is what Flux replaces. The runtime loads `.env` automatically (shell environment wins; `--env-file ''` disables). Needs `OPENAI_API_KEY`, `DEEPGRAM_API_KEY` and the OJN vars in `.env` (values never logged). **Do not run the runtime and the MCP server at the same time** — both bind :8090/:8091 and each would create its own BodyController. Pick one per session.
+Pipeline: reSpeaker → openWakeWord → **Deepgram Flux** (recognition *and* end-of-turn detection in one pass, `stt_profile: flux`) → **OpenAI Responses** (`gpt-5.4-mini`) → **Piper** (self-hosted, `it_IT-paola-medium` / `en_GB-alba-medium`, voice routed by the STT-detected language; Deepgram Aura as automatic fallback) → local MP3 → OpenJabNab → Nabaztag speaker. Set `conversation.mode: realtime` (with `audio_out.backend: local`) for the full-duplex path instead. `stt_profile: cloud` switches back to nova-3 + a local silero VAD window, which is what Flux replaces. The runtime loads `.env` automatically (shell environment wins; `--env-file ''` disables). Needs `OPENAI_API_KEY`, `DEEPGRAM_API_KEY` and the OJN vars in `.env` (values never logged). **Do not run the runtime and the MCP server at the same time** — both bind :8090/:8091 and each would create its own BodyController. Pick one per session.
 
 Rabbit-facing MP3 delivery goes through **Apache**, not the built-in server: the MTL decoder ignores aiohttp-served audio (hardware finding). Install the alias once (`ojn/apache/brain-audio.conf.example`) and set `NABAZTAG_MP3_SERVE_HTTP=0` + `NABAZTAG_MP3_BASE_URL=http://192.168.66.1/brain-audio` in `.env`. A plain `chmod` on the audio dir is **not** enough (403: www-data can't traverse your home directory) — the conf example includes the `setfacl` commands that hardware-confirmed fix it.
 
