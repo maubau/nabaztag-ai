@@ -48,7 +48,7 @@ from rabbit_brain.body.ojn_adapter import OjnAdapter
 from rabbit_brain.tts import Speaker, build_speech_stack
 
 # Named choreographies for play_choreography(); VAPI chor strings
-# (format: docs/OJN_API_NOTES.md §2). Tune on camera, like moods.yaml.
+# (format: docs/OJN_API_NOTES.md §2). Tune freely, like moods.yaml.
 CHOREOGRAPHIES = {
     "greet": "10,0,motor,0,0,0,0,0,motor,1,0,0,0,30,motor,0,180,0,0,30,motor,1,180,0,0",
     "party": "10,0,led,0,255,0,0,20,led,2,0,255,0,40,led,4,0,0,255,60,led,2,255,0,255",

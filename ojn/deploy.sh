@@ -6,7 +6,7 @@
 #   ./ojn/deploy.sh verify  # Gate S0 checks
 #
 # Reads from .env (repo root): AP_IFACE, LEGACY_AP_PASSPHRASE, RABBIT_MAC.
-# Hardware steps (booting/configuring the rabbit) are Maurizio's;
+# Hardware steps (booting/configuring the rabbit) are manual;
 # everything scriptable lives here so the setup is reproducible from the repo.
 
 set -euo pipefail

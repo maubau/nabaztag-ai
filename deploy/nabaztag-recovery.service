@@ -22,9 +22,9 @@ Wants=hostapd.service
 [Service]
 Type=simple
 # Reads RABBIT_MAC / AP_IFACE (and optional RABBIT_IP, thresholds) from .env.
-EnvironmentFile=/home/maurizio/nabaztag-ai/.env
-WorkingDirectory=/home/maurizio/nabaztag-ai
-ExecStart=/usr/bin/python3 /home/maurizio/nabaztag-ai/deploy/rabbit_recovery.py --interval 60
+EnvironmentFile=/home/<user>/nabaztag-ai/.env
+WorkingDirectory=/home/<user>/nabaztag-ai
+ExecStart=/usr/bin/python3 /home/<user>/nabaztag-ai/deploy/rabbit_recovery.py --interval 60
 Restart=always
 RestartSec=10
 

@@ -4,7 +4,7 @@
 rfid_intents:
   "00:00:00:00:00:00:00:01":
     intent: atlas_news
-    description: "Physical AI Atlas card → fetch RSS/JSON, summarize via Claude, speak"
+    description: "Physical AI Atlas card → fetch RSS/JSON, summarize, speak"
   "00:00:00:00:00:00:00:02":
     intent: weather_today
     description: "Weather card → speak today's forecast"

@@ -52,7 +52,7 @@ Bolt). Put the env vars in the Bolt's `~/nabaztag-ai/.env` and use:
     "nabaztag": {
       "command": "ssh",
       "args": [
-        "-T", "maurizio@udoo-bolt",
+        "-T", "<user>@<bolt-host>",
         "cd ~/nabaztag-ai && set -a && . ./.env && exec .venv/bin/nabaztag-mcp"
       ]
     }

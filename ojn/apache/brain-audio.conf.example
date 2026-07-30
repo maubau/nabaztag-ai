@@ -7,7 +7,7 @@
 # storage/retention (NABAZTAG_MP3_SERVE_HTTP=0).
 #
 # Install on the Bolt (adjust the repo path):
-#   sudo sed 's#__REPO_DIR__#/home/maurizio/nabaztag-ai#' \
+#   sudo sed 's#__REPO_DIR__#/home/<user>/nabaztag-ai#' \
 #       ojn/apache/brain-audio.conf.example | \
 #       sudo tee /etc/apache2/conf-available/brain-audio.conf
 #   sudo a2enconf brain-audio && sudo systemctl reload apache2

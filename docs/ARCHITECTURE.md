@@ -17,9 +17,9 @@
 
 ## 1\. Problem Statement & Concept
 
-Revive a stock 2006 Nabaztag:tag as the body of a modern AI assistant **without opening it or replacing its electronics**. The rabbit remains 100% original — output only (speech, LEDs, ears, plus RFID/button as input events) via the OpenJabNab community server. Modern audio input comes from an external reSpeaker 4-mic array. The brain (STT → LLM with tool use → TTS) runs on a UDOO Bolt, a board co-created by the owner — closing a personal 20-year loop between the first consumer connected device and modern edge AI.
+Revive a stock 2006 Nabaztag:tag as the body of a modern AI assistant **without opening it or replacing its electronics**. The rabbit remains 100% original — output only (speech, LEDs, ears, plus RFID/button as input events) via the OpenJabNab community server. Modern audio input comes from an external reSpeaker 4-mic array. The brain (STT → LLM with tool use → TTS) runs on a UDOO Bolt — any Linux PC or SBC of comparable capability would do — closing a 20-year loop between the first consumer connected device and modern edge AI.
 
-Deliverables: working system, public repo, YouTube video, and a comparison protocol vs Reachy Mini (same brain, different body).
+Deliverables: a working system, a public repo, and a comparison protocol vs Reachy Mini (same brain, different body).
 
 ## 2\. Goals
 
@@ -168,13 +168,13 @@ Only if native \+ raw frames prove insufficient or too awkward to sequence do we
 4. **STT — three profiles behind the `STTProvider` interface, selected in `config.yaml`:**  
    - `flux` (**production**): **Deepgram Flux**, which does recognition *and* end-of-turn detection in one pass, replacing the client-side silence window entirely. Providers advertise `detects_end_of_turn` and the pipeline branches on it, so the two endpointing styles are not tangled together. `EagerEndOfTurn` is recorded for diagnostics but **never acted on** — no speculative dispatch.  
    - `cloud`: nova-3 (`deepgram.model`, swappable without code changes) \+ the local Silero window. Kept as the fallback profile, not deleted.  
-   - `local`: faster-whisper (CTranslate2) on Bolt CPU, `small` or `medium` int8, RTF logged for the video's local-vs-cloud segment.  
+   - `local`: faster-whisper (CTranslate2) on Bolt CPU, `small` or `medium` int8, with the real-time factor logged for the local-vs-cloud comparison.  
    - **`language: multi` is deliberate.** Automatic it/en code-switching is the desired behaviour, not a misdetection to be fixed: a transcript that came back "English" was in fact an English phrase.  
 5. **Agent loop:** LLM behind a provider-neutral `LLMProvider` interface (`llm/base.py`). **OpenAI is the active provider** (Responses API, streaming \+ function calling; model configurable via `llm.model`, never hardcoded) — the earlier "Claude API" wording was a leftover from v1.0; the interface is what keeps the choice swappable. Production is **`gpt-5.4-mini` \+ `reasoning_effort: low`**, picked by A/B (`brain/scripts/llm-bench.py`). **Decide on `final_text`, not on first token:** TTS cannot start until the text is complete, so a faster first token buys nothing here. Rolling history (`llm.max_history_turns`), personality prompt (`prompts/system.md`), tool rounds capped (`llm.max_tool_rounds`). `OPENAI_API_KEY` comes only from the environment and is never logged.  
 6. **TTS: self-hosted Piper (production), Deepgram Aura as automatic fallback.** Italian `it_IT-paola-medium` at `length_scale` **1.25** and English `en_GB-alba-medium` at **1.0**, chosen by listening *through the rabbit* per language — the only test that counts on a small speaker and an ancient decoder. Voice is routed by **the STT's own detected language**, never by text heuristics. Piper runs as a persistent HTTP server per language; the engine is GPL-3.0 and stays an external localhost process, with no code vendored. Alba is CC BY 4.0: **attribution is required** (Alba dataset, University of Edinburgh). Output is a complete MP3 in `www/audio/`, served by Apache (§5); long replies may be split into sentence-level files queued sequentially.  
 7. **Half-duplex gate:** mic pipeline pauses from the OJN play command until estimated playback end (+300 ms guard), keyed on `BodyController.audio_busy` so queued-but-not-yet-started audio counts too. Capture is **drained, not paused**, during processing — an unread queue starves the pipeline.  
 8. **DoA behavior:** on wake word, read DoA angle → map to an ear gesture "turning toward the speaker" before the listening pose. **Choreography-only, never `posleft`/`posright`** — that path makes the firmware play a long carillon (`OJN_API_NOTES` #7). DoA reads are time-bounded so a USB stall cannot freeze the feedback, and fail open.  
-9. **Event handlers:** RFID tag ID → named intents (`intents.yaml`), e.g. atlas card → fetch Physical AI Atlas RSS/JSON → summarize → speak. *(Next phase — see §8.)*  
+9. **Event handlers:** RFID tag ID → named intents (`intents.yaml`), e.g. an Atlas card → fetch the Physical AI Atlas RSS/JSON → summarize → speak. *(Next phase — see §8.)*  
 10. **Realtime mode (`conversation.mode: realtime`) — full-duplex, the v2.3 addition.** One WebSocket (OpenAI Realtime) carries audio both ways: the wake word opens a **continuous conversation** that is not re-armed per turn, and the user can talk over the rabbit. **Requires `audio_out.backend: local`**, and the runtime refuses the combination on the rabbit backend rather than half-supporting it. On `speech_started` the local stream is cut and `conversation.item.truncate` reports how much was *actually heard* — get that wrong and the model's transcript keeps words the user never heard, and every later turn reasons from fiction. **What it costs:** the model generates its own voice, so Paola/Alba are not used — which is exactly why this is a mode, not a replacement. Any WebSocket/API failure re-arms `turn_based` in place, without restarting the service.
 11. **Latency: accepted and CLOSED for v1.** The wake→first-audio budget is met and the residual variability is LLM-dominated. Explicitly not to be built — speculative/anticipatory TTS, progressive MP3 (hardware-rejected, §3), further LLM benchmarking. Re-open only if a hardware or firmware assumption changes.
 
@@ -295,7 +295,7 @@ nabaztag-ai/
 
 ├── mcp/
 
-├── demos/                \# scripted video scenarios incl. RFID \+ DoA tricks
+├── demos/                \# scripted demo scenarios incl. RFID \+ DoA
 
 ├── config.example.yaml   \# committed. stt\_profile, tts\_profile, conversation.mode,
 
@@ -303,7 +303,7 @@ nabaztag-ai/
 
 ├── intents.example.yaml  \# committed: placeholder RFID tag IDs → intent mapping
 
-├── moods.yaml            \# committed: mood → LED/ear mapping (no secrets, tweakable on camera)
+├── moods.yaml            \# committed: mood → LED/ear mapping (no secrets, tweakable at runtime)
 
 └── .env.example          \# committed. OPENAI\_API\_KEY, DEEPGRAM\_API\_KEY, PIPER\_URL\_IT/\_EN,
 
@@ -332,7 +332,7 @@ nabaztag-ai/
 
 **Phase 2 — Voice pipeline:** reSpeaker capture, wake word, VAD, STT profiles, TTS→MP3→OJN playback, half-duplex gate. ✅ Full it/en conversation; p50 wake→first-audio within the budget set by Phase 0's measured OJN latency (target ≤ 4.0 s) over 20 runs; `stt_profile: local` works end-to-end with measured RTF logged. **Status: PASSED (July 2026)**, then superseded in its details by the latency campaign (§6.2.4, §6.2.11).
 
-**Phase 3 — Embodiment \+ DoA \+ RFID:** tools in agent loop (all body output via `BodyController`), DoA ear-turn reflex on wake, RFID intents. ✅ ≥ 8/10 varied prompts show spontaneous plausible body language; rabbit visibly orients ears toward speaker positioned 90° off-axis; Atlas RFID card triggers spoken news summary; DoA reflex and agent expression never fight (controller priority verified). **Status: agent loop, embodiment and DoA PASSED; RFID intents still open** (Maurizio has no physical tag yet — the egress path itself is confirmed for clicks).
+**Phase 3 — Embodiment \+ DoA \+ RFID:** tools in agent loop (all body output via `BodyController`), DoA ear-turn reflex on wake, RFID intents. ✅ ≥ 8/10 varied prompts show spontaneous plausible body language; rabbit visibly orients ears toward speaker positioned 90° off-axis; the Atlas RFID card triggers a spoken news summary; DoA reflex and agent expression never fight (controller priority verified). **Status: agent loop, embodiment and DoA PASSED; RFID intents still open** (no physical RFID tag available yet — the egress path itself is confirmed for clicks).
 
 **Phase 3.5 — Full-duplex realtime \+ runtime hardening (added in v2.3).** `conversation.mode`, switchable audio output, AEC verification, systemd \+ boot, hostapd recovery. ✅ **PASSED on hardware (July 2026):** wake opens a continuous conversation, the user can interrupt mid-sentence, the body animates for as long as the reply is actually playing, cleanup leaves no residue, and a second session works after the first. **Closed; no further cosmetic optimisation for now.**
 
@@ -358,7 +358,7 @@ nabaztag-ai/
 
 > Kept verbatim as a record of how the project was started; it is **not** current instructions. The bootstrap it describes is done, Gate G0 answered its central question (no choreography plugin), and §6/§8 above describe what actually exists. Its one instruction that aged well is worth carrying forward: *do not assume any OJN endpoint exists* — nearly every hardware round in `OJN_API_NOTES` began with an assumption that turned out to be wrong.
 
-Read docs/ARCHITECTURE.md. First execute §11.4 (open-source repo bootstrap), including `ojn/network/` with the `hostapd`/`dnsmasq`/firewall example configs from §4.1 (passphrases come from `.env`, never committed) and a `deploy.sh` that provisions the legacy AP and OJN on the Bolt. Note that Gate S0 (rabbit on the network) and the hardware half of Phase 0 are Maurizio's to run — your job is to make them scriptable and reproducible.
+Read docs/ARCHITECTURE.md. First execute §11.4 (open-source repo bootstrap), including `ojn/network/` with the `hostapd`/`dnsmasq`/firewall example configs from §4.1 (passphrases come from `.env`, never committed) and a `deploy.sh` that provisions the legacy AP and OJN on the Bolt. Note that Gate S0 (rabbit on the network) and the hardware half of Phase 0 are manual steps run by whoever has the hardware — the job here is to make them scriptable and reproducible.
 
 **Do not assume any OJN endpoint exists.** Before writing the adapter, clone and study the OpenJabNab repo (github.com/OpenJabNab/OpenJabNab): find the *actual* API surface (the real path for TTS, MP3-by-URL, ear/LED control, the `packet/sendMessage` raw-frame endpoint, and how events are exposed). Record exactly what exists, with real paths and payloads, in `docs/OJN_API_NOTES.md`. This is the software half of the Phase 0 feasibility gate; together with the hardware probing it produces the capability matrix (Gate G0) that decides whether the choreography plugin is needed.
 
@@ -366,7 +366,7 @@ Then implement Phase 1 against the *verified* surface: `brain/rabbit_brain/body/
 
 ## 11\. Open Source Release
 
-This project is public on GitHub **from the first commit** (building-in-public: each completed phase is content for LinkedIn/YouTube).
+This project has been public on GitHub **from the first commit**, so the repo has to be correct in the open at every step rather than tidied up before a release.
 
 ### 11.1 Licensing structure
 
@@ -377,20 +377,20 @@ This project is public on GitHub **from the first commit** (building-in-public: 
 - README must state the dual-license layout explicitly.  
 - Trademark note in README: "Nabaztag is a trademark of its respective owner; this is an independent community project, not affiliated with Violet/Aldebaran."
 
-### 11.2 Repo naming & discoverability
+### 11.2 Repo naming
 
 - Repo name: `nabaztag-ai`. `rabbit-brain` remains the name of the brain component/package inside the repo regardless.  
-- GitHub **topics** (these drive discovery more than the name): `physical-ai`, `robotics`, `embodied-ai`, `nabaztag`, `voice-assistant`, `llm`, `claude`, `mcp`, `iot`, `retro-tech`.  
-- Repo description (≤ 120 chars, keyword-dense): "AI brain for the original Nabaztag rabbit — LLM tool-use embodiment, voice pipeline, MCP server. Physical AI, 2006 edition."
+- GitHub topics: `physical-ai`, `robotics`, `embodied-ai`, `nabaztag`, `voice-assistant`, `llm`, `claude`, `mcp`, `iot`, `retro-tech`.  
+- Repo description: "AI brain for the original Nabaztag rabbit — LLM tool-use embodiment, voice pipeline, MCP server. Physical AI, 2006 edition."
 
 ### 11.3 Repo hygiene (non-negotiable, from commit \#1)
 
 - `.gitignore`: `.env`, `config.yaml` (ship `config.example.yaml`), `intents.yaml` (ship `intents.example.yaml`; real file holds RFID UIDs), `www/audio/`, model weights, `*.mp3`.  
 - **Secrets:** pre-commit hook with `gitleaks`; keys only in `.env` (never committed). CI also runs gitleaks on push.  
-- `README.md` top-to-bottom: demo GIF → what/why (the 20-year loop story) → hardware BOM with prices (\~€70 rabbit \+ \~€50 reSpeaker \+ a PC/SBC) → quickstart with `--mock-ojn` (no hardware needed) → architecture diagram → roadmap (Reachy Mini, VENTUNO Q profiles).  
+- `README.md` top-to-bottom: what/why → hardware BOM with prices (\~€70 rabbit \+ \~€50 reSpeaker \+ a PC/SBC) → quickstart with `--mock-ojn` (no hardware needed) → architecture diagram → roadmap (Reachy Mini, VENTUNO Q profiles).  
 - `CONTRIBUTING.md`: dev setup on mock, how to run tests, PR conventions. `CODE_OF_CONDUCT.md` (Contributor Covenant).  
 - GitHub Actions CI: lint (ruff) \+ unit tests against `--mock-ojn` on every PR — contributors never need a physical rabbit.  
-- Conventional commits; tagged releases per phase (`v0.1-phase1`, ...), each with a short demo video/GIF in the release notes.
+- Conventional commits; tagged releases per phase (`v0.1-phase1`, ...).
 
 ### 11.4 Bootstrap task for Claude Code (do this first)
 

@@ -4,15 +4,13 @@
 
 > AI brain for the original Nabaztag rabbit — LLM tool-use embodiment, voice pipeline, MCP server. Physical AI, 2006 edition.
 
-*(demo GIF — coming with Phase 1)*
-
 ## What & why
 
 In 2006 the Nabaztag:tag was the first consumer connected device — a Wi-Fi rabbit that read the news and wiggled its ears. Twenty years later, this project revives a **stock, unopened** Nabaztag:tag as the body of a modern AI assistant: wake word → speech-to-text → an LLM with tool use → text-to-speech, played through the rabbit's own speaker, with the LLM deciding ear positions and LED moods itself.
 
 There is also a **full-duplex mode**: the wake word opens a continuous conversation and you can talk over the rabbit mid-sentence. That needs playback which can be cancelled — the 2006 decoder cannot be — so it routes audio through the reSpeaker instead, whose on-chip echo cancellation was measured before being relied on. The rabbit keeps the ears and the lights.
 
-The rabbit stays 100% original. It talks to a self-hosted [OpenJabNab](https://github.com/OpenJabNab/OpenJabNab) server; modern audio input comes from an external reSpeaker 4-mic array; the brain runs on a UDOO Bolt — a board co-created by the project's owner, closing a personal 20-year loop between the first connected device and modern edge AI.
+The rabbit stays 100% original. It talks to a self-hosted [OpenJabNab](https://github.com/OpenJabNab/OpenJabNab) server; modern audio input comes from an external reSpeaker 4-mic array; the brain runs on a UDOO Bolt (any Linux PC or SBC works) — closing a 20-year loop between the first consumer connected device and modern edge AI.
 
 Full spec: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 

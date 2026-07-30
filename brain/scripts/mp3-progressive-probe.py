@@ -38,7 +38,7 @@ Two routes are served for an A/B:
                  the client knows the total size; only delivery is slow)
     /fast.mp3  — the same bytes in one shot (sanity baseline)
 
-What Maurizio reports decides the next step:
+What the listener reports decides the next step:
   - sound starts right after the FIRST chunk (well before last-byte)  → the
     decoder streams; a progressive TTS path is worth building.
   - sound starts only around last-byte (≈ --spread later)             → MTL

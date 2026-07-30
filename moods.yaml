@@ -1,4 +1,4 @@
-# Mood → LED/ear mapping. No secrets; meant to be tweaked on camera.
+# Mood → LED/ear mapping. No secrets; meant to be tweaked freely.
 # Ears: 0..16 per ear (0 = fully forward, 16 = fully back — confirm in Phase 0).
 # LEDs: bottom, left, right, nose, top — per-LED RGB where the capability matrix allows.
 

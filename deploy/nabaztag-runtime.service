@@ -30,11 +30,11 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=maurizio
-WorkingDirectory=/home/maurizio/nabaztag-ai
+User=<user>
+WorkingDirectory=/home/<user>/nabaztag-ai
 # Keys and config live in .env (gitignored); never put them in this unit.
-EnvironmentFile=/home/maurizio/nabaztag-ai/.env
-ExecStart=/home/maurizio/nabaztag-ai/.venv/bin/python -m rabbit_brain.runtime --config config.yaml
+EnvironmentFile=/home/<user>/nabaztag-ai/.env
+ExecStart=/home/<user>/nabaztag-ai/.venv/bin/python -m rabbit_brain.runtime --config config.yaml
 
 # Recovery: always come back, including after a clean-but-unexpected exit.
 # (The rate cap that keeps this from crash-looping is in [Unit] above.)
@@ -58,7 +58,7 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 # TTS MP3s are written under the working dir; keep exactly that writable.
-ReadWritePaths=/home/maurizio/nabaztag-ai
+ReadWritePaths=/home/<user>/nabaztag-ai
 
 [Install]
 WantedBy=multi-user.target
