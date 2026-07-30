@@ -23,7 +23,7 @@ Full spec: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Nabaztag:tag (V2), stock | Body: speaker, ears, LEDs, RFID, button | ~€70 (second-hand) |
 | reSpeaker Flex XVF3800 Circular-4 | Ears-in: 4-mic array, beamforming, DoA | ~€50 |
 | UDOO Bolt (or any Linux PC/SBC) | Brain: OJN server, rabbit-brain, MCP | you probably have one |
-| USB Wi-Fi dongle (AP-mode capable) | Dedicated legacy WPA-TKIP AP (§4.1) | ~€10 |
+| *(usually nothing)* — the Bolt's own M.2 Wi-Fi module runs the AP | Dedicated legacy WPA-TKIP AP (§4.1) | — |
 
 ## Quickstart (no hardware needed)
 

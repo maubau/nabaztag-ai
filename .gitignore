@@ -32,6 +32,11 @@ build/
 # Local working copy of the spec; the canonical version is docs/ARCHITECTURE.md
 /nabaztag-ai-architecture-v2.2.md
 
+# Private working notes: the FULL annotated spec and findings log, with the
+# measurements and the story behind each rule. Kept out of the public repo while
+# the write-ups are being produced; docs/ holds the reference versions.
+/notes/
+
 # OS / editor
 .DS_Store
 .idea/
